@@ -1,0 +1,51 @@
+name: Dendrite
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dendrite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo run --locked -p dendrite-simulator -- --seed 24301 --pieces 4096 --peers 64 --corruption-per-mille 100 --churn-per-mille 100
+      - run: cargo bench --locked -p dendrite-benchmarks --no-run
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+      - run: cargo build --release -p dendrite-daemon -p dendrite-cli --locked
+
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  fault-soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Run extended deterministic fault matrix
+        run: DENDRITE_SOAK_CASES=100000 cargo test --locked -p dendrite-simulator tests::extended_fault_soak -- --ignored --exact

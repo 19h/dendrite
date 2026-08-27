@@ -1,0 +1,45 @@
+[package]
+name = "dendrite-daemon"
+description = "Dendrite headless daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dendrite"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+base64.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+http.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+dendrite-api-types = { path = "../api-types", version = "2.0.0-alpha.1" }
+dendrite-config = { path = "../config", version = "2.0.0-alpha.1" }
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
+dendrite-engine = { path = "../engine", version = "2.0.0-alpha.1" }
+dendrite-metainfo = { path = "../metainfo", version = "2.0.0-alpha.1" }
+dendrite-net = { path = "../net", version = "2.0.0-alpha.1" }
+dendrite-persistence = { path = "../persistence", version = "2.0.0-alpha.1" }
+dendrite-storage = { path = "../storage", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

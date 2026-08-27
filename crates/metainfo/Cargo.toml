@@ -1,0 +1,22 @@
+[package]
+name = "dendrite-metainfo"
+description = "Bounded BitTorrent metainfo and bencode parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+data-encoding.workspace = true
+hex.workspace = true
+multibase.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

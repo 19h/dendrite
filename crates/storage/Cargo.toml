@@ -1,0 +1,28 @@
+[package]
+name = "dendrite-storage"
+description = "Capability-confined torrent payload storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+fault-injection = []
+
+[dependencies]
+bytes.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

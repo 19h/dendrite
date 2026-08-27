@@ -1,0 +1,23 @@
+[package]
+name = "dendrite-simulator"
+description = "Deterministic swarm fault simulator for Dendrite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "dendrite-sim"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

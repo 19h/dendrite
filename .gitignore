@@ -1,0 +1,4 @@
+/target/
+/dendrite-data/
+/downloads/
+*.torrent

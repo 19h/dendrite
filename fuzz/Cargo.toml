@@ -1,0 +1,41 @@
+[package]
+name = "dendrite-fuzz"
+authors = ["Kenan Sulayman"]
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.94"
+license = "ISC"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.11.1"
+libfuzzer-sys = "0.4.13"
+dendrite-metainfo = { path = "../crates/metainfo", version = "2.0.0-alpha.1" }
+dendrite-net = { path = "../crates/net", version = "2.0.0-alpha.1" }
+
+[[bin]]
+name = "metainfo"
+path = "fuzz_targets/metainfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_wire"
+path = "fuzz_targets/peer_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_extensions"
+path = "fuzz_targets/discovery_extensions.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

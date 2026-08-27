@@ -1,0 +1,22 @@
+[package]
+name = "dendrite-persistence"
+description = "Transactional state storage for Dendrite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+fault-injection = []
+
+[dependencies]
+postcard.workspace = true
+redb.workspace = true
+serde.workspace = true
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

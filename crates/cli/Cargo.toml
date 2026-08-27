@@ -1,0 +1,24 @@
+[package]
+name = "dendrite-cli"
+description = "Command line client for Dendrite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dendritectl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dendrite-api-types = { path = "../api-types", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

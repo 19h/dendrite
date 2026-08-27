@@ -1,0 +1,33 @@
+[package]
+name = "dendrite-net"
+description = "Bounded BitTorrent wire codecs and network services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crypto-bigint.workspace = true
+futures-util.workspace = true
+librqbit-utp.workspace = true
+percent-encoding.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+sha1.workspace = true
+socket2.workspace = true
+subtle.workspace = true
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
+dendrite-metainfo = { path = "../metainfo", version = "2.0.0-alpha.1" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

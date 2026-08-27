@@ -1,0 +1,41 @@
+# Safe local example. Run from the repository root with:
+#   target/release/dendrite --config example.toml
+data_dir = "./dendrite-data"
+download_dir = "./downloads"
+
+[listen]
+# The administrator API is loopback-only by default. See the remote API
+# playbook before exposing it on another interface.
+api = "127.0.0.1:8412"
+peer = "0.0.0.0:16493"
+dht = "0.0.0.0:16309"
+
+# DHT lookup is used only when explicit IP:port bootstrap nodes are supplied.
+dht_bootstrap = []
+
+# NAT-PMP is opt-in. Uncomment only when this is the actual local IPv4 gateway.
+# nat_pmp_gateway = "192.168.1.1:5351"
+
+# disabled | preferred | required
+peer_encryption = "disabled"
+
+# These are required together when api is not bound to loopback:
+# tls_certificate = "/etc/dendrite/tls/cert.pem"
+# tls_private_key = "/etc/dendrite/tls/key.pem"
+allowed_origins = []
+
+[limits]
+loaded_torrents = 10000
+active_torrents = 1000
+peer_connections = 10000
+metainfo_bytes = 67108864
+tracker_response_bytes = 8388608
+websocket_message_bytes = 8388608
+api_concurrency = 256
+api_requests_per_second = 1000
+browser_sessions = 1024
+list_page_size = 200
+
+[logging]
+filter = "dendrite=info"
+json = false
