@@ -167,7 +167,7 @@ fn encode_announce(
         AnnounceEvent::Stopped => 3,
     };
     output[80..84].copy_from_slice(&event.to_be_bytes());
-    output[88..92].copy_from_slice(&rand::random::<u32>().to_be_bytes());
+    output[88..92].copy_from_slice(&request.key.to_be_bytes());
     output[92..96].copy_from_slice(&i32::from(request.numwant).to_be_bytes());
     output[96..].copy_from_slice(&request.port.to_be_bytes());
     output
@@ -203,6 +203,12 @@ mod tests {
             if received != ANNOUNCE_BYTES || packet[8..12] != 1_u32.to_be_bytes() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad announce"));
             }
+            if packet[88..92] != 0x1234_abcd_u32.to_be_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "announce key changed",
+                ));
+            }
             let transaction = &packet[12..16];
             let mut response = Vec::from([0_u8; 20]);
             response[..4].copy_from_slice(&1_u32.to_be_bytes());
@@ -227,6 +233,8 @@ mod tests {
                     left: 1,
                     event: AnnounceEvent::Started,
                     numwant: 50,
+                    key: 0x1234_abcd,
+                    support_crypto: true,
                 },
             )
             .await?;

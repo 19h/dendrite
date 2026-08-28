@@ -139,11 +139,11 @@ Quote magnets so `&` is not interpreted by the shell.
 
 ## Torrent has zero peers
 
-Check discovery in its actual order:
+Check each discovery input:
 
 1. Does it declare a reachable HTTP/HTTPS/UDP tracker?
 2. Did the tracker return usable peers?
-3. If trackers did not, is `dht_bootstrap` nonempty and reachable?
+3. Is `dht_bootstrap` nonempty and reachable?
 4. Is it private, which intentionally disables DHT, LSD, and PEX?
 5. Can the host make outbound peer connections?
 6. Does `peer_encryption = "required"` exclude available peers?
@@ -151,6 +151,24 @@ Check discovery in its actual order:
 LSD is LAN-local. NAT-PMP and an open incoming port can improve reachability but
 do not manufacture tracker/DHT results. A zero sampled peer count can also be
 transient; use logs over time.
+
+## Torrent has one peer and is extremely slow
+
+The sampled `peers` value counts connected sessions, not tracker seeders. One
+connection can therefore mean that discovery found only one usable endpoint,
+or that every other candidate failed during connect or negotiation.
+
+On a dual-stack host, Dendrite prefers IPv6 for HTTP tracker announces and falls
+back to IPv4. This matters because some trackers return different IPv4 and IPv6
+peer populations. With debug logging enabled, compare `tracker announce
+succeeded ... peers=N`, `peer connection ready`, and connection failures. If a
+tracker returns several candidates but only one connects, investigate routing,
+firewall, encryption policy, and remote churn. If it returns one candidate,
+check the other tracker tiers and configured DHT bootstrap nodes.
+
+Measure progress with two summary requests at least 250 ms apart. A single
+`download_rate: 0` sample does not mean the transfer is idle; compare the
+durable `downloaded` counter as well.
 
 ## Torrent is stuck in `starting`
 

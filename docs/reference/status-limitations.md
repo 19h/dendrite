@@ -60,8 +60,8 @@ exhaust.
 ## Discovery and network limits
 
 - DHT has no default bootstrap nodes.
-- Initial discovery is fallback-ordered rather than an always-parallel merge:
-  trackers, then DHT, then local discovery.
+- Initial discovery combines every tracker tier with a bounded DHT lookup when
+  bootstrap nodes are configured; local discovery remains a no-peer fallback.
 - Private torrents disable DHT, local discovery, and PEX.
 - NAT-PMP gateway configuration is IPv4-only.
 - NAT-PMP requires an explicit gateway and has no automatic discovery or UPnP

@@ -25,17 +25,24 @@ unsafe paths, identity mismatches, and unsupported hash forms are rejected.
 
 | Mechanism | Behavior |
 |---|---|
-| HTTP trackers | announce requests with bounded response parsing |
+| HTTP trackers | IPv6-preferred announces with IPv4 fallback and bounded response parsing |
 | UDP trackers | connect and announce transactions with bounded parsing/timeouts |
-| Tracker tiers | processed in tier order according to fallback behavior |
+| Tracker tiers | every valid tier is announced to and usable peers are deduplicated |
 | DHT | UDP discovery for public torrents when bootstrap nodes are configured |
 | Local service discovery | multicast discovery fallback for public torrents |
 | PEX | peers learned from negotiated peer exchange during public swarm sessions |
 
-Initial discovery is intentionally ordered: trackers first; if they return
-peers, the actor proceeds without also waiting on DHT or local discovery. If
-they do not, DHT is tried, then local discovery. This affects troubleshooting:
-“DHT enabled” does not mean every transfer consults it.
+Initial discovery announces to every tracker tier and combines those results
+with a bounded DHT lookup when bootstrap nodes are configured. Local discovery
+is tried when neither wide-area source returns a peer. Exhausted swarms repeat
+discovery with bounded backoff.
+
+HTTP announces prefer IPv6 on dual-stack hosts because trackers may return a
+different peer population according to the request's address family. If IPv6
+cannot connect, the same request falls back to the normal dual-stack client.
+Announces request compact responses, omit redundant peer IDs, carry a stable
+session key, and advertise encrypted-peer support when peer encryption is
+enabled.
 
 The default configuration has no DHT bootstrap nodes. Add trusted IP socket
 addresses in TOML before expecting DHT to provide initial peers.

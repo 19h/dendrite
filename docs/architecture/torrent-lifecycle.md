@@ -69,16 +69,16 @@ top-level names but do not have identical identities.
 
 ## Discovery
 
-For public torrents, initial discovery is a fallback sequence:
+For public torrents, initial discovery combines wide-area sources:
 
-1. process tracker tiers;
-2. return immediately if trackers produced usable peers;
-3. otherwise query DHT when bootstrap nodes are configured;
-4. otherwise try local service discovery.
+1. announce to every valid tracker tier and combine their peers;
+2. also query DHT when bootstrap nodes are configured;
+3. if neither wide-area source produced peers, try local service discovery.
 
-PEX can add peers after compatible peer sessions exist. This is not a strategy
-that continually merges every discovery source in parallel. Private torrents
-use their declared trackers and suppress DHT, local discovery, and PEX.
+PEX can add peers after compatible peer sessions exist. Discovery is repeated
+after a swarm is exhausted, but sources are not maintained continuously in
+parallel. Private torrents use their declared trackers and suppress DHT, local
+discovery, and PEX.
 
 With the default empty DHT bootstrap list, a torrent that has no working
 tracker cannot rely on DHT discovery until the operator supplies bootstrap

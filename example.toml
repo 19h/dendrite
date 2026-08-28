@@ -10,8 +10,11 @@ api = "127.0.0.1:8412"
 peer = "0.0.0.0:16493"
 dht = "0.0.0.0:16309"
 
-# DHT lookup is used only when explicit IP:port bootstrap nodes are supplied.
-dht_bootstrap = []
+# Public IPv4 bootstrap nodes let DHT widen discovery beyond tracker results.
+dht_bootstrap = [
+  "87.98.162.88:6881",   # dht.transmissionbt.com
+  "212.129.33.59:6881",  # dht.transmissionbt.com
+]
 
 # NAT-PMP is opt-in. Uncomment only when this is the actual local IPv4 gateway.
 # nat_pmp_gateway = "192.168.1.1:5351"

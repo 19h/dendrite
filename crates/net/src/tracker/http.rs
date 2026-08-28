@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fmt::Write as _,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -67,6 +67,8 @@ pub struct TrackerRequest {
     pub left: u64,
     pub event: AnnounceEvent,
     pub numwant: u16,
+    pub key: u32,
+    pub support_crypto: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +84,7 @@ pub struct TrackerAnnounce {
 #[derive(Clone, Debug)]
 pub struct HttpTrackerClient {
     client: Client,
+    ipv6_client: Client,
     response_limit: usize,
 }
 
@@ -113,14 +116,13 @@ pub enum TrackerServiceError {
 
 impl HttpTrackerClient {
     pub fn new(response_limit: usize) -> Result<Self, TrackerServiceError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .user_agent(concat!("dendrite/", env!("CARGO_PKG_VERSION")))
+        let client = tracker_client_builder().build()?;
+        let ipv6_client = tracker_client_builder()
+            .local_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
             .build()?;
         Ok(Self {
             client,
+            ipv6_client,
             response_limit,
         })
     }
@@ -134,9 +136,19 @@ impl HttpTrackerClient {
             return Err(TrackerServiceError::Scheme);
         }
         let url = announce_url(tracker, request)?;
-        let response = self
-            .client
-            .get(url)
+        match self.announce_url(&self.ipv6_client, &url).await {
+            Err(TrackerServiceError::Request(_)) => self.announce_url(&self.client, &url).await,
+            result => result,
+        }
+    }
+
+    async fn announce_url(
+        &self,
+        client: &Client,
+        url: &Url,
+    ) -> Result<TrackerAnnounce, TrackerServiceError> {
+        let response = client
+            .get(url.clone())
             .header(header::ACCEPT_ENCODING, "identity")
             .send()
             .await?;
@@ -166,6 +178,14 @@ impl HttpTrackerClient {
     }
 }
 
+fn tracker_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent(concat!("dendrite/", env!("CARGO_PKG_VERSION")))
+}
+
 fn announce_url(base: &Url, request: TrackerRequest) -> Result<Url, TrackerServiceError> {
     let mut value = base.as_str().to_owned();
     value.push(if base.query().is_some() { '&' } else { '?' });
@@ -173,10 +193,18 @@ fn announce_url(base: &Url, request: TrackerRequest) -> Result<Url, TrackerServi
     let peer_id = percent_encode(request.peer_id.as_bytes(), TRACKER_ENCODE);
     write!(
         value,
-        "info_hash={info_hash}&peer_id={peer_id}&port={}&uploaded={}&downloaded={}&left={}&compact=1&numwant={}",
-        request.port, request.uploaded, request.downloaded, request.left, request.numwant
+        "info_hash={info_hash}&peer_id={peer_id}&port={}&uploaded={}&downloaded={}&left={}&compact=1&no_peer_id=1&numwant={}&key={:08x}",
+        request.port,
+        request.uploaded,
+        request.downloaded,
+        request.left,
+        request.numwant,
+        request.key
     )
     .map_err(|_| TrackerServiceError::UrlEncoding)?;
+    if request.support_crypto {
+        value.push_str("&supportcrypto=1");
+    }
     match request.event {
         AnnounceEvent::Started => value.push_str("&event=started"),
         AnnounceEvent::Stopped => value.push_str("&event=stopped"),
@@ -453,6 +481,12 @@ mod tests {
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(2))
                 .build()?,
+            ipv6_client: Client::builder()
+                .no_proxy()
+                .local_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(2))
+                .build()?,
             response_limit: 1024,
         };
         let missing = Url::parse("http://tracker-does-not-exist.invalid/announce")?;
@@ -460,6 +494,51 @@ mod tests {
             dns_client.announce(&missing, test_request()).await,
             Err(TrackerServiceError::Request(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefers_ipv6_for_dual_stack_trackers()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ipv6_listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await?;
+        let port = ipv6_listener.local_addr()?.port();
+        let ipv4_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        let ipv4_address = ipv4_listener.local_addr()?;
+        let ipv6_address = ipv6_listener.local_addr()?;
+        let ipv4_server = tokio::spawn(serve_http_once(
+            ipv4_listener,
+            "200 OK",
+            b"d8:intervali60e5:peers6:\x7f\x00\x00\x04\x1a\xe1e".to_vec(),
+        ));
+        let ipv6_server = tokio::spawn(serve_http_once(
+            ipv6_listener,
+            "200 OK",
+            b"d8:intervali60e5:peers6:\x7f\x00\x00\x06\x1a\xe1e".to_vec(),
+        ));
+        let addresses = [ipv4_address, ipv6_address];
+        let client = HttpTrackerClient {
+            client: tracker_client_builder()
+                .no_proxy()
+                .resolve_to_addrs("tracker.test", &addresses)
+                .build()?,
+            ipv6_client: tracker_client_builder()
+                .no_proxy()
+                .local_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+                .resolve_to_addrs("tracker.test", &addresses)
+                .build()?,
+            response_limit: 1024,
+        };
+
+        let result = client
+            .announce(
+                &Url::parse(&format!("http://tracker.test:{port}/announce"))?,
+                test_request(),
+            )
+            .await;
+        ipv4_server.abort();
+        ipv6_server.abort();
+
+        assert_eq!(result?.peers, [SocketAddr::from(([127, 0, 0, 6], 6881))]);
         Ok(())
     }
 
@@ -473,7 +552,28 @@ mod tests {
             left: 1,
             event: AnnounceEvent::Started,
             numwant: 10,
+            key: 0x1234_abcd,
+            support_crypto: true,
         }
+    }
+
+    #[test]
+    fn announce_identifies_the_session_and_advertises_peer_capabilities()
+    -> Result<(), TrackerServiceError> {
+        let url = announce_url(
+            &Url::parse("https://tracker.example/announce?passkey=secret")?,
+            test_request(),
+        )?;
+        let query = url.query().ok_or(TrackerServiceError::UrlEncoding)?;
+
+        assert!(query.contains("passkey=secret"));
+        assert!(query.contains("compact=1"));
+        assert!(query.contains("no_peer_id=1"));
+        assert!(query.contains("numwant=10"));
+        assert!(query.contains("key=1234abcd"));
+        assert!(query.contains("supportcrypto=1"));
+        assert!(query.contains("event=started"));
+        Ok(())
     }
 
     async fn serve_http_once(

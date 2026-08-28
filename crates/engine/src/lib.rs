@@ -57,6 +57,7 @@ const PEER_COMMAND_CAPACITY: usize = 64;
 const ACTIVE_PEER_LIMIT: usize = 32;
 const INCOMING_PEER_LIMIT: usize = 256;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
 const SWARM_RETRY_MAX: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
@@ -2575,12 +2576,16 @@ async fn discover_with_dht(
     allow_dht: bool,
     announce_event: AnnounceEvent,
 ) -> Result<Vec<SocketAddr>, ActorError> {
+    let mut peers = HashSet::new();
     let tracker_error =
         match discover_tracker_peers(trackers, record, services, info_hash, left, announce_event)
             .await
         {
-            Ok(peers) => return Ok(peers),
-            Err(error) => error,
+            Ok(discovered) => {
+                peers.extend(discovered);
+                None
+            }
+            Err(error) => Some(error),
         };
     let mut dht_error = None;
     if allow_dht && !services.dht_bootstrap.is_empty() {
@@ -2590,24 +2595,33 @@ async fn discover_with_dht(
             DhtClient::new(128, 65_507, Duration::from_secs(2))
                 .map_err(|error| ActorError::Peer(error.to_string()))?
         };
-        match client.get_peers(info_hash, &services.dht_bootstrap).await {
-            Ok(peers) if !peers.is_empty() => return Ok(peers),
-            Ok(_) => {}
-            Err(error) => dht_error = Some(error.to_string()),
+        match tokio::time::timeout(
+            DHT_DISCOVERY_TIMEOUT,
+            client.get_peers(info_hash, &services.dht_bootstrap),
+        )
+        .await
+        {
+            Ok(Ok(discovered)) => {
+                debug!(peers = discovered.len(), "DHT peer discovery succeeded");
+                peers.extend(discovered);
+            }
+            Ok(Err(error)) => dht_error = Some(error.to_string()),
+            Err(_) => dht_error = Some("DHT lookup timed out".to_owned()),
         }
     }
-    if allow_dht {
-        let peers = discover_lsd_peer(info_hash, services).await;
-        if !peers.is_empty() {
-            return Ok(peers);
-        }
+    if peers.is_empty() && allow_dht {
+        peers.extend(discover_lsd_peer(info_hash, services).await);
+    }
+    if !peers.is_empty() {
+        return Ok(peers.into_iter().collect());
     }
     if let Some(error) = dht_error {
         Err(ActorError::Peer(format!(
-            "tracker discovery failed ({tracker_error}); DHT failed ({error}); local discovery found no peers"
+            "tracker discovery failed ({}); DHT failed ({error}); local discovery found no peers",
+            tracker_error.map_or_else(|| "no peers".to_owned(), |error| error.to_string())
         )))
     } else {
-        Err(tracker_error)
+        Err(tracker_error.unwrap_or(ActorError::NoPeers))
     }
 }
 
@@ -2624,6 +2638,7 @@ async fn discover_tracker_peers(
     let udp_tracker = UdpTrackerClient::new(services.tracker_response_limit)
         .map_err(|error| ActorError::Peer(error.to_string()))?;
     let mut peers = HashSet::new();
+    let peer_id = services.peer_id.as_bytes();
     let request = TrackerRequest {
         info_hash,
         peer_id: services.peer_id,
@@ -2633,6 +2648,8 @@ async fn discover_tracker_peers(
         left,
         event: announce_event,
         numwant: PEER_LIMIT_PER_ANNOUNCE,
+        key: u32::from_be_bytes([peer_id[16], peer_id[17], peer_id[18], peer_id[19]]),
+        support_crypto: !matches!(services.encryption, EncryptionPolicy::Disabled),
     };
     let mut attempted = false;
     for tier in trackers {
@@ -2668,9 +2685,6 @@ async fn discover_tracker_peers(
                 }
                 Err(error) => debug!(tracker = %url, %error, "tracker announce failed"),
             }
-        }
-        if !peers.is_empty() {
-            break;
         }
     }
     if !attempted {
@@ -4745,6 +4759,52 @@ mod tests {
         assert_eq!(tokio::fs::read(downloads.join("pex.bin")).await?, payload);
         bootstrap_peer.await.map_err(|error| error.to_string())??;
         payload_peer.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracker_discovery_combines_all_successful_tiers()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let first_tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let second_tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let first_url = format!("http://{}/announce", first_tracker.local_addr()?);
+        let second_url = format!("http://{}/announce", second_tracker.local_addr()?);
+        let first_peer = SocketAddr::from(([127, 0, 0, 1], 61_001));
+        let second_peer = SocketAddr::from(([127, 0, 0, 1], 61_002));
+        let first_task = tokio::spawn(fake_tracker(first_tracker, first_peer));
+        let second_task = tokio::spawn(fake_tracker(second_tracker, second_peer));
+        let payload = Bytes::from_static(b"tracker tier aggregation");
+        let digest: [u8; 20] = Sha1::digest(&payload).into();
+        let raw = single_file_metainfo(&first_url, "tiers.bin", &payload, digest);
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let record = test_record(&metainfo, raw);
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let services = test_services(
+            store,
+            StorageHandle::start_portable(&downloads, 8)?,
+            "tracker-tiers-test",
+        );
+
+        let peers = discover_tracker_peers(
+            &[vec![first_url], vec![second_url]],
+            &record,
+            &services,
+            info_hash,
+            metainfo.total_length,
+            AnnounceEvent::Started,
+        )
+        .await?;
+
+        assert_eq!(
+            peers.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([first_peer, second_peer])
+        );
+        first_task.await.map_err(|error| error.to_string())??;
+        second_task.await.map_err(|error| error.to_string())??;
         Ok(())
     }
 

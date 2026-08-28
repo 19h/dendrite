@@ -21,9 +21,9 @@ The checked-in [`example.toml`](../../example.toml) is runnable without root:
 target/release/dendrite --config example.toml
 ```
 
-It keeps the administrator API on loopback, leaves DHT bootstrap and NAT-PMP
-opt-in, prefers MSE with plaintext fallback, and writes into ignored checkout
-directories.
+It keeps the administrator API on loopback, configures public IPv4 DHT bootstrap
+nodes, leaves NAT-PMP opt-in, prefers MSE with plaintext fallback, and writes
+into ignored checkout directories.
 
 ## Choose directories first
 
