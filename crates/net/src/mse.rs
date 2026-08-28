@@ -23,7 +23,7 @@ const MAX_INITIAL_PAYLOAD: usize = 4 * 1024;
 const CRYPTO_RC4: u32 = 0x02;
 const VC: [u8; 8] = [0; 8];
 const PRIME: U768 = U768::from_be_hex(
-    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A36210000000000090563",
 );
 
 #[derive(Debug, Error)]
@@ -413,6 +413,15 @@ impl<S: AsyncWrite + Unpin> MseStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_the_mse_diffie_hellman_modulus() {
+        let bytes = PRIME.to_be_bytes();
+        assert_eq!(
+            &bytes[KEY_BYTES - 12..],
+            &[0xa6, 0x3a, 0x36, 0x21, 0, 0, 0, 0, 0, 0x09, 0x05, 0x63]
+        );
+    }
 
     #[tokio::test]
     async fn initiator_and_responder_exchange_encrypted_stream_data()

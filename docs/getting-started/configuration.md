@@ -22,7 +22,8 @@ target/release/dendrite --config example.toml
 ```
 
 It keeps the administrator API on loopback, leaves DHT bootstrap and NAT-PMP
-opt-in, disables MSE by default, and writes into ignored checkout directories.
+opt-in, prefers MSE with plaintext fallback, and writes into ignored checkout
+directories.
 
 ## Choose directories first
 
@@ -84,8 +85,8 @@ the [remote API playbook](../playbooks/remote-api.md) before using this shape.
 ## Peer encryption
 
 ```toml
+peer_encryption = "preferred" # default: try MSE, fall back to plaintext
 peer_encryption = "disabled" # plaintext peer transport
-peer_encryption = "preferred" # try MSE, fall back to plaintext
 peer_encryption = "required" # MSE failure rejects the connection
 ```
 

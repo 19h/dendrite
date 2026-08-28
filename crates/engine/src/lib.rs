@@ -53,9 +53,11 @@ const EVENT_CAPACITY: usize = 4096;
 const PEER_LIMIT_PER_ANNOUNCE: u16 = 80;
 const BLOCK_BYTES: usize = 16 * 1024;
 const BLOCK_PIPELINE: usize = 8;
+const PEER_COMMAND_CAPACITY: usize = 64;
 const ACTIVE_PEER_LIMIT: usize = 32;
 const INCOMING_PEER_LIMIT: usize = 256;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const ACCEPT_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
@@ -102,6 +104,9 @@ enum PeerWorkerCommand {
         length: usize,
         cancellation: CancellationToken,
     },
+    Have {
+        piece: u32,
+    },
     Shutdown,
 }
 
@@ -124,10 +129,19 @@ enum PeerWorkerEvent {
         worker: usize,
         peers: Vec<SocketAddr>,
     },
+    Have {
+        worker: usize,
+        piece: u32,
+    },
     HolePunch {
         worker: usize,
         address: SocketAddr,
     },
+}
+
+enum PeerWorkerInput {
+    Command(PeerWorkerCommand),
+    Event(PeerEvent),
 }
 
 enum PieceResult {
@@ -2284,7 +2298,11 @@ async fn run_peer_swarm(
             &mut swarm.picker,
             metainfo,
         )?;
-        if scheduled == 0 && swarm.connecting == 0 && swarm.assignments.is_empty() {
+        if scheduled == 0
+            && swarm.connecting == 0
+            && swarm.assignments.is_empty()
+            && swarm.workers.is_empty()
+        {
             shutdown_swarm(&swarm);
             return Err(swarm
                 .last_error
@@ -2316,7 +2334,7 @@ fn spawn_swarm_worker_with_transport(swarm: &mut SwarmState, address: SocketAddr
     }
     let worker = swarm.next_worker;
     swarm.next_worker = swarm.next_worker.saturating_add(1);
-    let (commands, receiver) = mpsc::channel(2);
+    let (commands, receiver) = mpsc::channel(PEER_COMMAND_CAPACITY);
     swarm.workers.insert(
         worker,
         PeerWorkerHandle {
@@ -2405,6 +2423,32 @@ async fn handle_worker_event(
                 for address in peers {
                     spawn_swarm_worker(swarm, address);
                 }
+            }
+        }
+        PeerWorkerEvent::Have { worker, piece } => {
+            let piece = usize::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
+            if piece >= swarm.piece_count {
+                return Err(ActorError::Peer(
+                    "peer announced a piece outside the torrent".to_owned(),
+                ));
+            }
+            let Some(handle) = swarm.workers.get_mut(&worker) else {
+                return Ok(());
+            };
+            let Some(bitfield) = handle.bitfield.as_mut() else {
+                return Ok(());
+            };
+            if !bit_is_set(bitfield, piece) {
+                set_bit(bitfield, piece);
+                swarm
+                    .picker
+                    .add_peer_piece(piece)
+                    .map_err(|error| ActorError::Peer(error.to_string()))?;
+            }
+            if bit_is_set(&record.completed_pieces, piece) {
+                let _result_ignored = handle.commands.try_send(PeerWorkerCommand::Have {
+                    piece: u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?,
+                });
             }
         }
         PeerWorkerEvent::HolePunch { worker, address } => {
@@ -2521,7 +2565,14 @@ async fn discover_tracker_peers(
                 _ => continue,
             };
             match announce {
-                Ok(announce) => peers.extend(announce.peers),
+                Ok(announce) => {
+                    debug!(
+                        tracker = %url,
+                        peers = announce.peers.len(),
+                        "tracker announce succeeded"
+                    );
+                    peers.extend(announce.peers);
+                }
                 Err(error) => debug!(tracker = %url, %error, "tracker announce failed"),
             }
         }
@@ -2554,6 +2605,7 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
     let (mut peer, bitfield, peers) = match result {
         Ok(ready) => ready,
         Err(error) => {
+            debug!(address = %context.address, %error, "peer connection failed");
             let _result_ignored = context
                 .events
                 .send(PeerWorkerEvent::Gone {
@@ -2564,6 +2616,7 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
             return;
         }
     };
+    debug!(address = %context.address, "peer connection ready");
     let _connection = track_connection(&context.services, context.torrent_id);
     if context
         .events
@@ -2578,34 +2631,55 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
         return;
     }
     loop {
-        let command = tokio::select! {
+        let input = tokio::select! {
             () = context.cancellation.cancelled() => break,
-            command = commands.recv() => command,
+            command = commands.recv() => match command {
+                Some(command) => PeerWorkerInput::Command(command),
+                None => break,
+            },
+            event = next_peer_event_with_timeout(
+                &mut peer,
+                PEER_IDLE_TIMEOUT,
+            ) => match event {
+                Ok(event) => PeerWorkerInput::Event(event),
+                Err(error) => {
+                    let _result_ignored = context.events.send(PeerWorkerEvent::Gone {
+                        worker: context.worker,
+                        error: error.to_string(),
+                    }).await;
+                    break;
+                }
+            },
         };
-        let Some(command) = command else {
-            break;
-        };
-        match command {
-            PeerWorkerCommand::Download {
+        match input {
+            PeerWorkerInput::Command(PeerWorkerCommand::Download {
                 piece,
                 length,
                 cancellation: piece_cancellation,
-            } => {
+            }) => {
                 let result = match download_piece_blocks(
                     &mut peer,
                     piece,
                     length,
                     &piece_cancellation,
                     context.services.peer_message_timeout,
-                    context
-                        .allow_pex
-                        .then_some((&context.events, context.worker)),
+                    &context.events,
+                    context.worker,
+                    context.allow_pex,
                 )
                 .await
                 {
                     Ok(data) => PieceResult::Data(data),
                     Err(ActorError::Cancelled) => PieceResult::Cancelled,
-                    Err(error) => PieceResult::Failed(error.to_string()),
+                    Err(error) => {
+                        debug!(
+                            address = %context.address,
+                            piece,
+                            %error,
+                            "piece download failed"
+                        );
+                        PieceResult::Failed(error.to_string())
+                    }
                 };
                 let failed = matches!(result, PieceResult::Failed(_));
                 if context
@@ -2622,7 +2696,112 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
                     break;
                 }
             }
-            PeerWorkerCommand::Shutdown => break,
+            PeerWorkerInput::Command(PeerWorkerCommand::Have { piece }) => {
+                debug!(address = %context.address, piece, "announcing completed piece to peer");
+                if let Err(error) = peer.send(PeerMessage::Have(piece)).await {
+                    let _result_ignored = context
+                        .events
+                        .send(PeerWorkerEvent::Gone {
+                            worker: context.worker,
+                            error: error.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            }
+            PeerWorkerInput::Command(PeerWorkerCommand::Shutdown) => break,
+            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Have(piece))) => {
+                debug!(address = %context.address, piece, "peer announced piece availability");
+                if context
+                    .events
+                    .send(PeerWorkerEvent::Have {
+                        worker: context.worker,
+                        piece,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Extended {
+                extension_id: LOCAL_PEX_EXTENSION_ID,
+                payload,
+            })) if context.allow_pex => match pex_addresses(&payload) {
+                Ok(peers) => {
+                    if context
+                        .events
+                        .send(PeerWorkerEvent::Peers {
+                            worker: context.worker,
+                            peers,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _result_ignored = context
+                        .events
+                        .send(PeerWorkerEvent::Gone {
+                            worker: context.worker,
+                            error: error.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            },
+            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Extended {
+                extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
+                payload,
+            })) if context.allow_pex => match decode_holepunch_message(&payload) {
+                Ok(message) if message.kind == HolePunchKind::Connect => {
+                    if context
+                        .events
+                        .send(PeerWorkerEvent::HolePunch {
+                            worker: context.worker,
+                            address: message.address,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _result_ignored = context
+                        .events
+                        .send(PeerWorkerEvent::Gone {
+                            worker: context.worker,
+                            error: error.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            },
+            PeerWorkerInput::Event(PeerEvent::Disconnected) => {
+                let _result_ignored = context
+                    .events
+                    .send(PeerWorkerEvent::Gone {
+                        worker: context.worker,
+                        error: "peer disconnected".to_owned(),
+                    })
+                    .await;
+                break;
+            }
+            PeerWorkerInput::Event(PeerEvent::Failed(error)) => {
+                let _result_ignored = context
+                    .events
+                    .send(PeerWorkerEvent::Gone {
+                        worker: context.worker,
+                        error,
+                    })
+                    .await;
+                break;
+            }
+            PeerWorkerInput::Event(_) => {}
         }
     }
     peer.shutdown();
@@ -2657,7 +2836,7 @@ async fn connect_peer_worker(
             .await
             .map_err(|error| ActorError::Peer(error.to_string()))?
     };
-    if allow_pex {
+    if allow_pex && peer.remote_supports_extensions() {
         peer.send(PeerMessage::Extended {
             extension_id: 0,
             payload: encode_extension_handshake(None),
@@ -2671,7 +2850,7 @@ async fn connect_peer_worker(
     let (available, peers) = await_unchoke(&mut peer, piece_count).await?;
     Ok((
         peer,
-        available.unwrap_or_else(|| complete_bitfield(piece_count)),
+        available.unwrap_or_else(|| vec![0; piece_count.div_ceil(8)]),
         peers,
     ))
 }
@@ -2751,6 +2930,12 @@ async fn apply_piece_result(
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
             record.downloaded = completed_bytes(metainfo, &record.completed_pieces)?;
             replace_record(services, record.clone()).await?;
+            let wire_piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
+            for handle in swarm.workers.values() {
+                let _result_ignored = handle
+                    .commands
+                    .try_send(PeerWorkerCommand::Have { piece: wire_piece });
+            }
             for (assigned_piece, token) in swarm.assignments.values() {
                 if *assigned_piece == piece {
                     token.cancel();
@@ -2809,7 +2994,9 @@ async fn download_piece_blocks(
     length: usize,
     cancellation: &CancellationToken,
     message_timeout: Duration,
-    pex_events: Option<(&mpsc::Sender<PeerWorkerEvent>, usize)>,
+    events: &mpsc::Sender<PeerWorkerEvent>,
+    worker: usize,
+    allow_pex: bool,
 ) -> Result<Bytes, ActorError> {
     let piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
     let mut output = vec![0_u8; length];
@@ -2855,44 +3042,51 @@ async fn download_piece_blocks(
                     "peer choked outstanding requests".to_owned(),
                 ));
             }
-            PeerEvent::Disconnected | PeerEvent::Failed(_) => {
+            PeerEvent::Disconnected => {
                 return Err(ActorError::Peer(
                     "peer disconnected during piece transfer".to_owned(),
                 ));
+            }
+            PeerEvent::Failed(error) => {
+                return Err(ActorError::Peer(format!(
+                    "peer session failed during piece transfer: {error}"
+                )));
             }
             PeerEvent::Message(PeerMessage::Piece { .. }) => {
                 return Err(ActorError::Peer(
                     "peer returned a block for another piece".to_owned(),
                 ));
             }
+            PeerEvent::Message(PeerMessage::Have(piece)) => {
+                events
+                    .send(PeerWorkerEvent::Have { worker, piece })
+                    .await
+                    .map_err(|_| ActorError::Cancelled)?;
+            }
             PeerEvent::Message(PeerMessage::Extended {
                 extension_id: LOCAL_PEX_EXTENSION_ID,
                 payload,
-            }) => {
-                if let Some((events, worker)) = pex_events {
-                    let peers = pex_addresses(&payload)?;
-                    events
-                        .send(PeerWorkerEvent::Peers { worker, peers })
-                        .await
-                        .map_err(|_| ActorError::Cancelled)?;
-                }
+            }) if allow_pex => {
+                let peers = pex_addresses(&payload)?;
+                events
+                    .send(PeerWorkerEvent::Peers { worker, peers })
+                    .await
+                    .map_err(|_| ActorError::Cancelled)?;
             }
             PeerEvent::Message(PeerMessage::Extended {
                 extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
                 payload,
-            }) => {
-                if let Some((events, worker)) = pex_events {
-                    let message = decode_holepunch_message(&payload)
-                        .map_err(|error| ActorError::Peer(error.to_string()))?;
-                    if message.kind == HolePunchKind::Connect {
-                        events
-                            .send(PeerWorkerEvent::HolePunch {
-                                worker,
-                                address: message.address,
-                            })
-                            .await
-                            .map_err(|_| ActorError::Cancelled)?;
-                    }
+            }) if allow_pex => {
+                let message = decode_holepunch_message(&payload)
+                    .map_err(|error| ActorError::Peer(error.to_string()))?;
+                if message.kind == HolePunchKind::Connect {
+                    events
+                        .send(PeerWorkerEvent::HolePunch {
+                            worker,
+                            address: message.address,
+                        })
+                        .await
+                        .map_err(|_| ActorError::Cancelled)?;
                 }
             }
             _ => {}
@@ -2993,6 +3187,17 @@ async fn await_unchoke(
                 }
                 available = Some(bits.to_vec());
             }
+            PeerEvent::Message(PeerMessage::Have(piece)) => {
+                let piece = usize::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
+                if piece >= piece_count {
+                    return Err(ActorError::Peer(
+                        "peer announced a piece outside the torrent".to_owned(),
+                    ));
+                }
+                let bits = available.get_or_insert_with(|| vec![0; expected_bitfield]);
+                bits[piece / 8] |= 0x80 >> (piece % 8);
+                debug!(piece, "peer announced a piece before unchoking");
+            }
             PeerEvent::Message(PeerMessage::Extended {
                 extension_id: LOCAL_PEX_EXTENSION_ID,
                 payload,
@@ -3007,10 +3212,15 @@ async fn await_unchoke(
                     peers.push(message.address);
                 }
             }
-            PeerEvent::Disconnected | PeerEvent::Failed(_) => {
+            PeerEvent::Disconnected => {
                 return Err(ActorError::Peer(
                     "peer disconnected before unchoking".to_owned(),
                 ));
+            }
+            PeerEvent::Failed(error) => {
+                return Err(ActorError::Peer(format!(
+                    "peer session failed before unchoking: {error}"
+                )));
             }
             _ => {}
         }
@@ -3509,6 +3719,7 @@ fn all_complete(bitfield: &[u8], pieces: usize) -> bool {
     (0..pieces).all(|index| bit_is_set(bitfield, index))
 }
 
+#[cfg(test)]
 fn complete_bitfield(pieces: usize) -> Vec<u8> {
     let mut bitfield = vec![u8::MAX; pieces.div_ceil(8)];
     let spare = bitfield.len().saturating_mul(8).saturating_sub(pieces);
@@ -3704,13 +3915,6 @@ mod tests {
     #[test]
     fn peer_ids_have_stable_prefix() {
         assert_eq!(&generate_peer_id().as_bytes()[..8], b"-SY2000-");
-    }
-
-    #[test]
-    fn complete_bitfields_leave_spare_bits_clear() {
-        assert_eq!(complete_bitfield(0), Vec::<u8>::new());
-        assert_eq!(complete_bitfield(1), [0b1000_0000]);
-        assert_eq!(complete_bitfield(9), [0xff, 0x80]);
     }
 
     #[test]
@@ -5130,7 +5334,11 @@ mod tests {
         let info_hash = metainfo.v1_info_hash.ok_or("missing v1 info hash")?;
 
         let tracker_task = tokio::spawn(fake_tracker(tracker_listener, peer_address));
-        let peer_task = tokio::spawn(fake_peer(peer_listener, info_hash, payload.clone()));
+        let peer_task = tokio::spawn(fake_superseed_peer(
+            peer_listener,
+            info_hash,
+            payload.clone(),
+        ));
 
         let directory = tempfile::tempdir()?;
         let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
@@ -7107,6 +7315,52 @@ mod tests {
         serve_payload_peer(stream, info_hash, payload).await
     }
 
+    async fn fake_superseed_peer(
+        listener: TcpListener,
+        info_hash: Sha1Hash,
+        payload: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (stream, _) = listener.accept().await?;
+        let mut peer = test_peer_connection(stream, info_hash).await?;
+        loop {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Interested)) => break,
+                Some(PeerEvent::Message(PeerMessage::Extended { .. })) => {
+                    return Err("client sent an extension message without negotiation".into());
+                }
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+        peer.send(PeerMessage::Unchoke).await?;
+        tokio::task::yield_now().await;
+        peer.send(PeerMessage::Have(0)).await?;
+        let mut sent_piece = false;
+        loop {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Request(request))) => {
+                    let start = usize::try_from(request.begin)?;
+                    let end = start
+                        .checked_add(usize::try_from(request.length)?)
+                        .ok_or("block range overflow")?;
+                    let block = payload.get(start..end).ok_or("invalid block request")?;
+                    peer.send(PeerMessage::Piece {
+                        piece: request.piece,
+                        begin: request.begin,
+                        block: Bytes::copy_from_slice(block),
+                    })
+                    .await?;
+                    sent_piece = end == payload.len();
+                }
+                Some(PeerEvent::Message(PeerMessage::Have(0))) if sent_piece => return Ok(()),
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+    }
+
     async fn fake_disconnect_mid_piece(
         listener: TcpListener,
         info_hash: Sha1Hash,
@@ -7327,7 +7581,18 @@ mod tests {
         discovered: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (stream, _) = listener.accept().await?;
-        let mut peer = test_peer_connection(stream, info_hash).await?;
+        let mut reserved = [0_u8; 8];
+        reserved[5] |= 0x10;
+        let mut peer = PeerConnection::accept(
+            stream,
+            Handshake {
+                reserved,
+                info_hash,
+                peer_id: PeerId::from_bytes(*b"-FAKE00-012345678901"),
+            },
+            PeerCodecLimits::default(),
+        )
+        .await?;
         let mut interested = false;
         let mut extension = false;
         loop {
@@ -7653,6 +7918,9 @@ mod tests {
         loop {
             match peer.next_event().await {
                 Some(PeerEvent::Message(PeerMessage::Interested)) => break,
+                Some(PeerEvent::Message(PeerMessage::Extended { .. })) => {
+                    return Err("client sent an extension message without negotiation".into());
+                }
                 Some(PeerEvent::Failed(error)) => return Err(error.into()),
                 Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
                 _ => {}

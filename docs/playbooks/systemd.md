@@ -48,7 +48,7 @@ api = "127.0.0.1:8412"
 peer = "0.0.0.0:16493"
 dht = "0.0.0.0:16309"
 dht_bootstrap = []
-peer_encryption = "disabled"
+peer_encryption = "preferred"
 allowed_origins = []
 
 [limits]

@@ -17,7 +17,7 @@ dht_bootstrap = []
 # nat_pmp_gateway = "192.168.1.1:5351"
 
 # disabled | preferred | required
-peer_encryption = "disabled"
+peer_encryption = "preferred"
 
 # These are required together when api is not bound to loopback:
 # tls_certificate = "/etc/dendrite/tls/cert.pem"

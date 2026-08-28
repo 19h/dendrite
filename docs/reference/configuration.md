@@ -36,7 +36,7 @@ read, write, rename, and synchronization access.
 | `dht` | socket address | `0.0.0.0:16309` | DHT UDP endpoint |
 | `dht_bootstrap` | socket-address array | `[]` | literal bootstrap nodes for DHT lookup |
 | `nat_pmp_gateway` | socket address or absent | absent | explicit IPv4 NAT-PMP gateway |
-| `peer_encryption` | enum | `disabled` | `disabled`, `preferred`, or `required` MSE policy |
+| `peer_encryption` | enum | `preferred` | `disabled`, `preferred`, or `required` MSE policy |
 | `tls_certificate` | path or absent | absent | PEM certificate chain for API TLS |
 | `tls_private_key` | path or absent | absent | PEM private key for API TLS |
 | `allowed_origins` | string array | `[]` | exact browser CORS origins |
@@ -92,7 +92,7 @@ api = "127.0.0.1:8412"
 peer = "0.0.0.0:16493"
 dht = "0.0.0.0:16309"
 dht_bootstrap = []
-peer_encryption = "disabled"
+peer_encryption = "preferred"
 allowed_origins = []
 
 [limits]

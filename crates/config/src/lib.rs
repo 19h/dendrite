@@ -33,8 +33,8 @@ pub struct ListenSettings {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerEncryption {
-    #[default]
     Disabled,
+    #[default]
     Preferred,
     Required,
 }
@@ -100,7 +100,7 @@ impl Default for ListenSettings {
             dht: SocketAddr::from(([0, 0, 0, 0], 16_309)),
             dht_bootstrap: Vec::new(),
             nat_pmp_gateway: None,
-            peer_encryption: PeerEncryption::Disabled,
+            peer_encryption: PeerEncryption::Preferred,
             tls_certificate: None,
             tls_private_key: None,
             allowed_origins: Vec::new(),

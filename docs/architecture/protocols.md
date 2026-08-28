@@ -60,9 +60,10 @@ Peer protocol support includes:
   current local engine integration tests covering IPv4 sessions;
 - incoming upload sessions for verified data.
 
-`peer_encryption_enabled = false` is the compatibility-oriented default. When
-enabled, Dendrite negotiates encrypted peer transport; it does not imply that
-the HTTP API, trackers, DHT, payload files, or database are encrypted.
+The compatibility-oriented default is `peer_encryption = "preferred"`: Dendrite
+tries MSE/PE first and falls back to plaintext. Peer transport encryption does
+not imply that the HTTP API, trackers, DHT, payload files, or database are
+encrypted.
 
 ## Web seeds
 

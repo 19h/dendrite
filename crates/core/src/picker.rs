@@ -75,6 +75,16 @@ impl PiecePicker {
         self.update_availability(bitfield, false)
     }
 
+    pub fn add_peer_piece(&mut self, index: usize) -> Result<(), BitfieldError> {
+        let pieces = self.pieces.len();
+        let piece = self
+            .pieces
+            .get_mut(index)
+            .ok_or(BitfieldError::Index { index, pieces })?;
+        piece.availability = piece.availability.saturating_add(1);
+        Ok(())
+    }
+
     pub fn set_enabled(
         &mut self,
         start: usize,
@@ -222,6 +232,18 @@ mod tests {
         picker.add_peer_bitfield(&[0b1010_0000])?;
         assert_eq!(
             picker.select(&[0b1111_0000], SelectionMode::RarestFirst)?,
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn have_updates_piece_availability() -> Result<(), BitfieldError> {
+        let mut picker = PiecePicker::new(4, 1);
+        let bitfield = [0b0100_0000];
+        picker.add_peer_piece(1)?;
+        assert_eq!(
+            picker.select(&bitfield, SelectionMode::RarestFirst)?,
             Some(1)
         );
         Ok(())

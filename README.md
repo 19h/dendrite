@@ -58,7 +58,7 @@ states, management commands, failures, and cleanup.
 |---|---|---|
 | Metadata | v1, v2, and hybrid metainfo; v1/v2 magnets | malformed, non-canonical, unsafe-path, and inconsistent hybrid metadata is rejected |
 | Discovery | HTTP(S) and UDP trackers, DHT, LSD, PEX | no built-in DHT bootstrap list; private torrents suppress DHT, LSD, and PEX |
-| Transport | TCP and uTP; optional MSE; BEP 55 hole punching | encryption is off by default; NAT-PMP needs an explicit IPv4 gateway; no UPnP |
+| Transport | TCP and uTP; MSE preferred with plaintext fallback; BEP 55 hole punching | encryption is transport obfuscation, not anonymity; NAT-PMP needs an explicit IPv4 gateway; no UPnP |
 | Transfer | rarest-first, up to 32 peers, eight-block pipelines, endgame, seeding; HTTP(S) web seeds | no per-torrent destination, sequential mode, ratio target, or bandwidth policy in API v2.0; web seeds reject non-public addresses |
 | Integrity | v1 SHA-1 pieces, v2 SHA-256 Merkle pieces and proofs, hybrid double verification | completion is persisted only after verified payload files are synced |
 | Control | authenticated REST API, WebSocket events, Prometheus metrics, OpenAPI, `dendritectl` | the CLI is a smaller surface than the HTTP API; no web UI; OpenAPI is hand-maintained and incomplete |

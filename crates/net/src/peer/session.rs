@@ -48,6 +48,7 @@ pub struct PeerConnection {
     commands: mpsc::Sender<PeerCommand>,
     events: mpsc::Receiver<PeerEvent>,
     cancellation: CancellationToken,
+    remote_reserved: [u8; 8],
 }
 
 /// A cloneable, send-only view of a live peer session. This lets bounded
@@ -222,6 +223,7 @@ impl PeerConnection {
             commands: command_sender,
             events: event_receiver,
             cancellation,
+            remote_reserved: remote.reserved,
         }
     }
 
@@ -238,6 +240,11 @@ impl PeerConnection {
 
     pub async fn next_event(&mut self) -> Option<PeerEvent> {
         self.events.recv().await
+    }
+
+    #[must_use]
+    pub const fn remote_supports_extensions(&self) -> bool {
+        self.remote_reserved[5] & 0x10 != 0
     }
 
     pub fn shutdown(&self) {
@@ -359,6 +366,8 @@ mod tests {
         let client =
             PeerConnection::connect(address, handshake(1), PeerCodecLimits::default()).await?;
         let mut server = accepting.await??;
+        assert!(!client.remote_supports_extensions());
+        assert!(!server.remote_supports_extensions());
 
         client.send(PeerMessage::Interested).await?;
         client.send(PeerMessage::Have(7)).await?;
@@ -374,6 +383,27 @@ mod tests {
             server.next_event().await,
             Some(PeerEvent::Message(PeerMessage::Have(7)))
         );
+        client.shutdown();
+        server.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exposes_remote_extension_support() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let accepting = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut server_handshake = handshake(2);
+            server_handshake.reserved[5] |= 0x10;
+            PeerConnection::accept(stream, server_handshake, PeerCodecLimits::default()).await
+        });
+        let client =
+            PeerConnection::connect(address, handshake(1), PeerCodecLimits::default()).await?;
+        let server = accepting.await??;
+
+        assert!(client.remote_supports_extensions());
+        assert!(!server.remote_supports_extensions());
         client.shutdown();
         server.shutdown();
         Ok(())
