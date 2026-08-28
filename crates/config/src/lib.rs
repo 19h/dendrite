@@ -232,6 +232,10 @@ mod tests {
     fn defaults_are_valid_and_local() {
         let settings = Settings::default();
         assert!(settings.listen.api.ip().is_loopback());
+        assert!(matches!(
+            settings.listen.peer_encryption,
+            PeerEncryption::Preferred
+        ));
         assert!(settings.validate().is_ok());
     }
 

@@ -57,7 +57,8 @@ const PEER_COMMAND_CAPACITY: usize = 64;
 const ACTIVE_PEER_LIMIT: usize = 32;
 const INCOMING_PEER_LIMIT: usize = 256;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
-const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
+const SWARM_RETRY_MAX: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
@@ -142,6 +143,12 @@ enum PeerWorkerEvent {
 enum PeerWorkerInput {
     Command(PeerWorkerCommand),
     Event(PeerEvent),
+}
+
+struct PeerEventForwarder<'a> {
+    events: &'a mpsc::Sender<PeerWorkerEvent>,
+    worker: usize,
+    allow_extensions: bool,
 }
 
 enum PieceResult {
@@ -1590,7 +1597,16 @@ async fn acquire_magnet_metadata(
         .cloned()
         .map(|tracker| vec![tracker])
         .collect();
-    let peers = discover_with_dht(&trackers, record, services, info_hash, 0, true).await?;
+    let peers = discover_with_dht(
+        &trackers,
+        record,
+        services,
+        info_hash,
+        0,
+        true,
+        AnnounceEvent::Started,
+    )
+    .await?;
     acquire_metadata_from_peers(record, &magnet, info_hash, peers, services, cancellation).await
 }
 
@@ -1946,11 +1962,18 @@ async fn download(
     let info_hash = wire_info_hash(metainfo)?;
     update_record_state(record, TorrentState::Starting, services).await?;
     update_record_state(record, TorrentState::Downloading, services).await?;
-    let peer_result = match discover_peers(metainfo, record, services, info_hash).await {
-        Ok(peers) => {
-            run_peer_swarm(peers, info_hash, metainfo, record, services, cancellation).await
-        }
-        Err(error) => Err(error),
+    let peer_result = if metainfo.web_seeds.is_empty() {
+        download_from_peers_with_retry(metainfo, record, services, cancellation, info_hash).await
+    } else {
+        download_from_peer_round(
+            metainfo,
+            record,
+            services,
+            cancellation,
+            info_hash,
+            AnnounceEvent::Started,
+        )
+        .await
     };
     if !all_complete(&record.completed_pieces, piece_count(metainfo)?) {
         if metainfo.web_seeds.is_empty() {
@@ -1959,6 +1982,70 @@ async fn download(
         download_from_web_seeds(metainfo, record, services, cancellation).await?;
     }
     update_record_state(record, TorrentState::Seeding, services).await
+}
+
+async fn download_from_peers_with_retry(
+    metainfo: &Metainfo,
+    record: &mut TorrentRecord,
+    services: &Services,
+    cancellation: &CancellationToken,
+    info_hash: Sha1Hash,
+) -> Result<(), ActorError> {
+    let mut delay = SWARM_RETRY_MIN;
+    let mut announce_event = AnnounceEvent::Started;
+    loop {
+        cancelled(cancellation)?;
+        let downloaded_before = record.downloaded;
+        match download_from_peer_round(
+            metainfo,
+            record,
+            services,
+            cancellation,
+            info_hash,
+            announce_event,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(ActorError::Cancelled) => return Err(ActorError::Cancelled),
+            Err(error) if retryable_peer_failure(&error) => {
+                debug!(%error, ?delay, "peer swarm exhausted; retrying discovery");
+            }
+            Err(error) => return Err(error),
+        }
+        if all_complete(&record.completed_pieces, piece_count(metainfo)?) {
+            return Ok(());
+        }
+        announce_event = AnnounceEvent::None;
+        if record.downloaded > downloaded_before {
+            delay = SWARM_RETRY_MIN;
+        } else {
+            delay = delay.saturating_mul(2).min(SWARM_RETRY_MAX);
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(ActorError::Cancelled),
+            () = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+fn retryable_peer_failure(error: &ActorError) -> bool {
+    matches!(
+        error,
+        ActorError::NoTracker | ActorError::NoPeers | ActorError::Peer(_)
+    )
+}
+
+async fn download_from_peer_round(
+    metainfo: &Metainfo,
+    record: &mut TorrentRecord,
+    services: &Services,
+    cancellation: &CancellationToken,
+    info_hash: Sha1Hash,
+    announce_event: AnnounceEvent,
+) -> Result<(), ActorError> {
+    let peers = discover_peers(metainfo, record, services, info_hash, announce_event).await?;
+    run_peer_swarm(peers, info_hash, metainfo, record, services, cancellation).await
 }
 
 async fn download_from_web_seeds(
@@ -2465,6 +2552,7 @@ async fn discover_peers(
     record: &TorrentRecord,
     services: &Services,
     info_hash: Sha1Hash,
+    announce_event: AnnounceEvent,
 ) -> Result<Vec<SocketAddr>, ActorError> {
     discover_with_dht(
         &metainfo.trackers,
@@ -2473,6 +2561,7 @@ async fn discover_peers(
         info_hash,
         metainfo.total_length.saturating_sub(record.downloaded),
         !metainfo.private,
+        announce_event,
     )
     .await
 }
@@ -2484,9 +2573,12 @@ async fn discover_with_dht(
     info_hash: Sha1Hash,
     left: u64,
     allow_dht: bool,
+    announce_event: AnnounceEvent,
 ) -> Result<Vec<SocketAddr>, ActorError> {
     let tracker_error =
-        match discover_tracker_peers(trackers, record, services, info_hash, left).await {
+        match discover_tracker_peers(trackers, record, services, info_hash, left, announce_event)
+            .await
+        {
             Ok(peers) => return Ok(peers),
             Err(error) => error,
         };
@@ -2525,6 +2617,7 @@ async fn discover_tracker_peers(
     services: &Services,
     info_hash: Sha1Hash,
     left: u64,
+    announce_event: AnnounceEvent,
 ) -> Result<Vec<SocketAddr>, ActorError> {
     let tracker = HttpTrackerClient::new(services.tracker_response_limit)
         .map_err(|error| ActorError::Peer(error.to_string()))?;
@@ -2538,7 +2631,7 @@ async fn discover_tracker_peers(
         uploaded: record.uploaded,
         downloaded: record.downloaded,
         left,
-        event: AnnounceEvent::Started,
+        event: announce_event,
         numwant: PEER_LIMIT_PER_ANNOUNCE,
     };
     let mut attempted = false;
@@ -2593,43 +2686,10 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
     let Ok(_permit) = context.services.peer_slots.clone().acquire_owned().await else {
         return;
     };
-    let result = connect_peer_worker(
-        context.address,
-        context.info_hash,
-        context.piece_count,
-        &context.services,
-        context.allow_pex,
-        context.force_utp,
-    )
-    .await;
-    let (mut peer, bitfield, peers) = match result {
-        Ok(ready) => ready,
-        Err(error) => {
-            debug!(address = %context.address, %error, "peer connection failed");
-            let _result_ignored = context
-                .events
-                .send(PeerWorkerEvent::Gone {
-                    worker: context.worker,
-                    error: error.to_string(),
-                })
-                .await;
-            return;
-        }
-    };
-    debug!(address = %context.address, "peer connection ready");
-    let _connection = track_connection(&context.services, context.torrent_id);
-    if context
-        .events
-        .send(PeerWorkerEvent::Ready {
-            worker: context.worker,
-            bitfield,
-            peers,
-        })
-        .await
-        .is_err()
-    {
+    let Some(mut peer) = establish_peer_worker(&context).await else {
         return;
-    }
+    };
+    let _connection = track_connection(&context.services, context.torrent_id);
     loop {
         let input = tokio::select! {
             () = context.cancellation.cancelled() => break,
@@ -2639,7 +2699,7 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
             },
             event = next_peer_event_with_timeout(
                 &mut peer,
-                PEER_IDLE_TIMEOUT,
+                context.services.peer_message_timeout.saturating_mul(4),
             ) => match event {
                 Ok(event) => PeerWorkerInput::Event(event),
                 Err(error) => {
@@ -2663,9 +2723,11 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
                     length,
                     &piece_cancellation,
                     context.services.peer_message_timeout,
-                    &context.events,
-                    context.worker,
-                    context.allow_pex,
+                    PeerEventForwarder {
+                        events: &context.events,
+                        worker: context.worker,
+                        allow_extensions: context.allow_pex,
+                    },
                 )
                 .await
                 {
@@ -2710,101 +2772,109 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
                 }
             }
             PeerWorkerInput::Command(PeerWorkerCommand::Shutdown) => break,
-            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Have(piece))) => {
-                debug!(address = %context.address, piece, "peer announced piece availability");
-                if context
-                    .events
-                    .send(PeerWorkerEvent::Have {
-                        worker: context.worker,
-                        piece,
-                    })
-                    .await
-                    .is_err()
-                {
+            PeerWorkerInput::Event(event) => {
+                if !forward_idle_peer_event(&context, event).await {
                     break;
                 }
             }
-            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Extended {
-                extension_id: LOCAL_PEX_EXTENSION_ID,
-                payload,
-            })) if context.allow_pex => match pex_addresses(&payload) {
-                Ok(peers) => {
-                    if context
-                        .events
-                        .send(PeerWorkerEvent::Peers {
-                            worker: context.worker,
-                            peers,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _result_ignored = context
-                        .events
-                        .send(PeerWorkerEvent::Gone {
-                            worker: context.worker,
-                            error: error.to_string(),
-                        })
-                        .await;
-                    break;
-                }
-            },
-            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Extended {
-                extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
-                payload,
-            })) if context.allow_pex => match decode_holepunch_message(&payload) {
-                Ok(message) if message.kind == HolePunchKind::Connect => {
-                    if context
-                        .events
-                        .send(PeerWorkerEvent::HolePunch {
-                            worker: context.worker,
-                            address: message.address,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _result_ignored = context
-                        .events
-                        .send(PeerWorkerEvent::Gone {
-                            worker: context.worker,
-                            error: error.to_string(),
-                        })
-                        .await;
-                    break;
-                }
-            },
-            PeerWorkerInput::Event(PeerEvent::Disconnected) => {
-                let _result_ignored = context
-                    .events
-                    .send(PeerWorkerEvent::Gone {
-                        worker: context.worker,
-                        error: "peer disconnected".to_owned(),
-                    })
-                    .await;
-                break;
-            }
-            PeerWorkerInput::Event(PeerEvent::Failed(error)) => {
-                let _result_ignored = context
-                    .events
-                    .send(PeerWorkerEvent::Gone {
-                        worker: context.worker,
-                        error,
-                    })
-                    .await;
-                break;
-            }
-            PeerWorkerInput::Event(_) => {}
         }
     }
     peer.shutdown();
+}
+
+async fn establish_peer_worker(context: &PeerWorkerContext) -> Option<PeerConnection> {
+    let result = connect_peer_worker(
+        context.address,
+        context.info_hash,
+        context.piece_count,
+        &context.services,
+        context.allow_pex,
+        context.force_utp,
+    )
+    .await;
+    let (peer, bitfield, peers) = match result {
+        Ok(ready) => ready,
+        Err(error) => {
+            debug!(address = %context.address, %error, "peer connection failed");
+            let _result_ignored = context
+                .events
+                .send(PeerWorkerEvent::Gone {
+                    worker: context.worker,
+                    error: error.to_string(),
+                })
+                .await;
+            return None;
+        }
+    };
+    debug!(address = %context.address, "peer connection ready");
+    if context
+        .events
+        .send(PeerWorkerEvent::Ready {
+            worker: context.worker,
+            bitfield,
+            peers,
+        })
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    Some(peer)
+}
+
+async fn forward_idle_peer_event(context: &PeerWorkerContext, event: PeerEvent) -> bool {
+    let worker_event = match event {
+        PeerEvent::Message(PeerMessage::Have(piece)) => {
+            debug!(address = %context.address, piece, "peer announced piece availability");
+            Some(PeerWorkerEvent::Have {
+                worker: context.worker,
+                piece,
+            })
+        }
+        PeerEvent::Message(PeerMessage::Extended {
+            extension_id: LOCAL_PEX_EXTENSION_ID,
+            payload,
+        }) if context.allow_pex => match pex_addresses(&payload) {
+            Ok(peers) => Some(PeerWorkerEvent::Peers {
+                worker: context.worker,
+                peers,
+            }),
+            Err(error) => return report_peer_gone(context, error.to_string()).await,
+        },
+        PeerEvent::Message(PeerMessage::Extended {
+            extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
+            payload,
+        }) if context.allow_pex => match decode_holepunch_message(&payload) {
+            Ok(message) if message.kind == HolePunchKind::Connect => {
+                Some(PeerWorkerEvent::HolePunch {
+                    worker: context.worker,
+                    address: message.address,
+                })
+            }
+            Ok(_) => None,
+            Err(error) => return report_peer_gone(context, error.to_string()).await,
+        },
+        PeerEvent::Disconnected => {
+            return report_peer_gone(context, "peer disconnected".to_owned()).await;
+        }
+        PeerEvent::Failed(error) => return report_peer_gone(context, error).await,
+        _ => None,
+    };
+    match worker_event {
+        Some(event) => context.events.send(event).await.is_ok(),
+        None => true,
+    }
+}
+
+async fn report_peer_gone(context: &PeerWorkerContext, error: String) -> bool {
+    let _result_ignored = context
+        .events
+        .send(PeerWorkerEvent::Gone {
+            worker: context.worker,
+            error,
+        })
+        .await;
+    false
 }
 
 async fn connect_peer_worker(
@@ -2994,9 +3064,7 @@ async fn download_piece_blocks(
     length: usize,
     cancellation: &CancellationToken,
     message_timeout: Duration,
-    events: &mpsc::Sender<PeerWorkerEvent>,
-    worker: usize,
-    allow_pex: bool,
+    forwarder: PeerEventForwarder<'_>,
 ) -> Result<Bytes, ActorError> {
     let piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
     let mut output = vec![0_u8; length];
@@ -3057,42 +3125,49 @@ async fn download_piece_blocks(
                     "peer returned a block for another piece".to_owned(),
                 ));
             }
-            PeerEvent::Message(PeerMessage::Have(piece)) => {
-                events
-                    .send(PeerWorkerEvent::Have { worker, piece })
-                    .await
-                    .map_err(|_| ActorError::Cancelled)?;
-            }
-            PeerEvent::Message(PeerMessage::Extended {
-                extension_id: LOCAL_PEX_EXTENSION_ID,
-                payload,
-            }) if allow_pex => {
-                let peers = pex_addresses(&payload)?;
-                events
-                    .send(PeerWorkerEvent::Peers { worker, peers })
-                    .await
-                    .map_err(|_| ActorError::Cancelled)?;
-            }
-            PeerEvent::Message(PeerMessage::Extended {
-                extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
-                payload,
-            }) if allow_pex => {
-                let message = decode_holepunch_message(&payload)
-                    .map_err(|error| ActorError::Peer(error.to_string()))?;
-                if message.kind == HolePunchKind::Connect {
-                    events
-                        .send(PeerWorkerEvent::HolePunch {
-                            worker,
-                            address: message.address,
-                        })
-                        .await
-                        .map_err(|_| ActorError::Cancelled)?;
-                }
-            }
-            _ => {}
+            event => forward_transfer_peer_event(event, &forwarder).await?,
         }
     }
     Ok(Bytes::from(output))
+}
+
+async fn forward_transfer_peer_event(
+    event: PeerEvent,
+    forwarder: &PeerEventForwarder<'_>,
+) -> Result<(), ActorError> {
+    let worker_event = match event {
+        PeerEvent::Message(PeerMessage::Have(piece)) => Some(PeerWorkerEvent::Have {
+            worker: forwarder.worker,
+            piece,
+        }),
+        PeerEvent::Message(PeerMessage::Extended {
+            extension_id: LOCAL_PEX_EXTENSION_ID,
+            payload,
+        }) if forwarder.allow_extensions => Some(PeerWorkerEvent::Peers {
+            worker: forwarder.worker,
+            peers: pex_addresses(&payload)?,
+        }),
+        PeerEvent::Message(PeerMessage::Extended {
+            extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
+            payload,
+        }) if forwarder.allow_extensions => {
+            let message = decode_holepunch_message(&payload)
+                .map_err(|error| ActorError::Peer(error.to_string()))?;
+            (message.kind == HolePunchKind::Connect).then_some(PeerWorkerEvent::HolePunch {
+                worker: forwarder.worker,
+                address: message.address,
+            })
+        }
+        _ => None,
+    };
+    if let Some(event) = worker_event {
+        forwarder
+            .events
+            .send(event)
+            .await
+            .map_err(|_| ActorError::Cancelled)?;
+    }
+    Ok(())
 }
 
 async fn fill_request_pipeline(
@@ -4728,7 +4803,14 @@ mod tests {
         let mut record = test_record(&metainfo, raw);
         normalize_completion(&mut record, 1);
         store.put_torrent(record.clone()).await?;
-        let peers = discover_peers(&metainfo, &record, &services, info_hash).await?;
+        let peers = discover_peers(
+            &metainfo,
+            &record,
+            &services,
+            info_hash,
+            AnnounceEvent::Started,
+        )
+        .await?;
         assert!(
             peers
                 .iter()
@@ -5398,6 +5480,134 @@ mod tests {
         assert_eq!(record.downloaded, payload.len() as u64);
         tracker_task.await.map_err(|error| error.to_string())??;
         peer_task.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn have_only_superseed_resumes_across_idle_announcements()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let first = Bytes::from(vec![0x31; BLOCK_BYTES * BLOCK_PIPELINE]);
+        let second = Bytes::from(vec![0x32; BLOCK_BYTES * BLOCK_PIPELINE]);
+        let third = Bytes::from(vec![0x33; BLOCK_BYTES * 2]);
+        let raw = multi_piece_v1_metainfo(
+            "delayed-superseed.bin",
+            &[first.clone(), second.clone(), third.clone()],
+        );
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let peer = tokio::spawn(fake_delayed_have_superseed(
+            listener,
+            info_hash,
+            [second.clone(), third.clone()],
+            Duration::from_millis(125),
+        ));
+
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
+        let storage = StorageHandle::start_portable(&downloads, 32)?;
+        write_piece(&metainfo, 0, first.clone(), &storage).await?;
+        let mut record = test_record(&metainfo, raw);
+        normalize_completion(&mut record, 3);
+        set_bit(&mut record.completed_pieces, 0);
+        record.downloaded = first.len() as u64;
+        store.put_torrent(record.clone()).await?;
+        let mut services = test_services(store, storage, "delayed-superseed-test");
+        services.peer_message_timeout = Duration::from_millis(50);
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            run_peer_swarm(
+                vec![address],
+                info_hash,
+                &metainfo,
+                &mut record,
+                &services,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .map_err(|_| "delayed superseed transfer timed out")??;
+
+        assert_eq!(record.completed_pieces, [0b1110_0000]);
+        assert_eq!(record.downloaded, metainfo.total_length);
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        expected.extend_from_slice(&third);
+        assert_eq!(
+            tokio::fs::read(downloads.join("delayed-superseed.bin")).await?,
+            expected
+        );
+        peer.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_swarm_reannounces_and_resumes_partial_progress()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let first = Bytes::from(vec![0x41; BLOCK_BYTES * BLOCK_PIPELINE]);
+        let second = Bytes::from(vec![0x42; BLOCK_BYTES * 2]);
+        let first_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let first_address = first_listener.local_addr()?;
+        let second_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let second_address = second_listener.local_addr()?;
+        let tracker_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let tracker_url = format!("http://{}/announce", tracker_listener.local_addr()?);
+        let raw = multi_piece_v1_metainfo_with_tracker(
+            &tracker_url,
+            "reannounce.bin",
+            &[first.clone(), second.clone()],
+        );
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let tracker = tokio::spawn(fake_tracker_sequence(
+            tracker_listener,
+            [first_address, second_address],
+        ));
+        let first_peer = tokio::spawn(fake_piece_then_disconnect(
+            first_listener,
+            info_hash,
+            0,
+            first.clone(),
+        ));
+        let second_peer = tokio::spawn(fake_single_piece_peer(
+            second_listener,
+            info_hash,
+            1,
+            second.clone(),
+        ));
+
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
+        let storage = StorageHandle::start_portable(&downloads, 32)?;
+        let services = test_services(store.clone(), storage, "reannounce-test");
+        let mut record = test_record(&metainfo, raw);
+        normalize_completion(&mut record, 2);
+        store.put_torrent(record.clone()).await?;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            download(&metainfo, &mut record, &services, &CancellationToken::new()),
+        )
+        .await
+        .map_err(|_| "torrent did not recover after re-announcing")??;
+
+        assert_eq!(record.state, TorrentState::Seeding);
+        assert_eq!(record.completed_pieces, [0b1100_0000]);
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        assert_eq!(
+            tokio::fs::read(downloads.join("reannounce.bin")).await?,
+            expected
+        );
+        tracker.await.map_err(|error| error.to_string())??;
+        first_peer.await.map_err(|error| error.to_string())??;
+        second_peer.await.map_err(|error| error.to_string())??;
         Ok(())
     }
 
@@ -6607,6 +6817,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
     async fn wait_for_error(
         events: &mut broadcast::Receiver<EngineEvent>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -6723,6 +6934,7 @@ mod tests {
         metainfo
     }
 
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
     fn two_file_v1_metainfo(
         root: &str,
         first_name: &str,
@@ -6942,6 +7154,48 @@ mod tests {
         );
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(&body).await?;
+        Ok(())
+    }
+
+    async fn fake_tracker_sequence(
+        listener: TcpListener,
+        peers: [SocketAddr; 2],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for (index, peer) in peers.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 || request.len().saturating_add(read) > 16 * 1024 {
+                    return Err("invalid tracker request".into());
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = std::str::from_utf8(&request)?;
+            if index == 0 && !request.contains("event=started") {
+                return Err("initial announce did not carry the started event".into());
+            }
+            if index > 0 && request.contains("event=") {
+                return Err("repeat announce incorrectly repeated a lifecycle event".into());
+            }
+            let IpAddr::V4(ip) = peer.ip() else {
+                return Err("test peer must use IPv4".into());
+            };
+            let mut body = b"d8:intervali60e5:peers6:".to_vec();
+            body.extend_from_slice(&ip.octets());
+            body.extend_from_slice(&peer.port().to_be_bytes());
+            body.push(b'e');
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await?;
+            stream.write_all(&body).await?;
+        }
         Ok(())
     }
 
@@ -7361,6 +7615,129 @@ mod tests {
         }
     }
 
+    async fn fake_delayed_have_superseed(
+        listener: TcpListener,
+        info_hash: Sha1Hash,
+        remaining_pieces: [Bytes; 2],
+        delay: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (stream, _) = listener.accept().await?;
+        let mut peer = test_peer_connection(stream, info_hash).await?;
+        loop {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Interested)) => break,
+                Some(PeerEvent::Message(PeerMessage::Extended { .. })) => {
+                    return Err("client sent an extension message without negotiation".into());
+                }
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+        peer.send(PeerMessage::Unchoke).await?;
+        expect_no_superseed_request(&mut peer, delay).await?;
+        peer.send(PeerMessage::Have(0)).await?;
+        wait_for_superseed_have(&mut peer, 0).await?;
+        expect_no_superseed_request(&mut peer, delay).await?;
+        peer.send(PeerMessage::Have(1)).await?;
+        serve_superseed_piece(&mut peer, 1, &remaining_pieces[0], true).await?;
+        expect_no_superseed_request(&mut peer, delay).await?;
+        peer.send(PeerMessage::Have(2)).await?;
+        serve_superseed_piece(&mut peer, 2, &remaining_pieces[1], false).await
+    }
+
+    async fn serve_superseed_piece(
+        peer: &mut PeerConnection,
+        piece: u32,
+        payload: &[u8],
+        require_have: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut served = 0_usize;
+        loop {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Request(request))) => {
+                    if request.piece != piece {
+                        return Err("client requested a piece before it was advertised".into());
+                    }
+                    let start = usize::try_from(request.begin)?;
+                    let end = start
+                        .checked_add(usize::try_from(request.length)?)
+                        .ok_or("block range overflow")?;
+                    let block = payload.get(start..end).ok_or("invalid block request")?;
+                    peer.send(PeerMessage::Piece {
+                        piece: request.piece,
+                        begin: request.begin,
+                        block: Bytes::copy_from_slice(block),
+                    })
+                    .await?;
+                    served = served.saturating_add(block.len());
+                }
+                Some(PeerEvent::Message(PeerMessage::Have(received)))
+                    if received == piece && served == payload.len() =>
+                {
+                    return Ok(());
+                }
+                Some(PeerEvent::Message(PeerMessage::Extended { .. })) => {
+                    return Err("client sent an extension message without negotiation".into());
+                }
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None
+                    if !require_have && served == payload.len() =>
+                {
+                    return Ok(());
+                }
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+    }
+
+    async fn expect_no_superseed_request(
+        peer: &mut PeerConnection,
+        duration: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match tokio::time::timeout(duration, peer.next_event()).await {
+            Err(_) => Ok(()),
+            Ok(Some(PeerEvent::Message(PeerMessage::Extended { .. }))) => {
+                Err("client sent an extension message without negotiation".into())
+            }
+            Ok(Some(PeerEvent::Message(PeerMessage::Request(_)))) => {
+                Err("client requested a piece before it was advertised".into())
+            }
+            Ok(Some(PeerEvent::Failed(error))) => Err(error.into()),
+            Ok(Some(PeerEvent::Disconnected) | None) => Err("peer disconnected".into()),
+            Ok(Some(_)) => Err("client sent an unexpected message while superseed was idle".into()),
+        }
+    }
+
+    async fn wait_for_superseed_have(
+        peer: &mut PeerConnection,
+        piece: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match peer.next_event().await {
+                    Some(PeerEvent::Message(PeerMessage::Have(received))) if received == piece => {
+                        return Ok(());
+                    }
+                    Some(PeerEvent::Message(PeerMessage::Extended { .. })) => {
+                        return Err("client sent an extension message without negotiation".into());
+                    }
+                    Some(PeerEvent::Message(PeerMessage::Request(_))) => {
+                        return Err("client requested an already-completed piece".into());
+                    }
+                    Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                    Some(PeerEvent::Disconnected) | None => {
+                        return Err("peer disconnected".into());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "client did not acknowledge the advertised completed piece")?
+    }
+
     async fn fake_disconnect_mid_piece(
         listener: TcpListener,
         info_hash: Sha1Hash,
@@ -7628,6 +8005,22 @@ mod tests {
         .await?;
         peer.send(PeerMessage::Unchoke).await?;
         Ok(())
+    }
+
+    async fn fake_piece_then_disconnect(
+        listener: TcpListener,
+        info_hash: Sha1Hash,
+        piece: u32,
+        payload: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (stream, _) = listener.accept().await?;
+        let mut peer = test_peer_connection(stream, info_hash).await?;
+        wait_for_interest(&mut peer).await?;
+        let bitfield = if piece == 0 { 0x80 } else { 0x40 };
+        peer.send(PeerMessage::Bitfield(Bytes::from(vec![bitfield])))
+            .await?;
+        peer.send(PeerMessage::Unchoke).await?;
+        serve_superseed_piece(&mut peer, piece, &payload, true).await
     }
 
     async fn fake_single_piece_peer(
