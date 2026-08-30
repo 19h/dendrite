@@ -17,6 +17,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dendrite-api-types = { path = "../api-types", version = "2.0.0-alpha.1" }
+dendrite-core = { path = "../core", version = "2.0.0-alpha.1" }
 thiserror.workspace = true
 tokio.workspace = true
 

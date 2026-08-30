@@ -701,6 +701,7 @@ version = "2.0.0-alpha.1"
 dependencies = [
  "clap",
  "dendrite-api-types",
+ "dendrite-core",
  "reqwest",
  "serde",
  "serde_json",

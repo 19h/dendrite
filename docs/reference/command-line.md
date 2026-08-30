@@ -81,6 +81,34 @@ dendritectl list
 Calls `GET /torrents` with server defaults. There are currently no client flags
 for cursor or limit, so this command returns only the first page.
 
+### `watch`
+
+```text
+Usage: dendritectl watch [OPTIONS] [ID]
+
+Arguments:
+  [ID]  Torrent ID. Omit it to watch every torrent
+
+Options:
+      --interval <INTERVAL>  Refresh interval in seconds [default: 1]
+      --no-clear             Append snapshots instead of redrawing the terminal
+```
+
+`watch` is the human-facing live progress view. Without an ID it follows the
+entire queue, traversing every API page; with an ID it shows a larger progress
+bar and details for that torrent. Both views include verified bytes, total size,
+live download/upload rates, connected peers, and estimated time remaining.
+
+```sh
+dendritectl watch
+dendritectl watch 01a05054-eb7e-7da3-9978-a673389fad22
+dendritectl watch --interval 5
+```
+
+Interactive terminals are redrawn in place until `Ctrl-C`. Redirected output
+and `--no-clear` append timestamp-free snapshots, making them suitable for log
+capture. The minimum interval is one second.
+
 ### `add`
 
 ```text

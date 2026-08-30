@@ -185,6 +185,9 @@ current connected peer count.
 
 The client `list` command requests one server-default page and has no cursor or
 limit flags. For more than the configured page size, use the paginated HTTP API.
+For active human-facing progress, use `dendritectl watch` for the entire queue
+or `dendritectl watch <ID>` for one torrent; the watch command follows all API
+pages and refreshes once per second by default.
 
 ## 7. Find the payload
 
