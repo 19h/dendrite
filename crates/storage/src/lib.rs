@@ -1,6 +1,10 @@
 //! Capability-confined positional file I/O.
 
-use std::{io, path::Path};
+use std::{
+    hash::{DefaultHasher, Hash as _, Hasher as _},
+    io,
+    path::Path,
+};
 
 #[cfg(feature = "fault-injection")]
 use std::sync::{
@@ -81,6 +85,14 @@ enum Request {
     },
 }
 
+impl Request {
+    fn path(&self) -> &TorrentPath {
+        match self {
+            Self::Read { path, .. } | Self::Write { path, .. } | Self::Sync { path, .. } => path,
+        }
+    }
+}
+
 impl StorageHandle {
     pub fn start(root: &Path, queue_capacity: usize) -> Result<Self, StorageError> {
         Self::start_inner(root, queue_capacity, BackendRequest::Automatic)
@@ -142,7 +154,7 @@ impl StorageHandle {
         }
         let directory = Dir::open_ambient_dir(root, ambient_authority())?;
         let (sender, receiver) = mpsc::channel(queue_capacity);
-        let backend = spawn_worker(directory, receiver, requested)?;
+        let backend = spawn_worker(directory, receiver, requested, queue_capacity)?;
         Ok(Self {
             sender,
             backend,
@@ -244,6 +256,7 @@ fn spawn_worker(
     directory: Dir,
     receiver: mpsc::Receiver<Request>,
     requested: BackendRequest,
+    queue_capacity: usize,
 ) -> Result<BackendKind, StorageError> {
     #[cfg(target_os = "linux")]
     if !matches!(requested, BackendRequest::Portable) {
@@ -252,7 +265,13 @@ fn spawn_worker(
         std::thread::Builder::new()
             .name("dendrite-storage-io-uring".to_owned())
             .spawn(move || {
-                run_io_uring_or_fallback(directory, receiver, required, &ready_sender);
+                run_io_uring_or_fallback(
+                    directory,
+                    receiver,
+                    required,
+                    queue_capacity,
+                    &ready_sender,
+                );
             })?;
         return ready_receiver
             .recv()
@@ -267,7 +286,7 @@ fn spawn_worker(
     let _ = requested;
     std::thread::Builder::new()
         .name("dendrite-storage-portable".to_owned())
-        .spawn(move || run_worker(&directory, receiver))?;
+        .spawn(move || run_worker(&directory, receiver, queue_capacity))?;
     Ok(BackendKind::Portable)
 }
 
@@ -276,6 +295,7 @@ fn run_io_uring_or_fallback(
     directory: Dir,
     receiver: mpsc::Receiver<Request>,
     required: bool,
+    queue_capacity: usize,
     ready: &std::sync::mpsc::SyncSender<Result<BackendKind, String>>,
 ) {
     match tokio_uring::Runtime::new(&tokio_uring::builder()) {
@@ -289,7 +309,7 @@ fn run_io_uring_or_fallback(
         }
         Err(_) => {
             if ready.send(Ok(BackendKind::Portable)).is_ok() {
-                run_worker(&directory, receiver);
+                run_worker(&directory, receiver, queue_capacity);
             }
         }
     }
@@ -372,30 +392,89 @@ async fn io_uring_sync(root: &Dir, path: &TorrentPath) -> Result<(), StorageErro
     Ok(())
 }
 
-fn run_worker(root: &Dir, mut receiver: mpsc::Receiver<Request>) {
+fn run_worker(root: &Dir, mut receiver: mpsc::Receiver<Request>, queue_capacity: usize) {
+    let worker_count = std::thread::available_parallelism()
+        .map_or(4, |parallelism| parallelism.get().saturating_mul(2))
+        .clamp(4, 32)
+        .min(queue_capacity);
+    let shard_capacity = queue_capacity.div_ceil(worker_count);
+    let roots = (0..worker_count)
+        .map(|_| root.try_clone())
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(roots) = roots else {
+        run_serial_worker(root, &mut receiver);
+        return;
+    };
+    let mut workers = Vec::with_capacity(worker_count);
+    for (index, worker_root) in roots.into_iter().enumerate() {
+        let (sender, worker_receiver) = std::sync::mpsc::sync_channel(shard_capacity);
+        if std::thread::Builder::new()
+            .name(format!("dendrite-storage-portable-{index}"))
+            .spawn(move || run_portable_worker(&worker_root, worker_receiver))
+            .is_ok()
+        {
+            workers.push(sender);
+        }
+    }
+    if workers.is_empty() {
+        run_serial_worker(root, &mut receiver);
+        return;
+    }
     while let Some(request) = receiver.blocking_recv() {
-        match request {
-            Request::Read {
-                path,
-                offset,
-                length,
-                reply,
-            } => {
-                let _result_ignored = reply.send(read_at(root, &path, offset, length));
-            }
-            Request::Write {
-                path,
-                offset,
-                data,
-                file_length,
-                reply,
-            } => {
-                let _result_ignored =
-                    reply.send(write_at(root, &path, offset, data.as_ref(), file_length));
-            }
-            Request::Sync { path, reply } => {
-                let _result_ignored = reply.send(sync_file(root, &path));
-            }
+        let mut hasher = DefaultHasher::new();
+        request.path().hash(&mut hasher);
+        let index = usize::try_from(hasher.finish()).unwrap_or(0) % workers.len();
+        if let Err(error) = workers[index].send(request) {
+            fail_request(error.0);
+        }
+    }
+}
+
+fn run_serial_worker(root: &Dir, receiver: &mut mpsc::Receiver<Request>) {
+    while let Some(request) = receiver.blocking_recv() {
+        execute_request(root, request);
+    }
+}
+
+fn run_portable_worker(root: &Dir, receiver: std::sync::mpsc::Receiver<Request>) {
+    for request in receiver {
+        execute_request(root, request);
+    }
+}
+
+fn execute_request(root: &Dir, request: Request) {
+    match request {
+        Request::Read {
+            path,
+            offset,
+            length,
+            reply,
+        } => {
+            let _result_ignored = reply.send(read_at(root, &path, offset, length));
+        }
+        Request::Write {
+            path,
+            offset,
+            data,
+            file_length,
+            reply,
+        } => {
+            let _result_ignored =
+                reply.send(write_at(root, &path, offset, data.as_ref(), file_length));
+        }
+        Request::Sync { path, reply } => {
+            let _result_ignored = reply.send(sync_file(root, &path));
+        }
+    }
+}
+
+fn fail_request(request: Request) {
+    match request {
+        Request::Read { reply, .. } => {
+            let _result_ignored = reply.send(Err(StorageError::WorkerStopped));
+        }
+        Request::Write { reply, .. } | Request::Sync { reply, .. } => {
+            let _result_ignored = reply.send(Err(StorageError::WorkerStopped));
         }
     }
 }

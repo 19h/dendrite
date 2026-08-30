@@ -769,6 +769,7 @@ dependencies = [
  "dendrite-net",
  "dendrite-persistence",
  "dendrite-storage",
+ "futures-util",
  "rand 0.10.2",
  "reqwest",
  "sha1 0.11.0",

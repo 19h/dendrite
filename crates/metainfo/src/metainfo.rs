@@ -25,6 +25,8 @@ pub struct FileEntry {
     pub length: u64,
     pub pieces_root: Option<Sha256Hash>,
     pub padding: bool,
+    #[serde(skip)]
+    pub wire_offset: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,16 +144,18 @@ impl Metainfo {
 
         let v1_piece_hashes = parse_v1_piece_hashes(info_dict, has_v1)?;
 
-        let v1_files = if has_v1 {
+        let mut v1_files = if has_v1 {
             parse_v1_files(info_dict, &name)?
         } else {
             Vec::new()
         };
-        let files = if has_v2 {
+        assign_wire_offsets(&mut v1_files)?;
+        let mut files = if has_v2 {
             parse_v2_files(info_dict, &name)?
         } else {
             v1_files.clone()
         };
+        assign_wire_offsets(&mut files)?;
         if has_v1 {
             validate_unique_paths(&v1_files)?;
         }
@@ -274,6 +278,7 @@ fn parse_v1_files(
                     length,
                     pieces_root: None,
                     padding,
+                    wire_offset: 0,
                 })
             })
             .collect()
@@ -287,6 +292,7 @@ fn parse_v1_files(
             length,
             pieces_root: None,
             padding: false,
+            wire_offset: 0,
         }])
     }
 }
@@ -297,6 +303,17 @@ fn sum_file_lengths(files: &[FileEntry]) -> Result<u64, MetainfoError> {
             .checked_add(file.length)
             .ok_or(MetainfoError::TotalLengthOverflow)
     })
+}
+
+fn assign_wire_offsets(files: &mut [FileEntry]) -> Result<(), MetainfoError> {
+    let mut offset = 0_u64;
+    for file in files {
+        file.wire_offset = offset;
+        offset = offset
+            .checked_add(file.length)
+            .ok_or(MetainfoError::TotalLengthOverflow)?;
+    }
+    Ok(())
 }
 
 fn validate_hybrid_layout(
@@ -382,6 +399,7 @@ fn walk_v2_tree(
                 length,
                 pieces_root,
                 padding: attr.contains(&b'p'),
+                wire_offset: 0,
             });
         } else {
             let component = text(key, "info.file tree path")?;

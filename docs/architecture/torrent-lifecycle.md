@@ -69,16 +69,17 @@ top-level names but do not have identical identities.
 
 ## Discovery
 
-For public torrents, initial discovery combines wide-area sources:
+For public torrents, initial discovery runs all sources concurrently:
 
-1. announce to every valid tracker tier and combine their peers;
-2. also query DHT when bootstrap nodes are configured;
-3. if neither wide-area source produced peers, try local service discovery.
+1. announce concurrently to every valid tracker tier;
+2. query DHT at the same time when bootstrap nodes are configured;
+3. query local service discovery without waiting for either wide-area source.
 
-PEX can add peers after compatible peer sessions exist. Discovery is repeated
-after a swarm is exhausted, but sources are not maintained continuously in
-parallel. Private torrents use their declared trackers and suppress DHT, local
-discovery, and PEX.
+Each result streams immediately into a deduplicated candidate queue. PEX adds
+more candidates after compatible peer sessions exist. Unused candidates remain
+available to replace failed sessions, and discovery is repeated only after the
+live swarm and candidate queue are exhausted. Private torrents use their
+declared trackers and suppress DHT, local discovery, and PEX.
 
 With the default empty DHT bootstrap list, a torrent that has no working
 tracker cannot rely on DHT discovery until the operator supplies bootstrap
@@ -88,7 +89,7 @@ nodes.
 
 The actor connects to a bounded set of discovered peers over TCP or uTP,
 performs protocol negotiation, and chooses pieces rarest-first. The current
-transfer scheduler uses up to 32 peers, with an eight-block request pipeline per
+transfer scheduler uses up to 256 peers, with a 64-block request pipeline per
 peer. Near completion, endgame scheduling can duplicate outstanding requests
 and cancel redundant work when one copy arrives.
 

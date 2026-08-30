@@ -166,9 +166,15 @@ tracker returns several candidates but only one connects, investigate routing,
 firewall, encryption policy, and remote churn. If it returns one candidate,
 check the other tracker tiers and configured DHT bootstrap nodes.
 
-Measure progress with two summary requests at least 250 ms apart. A single
-`download_rate: 0` sample does not mean the transfer is idle; compare the
-durable `downloaded` counter as well.
+Tracker tiers, DHT, and local discovery run concurrently. Usable results are
+connected immediately, while later results remain available as replacements for
+failed sessions. A long list of dead trackers should therefore increase log
+noise but must not delay a healthy tracker or an already discovered peer.
+
+Measure progress with two summary requests at least 250 ms apart. The live
+`download_rate` includes accepted peer blocks, including partial pieces; the
+durable `downloaded` counter advances only after complete pieces are verified,
+synced, and committed.
 
 ## Torrent is stuck in `starting`
 

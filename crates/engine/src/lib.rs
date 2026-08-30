@@ -1,7 +1,7 @@
 //! Supervised torrent actors and their bounded command interface.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
@@ -32,6 +32,7 @@ use dendrite_net::{
 };
 use dendrite_persistence::{StateStoreHandle, StoreError, TorrentRecord};
 use dendrite_storage::{StorageError, StorageHandle};
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use reqwest::{
     Client, StatusCode,
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE},
@@ -52,10 +53,14 @@ const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 4096;
 const PEER_LIMIT_PER_ANNOUNCE: u16 = 80;
 const BLOCK_BYTES: usize = 16 * 1024;
-const BLOCK_PIPELINE: usize = 8;
+const BLOCK_PIPELINE: usize = 64;
 const PEER_COMMAND_CAPACITY: usize = 64;
-const ACTIVE_PEER_LIMIT: usize = 32;
+const ACTIVE_PEER_LIMIT: usize = 256;
 const INCOMING_PEER_LIMIT: usize = 256;
+const TRACKER_ANNOUNCE_CONCURRENCY: usize = 128;
+const DISCOVERY_EVENT_CAPACITY: usize = 256;
+const METADATA_PEER_CONCURRENCY: usize = 32;
+const STORAGE_IO_CONCURRENCY: usize = 256;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -88,7 +93,8 @@ struct SwarmState {
     picker: PiecePicker,
     connecting: usize,
     last_error: Option<String>,
-    addresses: HashSet<SocketAddr>,
+    candidates: VecDeque<PeerCandidate>,
+    known_candidates: HashSet<PeerCandidate>,
     next_worker: usize,
     event_sender: mpsc::Sender<PeerWorkerEvent>,
     info_hash: Sha1Hash,
@@ -98,6 +104,41 @@ struct SwarmState {
     allow_pex: bool,
     torrent_id: TorrentId,
     peer_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PeerCandidate {
+    address: SocketAddr,
+    force_utp: bool,
+}
+
+enum DiscoveryEvent {
+    Peers(Vec<SocketAddr>),
+    Finished(Result<(), ActorError>),
+}
+
+enum DiscoverySourceResult {
+    Tracker {
+        url: Url,
+        result: Result<Vec<SocketAddr>, String>,
+    },
+    Dht(Result<Vec<SocketAddr>, String>),
+    Lsd(Vec<SocketAddr>),
+}
+
+struct DiscoveryQuery<'a> {
+    trackers: &'a [Vec<String>],
+    record: &'a TorrentRecord,
+    info_hash: Sha1Hash,
+    left: u64,
+    allow_dht: bool,
+    announce_event: AnnounceEvent,
+    cancellation: CancellationToken,
+}
+
+enum SwarmLoopEvent {
+    Worker(PeerWorkerEvent),
+    Discovery(Option<DiscoveryEvent>),
 }
 
 enum PeerWorkerCommand {
@@ -148,6 +189,8 @@ enum PeerWorkerInput {
 
 struct PeerEventForwarder<'a> {
     events: &'a mpsc::Sender<PeerWorkerEvent>,
+    activity: &'a Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
+    torrent_id: TorrentId,
     worker: usize,
     allow_extensions: bool,
 }
@@ -242,7 +285,7 @@ struct Services {
     encryption: EncryptionPolicy,
     rendezvous: Arc<Mutex<HashMap<(Sha1Hash, SocketAddr), RendezvousPeer>>>,
     connected_peers: Arc<AtomicUsize>,
-    torrent_peers: Arc<std::sync::Mutex<HashMap<TorrentId, usize>>>,
+    torrent_activity: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     payload_claims: Arc<std::sync::Mutex<HashMap<TorrentId, Vec<TorrentPath>>>>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
@@ -257,8 +300,14 @@ struct RendezvousPeer {
 
 struct ConnectionGuard {
     connected: Arc<AtomicUsize>,
-    torrents: Arc<std::sync::Mutex<HashMap<TorrentId, usize>>>,
+    torrents: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     torrent_id: TorrentId,
+}
+
+#[derive(Default)]
+struct TorrentActivity {
+    peers: usize,
+    downloaded_bytes: u64,
 }
 
 struct PayloadClaim {
@@ -280,10 +329,7 @@ impl Drop for ConnectionGuard {
         if let Ok(mut peers) = self.torrents.lock()
             && let Some(count) = peers.get_mut(&self.torrent_id)
         {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                peers.remove(&self.torrent_id);
-            }
+            count.peers = count.peers.saturating_sub(1);
         }
     }
 }
@@ -384,7 +430,7 @@ impl EngineHandle {
             encryption: options.encryption,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -484,22 +530,32 @@ impl EngineHandle {
     #[must_use]
     pub fn torrent_peer_count(&self, id: TorrentId) -> usize {
         self.services
-            .torrent_peers
+            .torrent_activity
             .lock()
             .ok()
-            .and_then(|peers| peers.get(&id).copied())
+            .and_then(|peers| peers.get(&id).map(|activity| activity.peers))
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn torrent_downloaded_bytes(&self, id: TorrentId) -> u64 {
+        self.services
+            .torrent_activity
+            .lock()
+            .ok()
+            .and_then(|peers| peers.get(&id).map(|activity| activity.downloaded_bytes))
             .unwrap_or(0)
     }
 }
 
 fn track_connection(services: &Services, torrent_id: TorrentId) -> ConnectionGuard {
     services.connected_peers.fetch_add(1, Ordering::AcqRel);
-    if let Ok(mut peers) = services.torrent_peers.lock() {
-        *peers.entry(torrent_id).or_default() += 1;
+    if let Ok(mut peers) = services.torrent_activity.lock() {
+        peers.entry(torrent_id).or_default().peers += 1;
     }
     ConnectionGuard {
         connected: services.connected_peers.clone(),
-        torrents: services.torrent_peers.clone(),
+        torrents: services.torrent_activity.clone(),
         torrent_id,
     }
 }
@@ -1598,19 +1654,114 @@ async fn acquire_magnet_metadata(
         .cloned()
         .map(|tracker| vec![tracker])
         .collect();
-    let peers = discover_with_dht(
-        &trackers,
-        record,
+    let discovery = start_peer_discovery(
         services,
+        DiscoveryQuery {
+            trackers: &trackers,
+            record,
+            info_hash,
+            left: 0,
+            allow_dht: true,
+            announce_event: AnnounceEvent::Started,
+            cancellation: cancellation.child_token(),
+        },
+    )?;
+    acquire_metadata_from_discovery(
+        record,
+        &magnet,
         info_hash,
-        0,
-        true,
-        AnnounceEvent::Started,
+        discovery,
+        services,
+        cancellation,
     )
-    .await?;
-    acquire_metadata_from_peers(record, &magnet, info_hash, peers, services, cancellation).await
+    .await
 }
 
+async fn acquire_metadata_from_discovery(
+    record: &mut TorrentRecord,
+    magnet: &Magnet,
+    info_hash: Sha1Hash,
+    mut discovery: mpsc::Receiver<DiscoveryEvent>,
+    services: &Services,
+    cancellation: &CancellationToken,
+) -> Result<(), ActorError> {
+    let attempts_cancellation = cancellation.child_token();
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut candidates = VecDeque::new();
+    let mut known = HashSet::new();
+    let mut discovery_done = false;
+    let mut last_error = None;
+    loop {
+        while attempts.len() < METADATA_PEER_CONCURRENCY {
+            let Some(address) = candidates.pop_front() else {
+                break;
+            };
+            let magnet = magnet.clone();
+            let services = services.clone();
+            let cancellation = attempts_cancellation.child_token();
+            attempts.spawn(async move {
+                fetch_and_validate_metadata(address, info_hash, &magnet, &services, &cancellation)
+                    .await
+            });
+        }
+        if discovery_done && attempts.is_empty() && candidates.is_empty() {
+            return Err(last_error.unwrap_or(ActorError::NoPeers));
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => {
+                attempts_cancellation.cancel();
+                attempts.abort_all();
+                return Err(ActorError::Cancelled);
+            }
+            event = discovery.recv(), if !discovery_done => match event {
+                Some(DiscoveryEvent::Peers(peers)) => {
+                    candidates.extend(peers.into_iter().filter(|address| known.insert(*address)));
+                }
+                Some(DiscoveryEvent::Finished(result)) => {
+                    if let Err(error) = result {
+                        last_error = Some(error);
+                    }
+                    discovery_done = true;
+                }
+                None => discovery_done = true,
+            },
+            joined = attempts.join_next(), if !attempts.is_empty() => match joined {
+                Some(Ok(Ok((raw, parsed)))) => {
+                    attempts_cancellation.cancel();
+                    attempts.abort_all();
+                    record.name = parsed.name;
+                    record.total_length = parsed.total_length;
+                    record.v1_info_hash = parsed.v1_info_hash;
+                    record.v2_info_hash = parsed.v2_info_hash;
+                    record.raw_metainfo = raw;
+                    replace_record(services, record.clone()).await?;
+                    return Ok(());
+                }
+                Some(Ok(Err(ActorError::Cancelled))) if cancellation.is_cancelled() => {
+                    return Err(ActorError::Cancelled);
+                }
+                Some(Ok(Err(error))) => last_error = Some(error),
+                Some(Err(error)) => last_error = Some(ActorError::Peer(error.to_string())),
+                None => {}
+            }
+        }
+    }
+}
+
+async fn fetch_and_validate_metadata(
+    address: SocketAddr,
+    info_hash: Sha1Hash,
+    magnet: &Magnet,
+    services: &Services,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<u8>, Metainfo), ActorError> {
+    let (info, mut peer) = fetch_metadata(address, info_hash, services, cancellation).await?;
+    let result = validate_acquired_metadata(&info, &mut peer, magnet, services).await;
+    peer.shutdown();
+    result
+}
+
+#[cfg(test)]
 async fn acquire_metadata_from_peers(
     record: &mut TorrentRecord,
     magnet: &Magnet,
@@ -2045,8 +2196,28 @@ async fn download_from_peer_round(
     info_hash: Sha1Hash,
     announce_event: AnnounceEvent,
 ) -> Result<(), ActorError> {
-    let peers = discover_peers(metainfo, record, services, info_hash, announce_event).await?;
-    run_peer_swarm(peers, info_hash, metainfo, record, services, cancellation).await
+    let discovery = start_peer_discovery(
+        services,
+        DiscoveryQuery {
+            trackers: &metainfo.trackers,
+            record,
+            info_hash,
+            left: metainfo.total_length.saturating_sub(record.downloaded),
+            allow_dht: !metainfo.private,
+            announce_event,
+            cancellation: cancellation.child_token(),
+        },
+    )?;
+    run_peer_swarm_with_discovery(
+        Vec::new(),
+        Some(discovery),
+        info_hash,
+        metainfo,
+        record,
+        services,
+        cancellation,
+    )
+    .await
 }
 
 async fn download_from_web_seeds(
@@ -2103,7 +2274,10 @@ async fn download_from_web_seeds(
         })?;
         write_piece(metainfo, piece, data, &services.storage).await?;
         set_bit(&mut record.completed_pieces, piece);
-        record.downloaded = completed_bytes(metainfo, &record.completed_pieces)?;
+        record.downloaded = record
+            .downloaded
+            .checked_add(piece_content_length(metainfo, piece)?)
+            .ok_or(ActorError::Arithmetic)?;
         replace_record(services, record.clone()).await?;
     }
     Ok(())
@@ -2331,6 +2505,7 @@ async fn fetch_http_range(
     Ok(output.freeze())
 }
 
+#[cfg(test)]
 async fn run_peer_swarm(
     peers: Vec<SocketAddr>,
     info_hash: Sha1Hash,
@@ -2339,9 +2514,29 @@ async fn run_peer_swarm(
     services: &Services,
     cancellation: &CancellationToken,
 ) -> Result<(), ActorError> {
+    run_peer_swarm_with_discovery(
+        peers,
+        None,
+        info_hash,
+        metainfo,
+        record,
+        services,
+        cancellation,
+    )
+    .await
+}
+
+async fn run_peer_swarm_with_discovery(
+    peers: Vec<SocketAddr>,
+    mut discovery: Option<mpsc::Receiver<DiscoveryEvent>>,
+    info_hash: Sha1Hash,
+    metainfo: &Metainfo,
+    record: &mut TorrentRecord,
+    services: &Services,
+    cancellation: &CancellationToken,
+) -> Result<(), ActorError> {
     let pieces = piece_count(metainfo)?;
-    let worker_count = peers.len().min(services.per_torrent_peer_limit);
-    let event_capacity = worker_count.saturating_mul(4).max(1);
+    let event_capacity = services.per_torrent_peer_limit.saturating_mul(4).max(1);
     let (event_sender, mut events) = mpsc::channel(event_capacity);
     let mut picker = PiecePicker::new(pieces, 4);
     for index in 0..pieces {
@@ -2352,12 +2547,13 @@ async fn run_peer_swarm(
         }
     }
     let mut swarm = SwarmState {
-        workers: HashMap::with_capacity(worker_count),
+        workers: HashMap::with_capacity(services.per_torrent_peer_limit),
         assignments: HashMap::new(),
         picker,
         connecting: 0,
         last_error: None,
-        addresses: HashSet::with_capacity(worker_count),
+        candidates: VecDeque::new(),
+        known_candidates: HashSet::new(),
         next_worker: 0,
         event_sender,
         info_hash,
@@ -2368,18 +2564,19 @@ async fn run_peer_swarm(
         torrent_id: record.id,
         peer_limit: services.per_torrent_peer_limit,
     };
-    for address in peers.into_iter().take(worker_count) {
-        spawn_swarm_worker(&mut swarm, address);
-    }
+    enqueue_peer_candidates(&mut swarm, peers, false);
+    fill_peer_slots(&mut swarm);
+    let mut discovery_error = None;
     loop {
         if cancellation.is_cancelled() {
             shutdown_swarm(&swarm);
             return Err(ActorError::Cancelled);
         }
         if all_complete(&record.completed_pieces, pieces) {
-            shutdown_swarm(&swarm);
+            stop_workers(&swarm.workers, &swarm.assignments);
             return Ok(());
         }
+        fill_peer_slots(&mut swarm);
         let scheduled = schedule_pieces(
             &mut swarm.workers,
             &mut swarm.assignments,
@@ -2387,11 +2584,16 @@ async fn run_peer_swarm(
             metainfo,
         )?;
         if scheduled == 0
+            && discovery.is_none()
+            && swarm.candidates.is_empty()
             && swarm.connecting == 0
             && swarm.assignments.is_empty()
             && swarm.workers.is_empty()
         {
             shutdown_swarm(&swarm);
+            if let Some(error) = discovery_error {
+                return Err(error);
+            }
             return Err(swarm
                 .last_error
                 .map_or(ActorError::NoPeers, ActorError::Peer));
@@ -2401,9 +2603,37 @@ async fn run_peer_swarm(
                 shutdown_swarm(&swarm);
                 return Err(ActorError::Cancelled);
             },
-            event = events.recv() => event.ok_or(ActorError::NoPeers)?,
+            event = events.recv() => {
+                SwarmLoopEvent::Worker(event.ok_or(ActorError::NoPeers)?)
+            },
+            event = receive_discovery_event(&mut discovery), if discovery.is_some() => {
+                SwarmLoopEvent::Discovery(event)
+            },
         };
-        handle_worker_event(&mut swarm, event, metainfo, record, services).await?;
+        match event {
+            SwarmLoopEvent::Worker(event) => {
+                handle_worker_event(&mut swarm, event, metainfo, record, services).await?;
+            }
+            SwarmLoopEvent::Discovery(Some(DiscoveryEvent::Peers(peers))) => {
+                enqueue_peer_candidates(&mut swarm, peers, false);
+            }
+            SwarmLoopEvent::Discovery(Some(DiscoveryEvent::Finished(result))) => {
+                if let Err(error) = result {
+                    discovery_error = Some(error);
+                }
+                discovery = None;
+            }
+            SwarmLoopEvent::Discovery(None) => discovery = None,
+        }
+    }
+}
+
+async fn receive_discovery_event(
+    discovery: &mut Option<mpsc::Receiver<DiscoveryEvent>>,
+) -> Option<DiscoveryEvent> {
+    match discovery {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2412,14 +2642,29 @@ fn shutdown_swarm(swarm: &SwarmState) {
     stop_workers(&swarm.workers, &swarm.assignments);
 }
 
-fn spawn_swarm_worker(swarm: &mut SwarmState, address: SocketAddr) {
-    spawn_swarm_worker_with_transport(swarm, address, false);
+fn enqueue_peer_candidates(
+    swarm: &mut SwarmState,
+    peers: impl IntoIterator<Item = SocketAddr>,
+    force_utp: bool,
+) {
+    for address in peers {
+        let candidate = PeerCandidate { address, force_utp };
+        if swarm.known_candidates.insert(candidate) {
+            swarm.candidates.push_back(candidate);
+        }
+    }
 }
 
-fn spawn_swarm_worker_with_transport(swarm: &mut SwarmState, address: SocketAddr, force_utp: bool) {
-    if swarm.workers.len() >= swarm.peer_limit || !swarm.addresses.insert(address) {
-        return;
+fn fill_peer_slots(swarm: &mut SwarmState) {
+    while swarm.workers.len() < swarm.peer_limit {
+        let Some(candidate) = swarm.candidates.pop_front() else {
+            break;
+        };
+        spawn_swarm_worker(swarm, candidate);
     }
+}
+
+fn spawn_swarm_worker(swarm: &mut SwarmState, candidate: PeerCandidate) {
     let worker = swarm.next_worker;
     swarm.next_worker = swarm.next_worker.saturating_add(1);
     let (commands, receiver) = mpsc::channel(PEER_COMMAND_CAPACITY);
@@ -2435,14 +2680,14 @@ fn spawn_swarm_worker_with_transport(swarm: &mut SwarmState, address: SocketAddr
     swarm.services.tasks.spawn(peer_worker(
         PeerWorkerContext {
             worker,
-            address,
+            address: candidate.address,
             info_hash: swarm.info_hash,
             piece_count: swarm.piece_count,
             services: swarm.services.clone(),
             events: swarm.event_sender.clone(),
             cancellation: swarm.cancellation.child_token(),
             allow_pex: swarm.allow_pex,
-            force_utp,
+            force_utp: candidate.force_utp,
             torrent_id: swarm.torrent_id,
         },
         receiver,
@@ -2475,9 +2720,7 @@ async fn handle_worker_event(
                 handle.bitfield = Some(bitfield);
                 handle.idle = true;
             }
-            for address in peers {
-                spawn_swarm_worker(swarm, address);
-            }
+            enqueue_peer_candidates(swarm, peers, false);
         }
         PeerWorkerEvent::Complete {
             worker,
@@ -2508,9 +2751,7 @@ async fn handle_worker_event(
         }
         PeerWorkerEvent::Peers { worker, peers } => {
             if swarm.workers.contains_key(&worker) {
-                for address in peers {
-                    spawn_swarm_worker(swarm, address);
-                }
+                enqueue_peer_candidates(swarm, peers, false);
             }
         }
         PeerWorkerEvent::Have { worker, piece } => {
@@ -2541,13 +2782,14 @@ async fn handle_worker_event(
         }
         PeerWorkerEvent::HolePunch { worker, address } => {
             if swarm.workers.contains_key(&worker) {
-                spawn_swarm_worker_with_transport(swarm, address, true);
+                enqueue_peer_candidates(swarm, [address], true);
             }
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 async fn discover_peers(
     metainfo: &Metainfo,
     record: &TorrentRecord,
@@ -2567,6 +2809,7 @@ async fn discover_peers(
     .await
 }
 
+#[cfg(test)]
 async fn discover_with_dht(
     trackers: &[Vec<String>],
     record: &TorrentRecord,
@@ -2576,70 +2819,198 @@ async fn discover_with_dht(
     allow_dht: bool,
     announce_event: AnnounceEvent,
 ) -> Result<Vec<SocketAddr>, ActorError> {
-    let mut peers = HashSet::new();
-    let tracker_error =
-        match discover_tracker_peers(trackers, record, services, info_hash, left, announce_event)
-            .await
-        {
-            Ok(discovered) => {
-                peers.extend(discovered);
-                None
-            }
-            Err(error) => Some(error),
-        };
-    let mut dht_error = None;
-    if allow_dht && !services.dht_bootstrap.is_empty() {
-        let client = if let Some(client) = &services.dht {
+    let receiver = start_peer_discovery(
+        services,
+        DiscoveryQuery {
+            trackers,
+            record,
+            info_hash,
+            left,
+            allow_dht,
+            announce_event,
+            cancellation: services.shutdown.child_token(),
+        },
+    )?;
+    collect_discovered_peers(receiver).await
+}
+
+fn start_peer_discovery(
+    services: &Services,
+    query: DiscoveryQuery<'_>,
+) -> Result<mpsc::Receiver<DiscoveryEvent>, ActorError> {
+    let http = HttpTrackerClient::new(services.tracker_response_limit)
+        .map_err(|error| ActorError::Peer(error.to_string()))?;
+    let udp = UdpTrackerClient::new(services.tracker_response_limit)
+        .map_err(|error| ActorError::Peer(error.to_string()))?;
+    let request = tracker_request(
+        query.record,
+        services,
+        query.info_hash,
+        query.left,
+        query.announce_event,
+    );
+    let urls = tracker_urls(query.trackers);
+    let dht = if query.allow_dht && !services.dht_bootstrap.is_empty() {
+        Some(if let Some(client) = &services.dht {
             client.clone()
         } else {
             DhtClient::new(128, 65_507, Duration::from_secs(2))
                 .map_err(|error| ActorError::Peer(error.to_string()))?
+        })
+    } else {
+        None
+    };
+    let bootstrap = services.dht_bootstrap.clone();
+    let lsd_services = services.clone();
+    let tracker_attempted = !urls.is_empty();
+    let info_hash = query.info_hash;
+    let allow_dht = query.allow_dht;
+    let cancellation = query.cancellation;
+    let (sender, receiver) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
+    let slots = Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY));
+    let mut sources = tokio::task::JoinSet::new();
+    for url in urls {
+        let http = http.clone();
+        let slots = slots.clone();
+        sources.spawn(async move {
+            let permit = slots.acquire_owned().await;
+            let result = match permit {
+                Ok(_permit) => announce_tracker(&http, udp, &url, request).await,
+                Err(error) => Err(error.to_string()),
+            };
+            DiscoverySourceResult::Tracker { url, result }
+        });
+    }
+    if let Some(dht) = dht {
+        sources.spawn(async move {
+            let result = match tokio::time::timeout(
+                DHT_DISCOVERY_TIMEOUT,
+                dht.get_peers(info_hash, &bootstrap),
+            )
+            .await
+            {
+                Ok(Ok(peers)) => Ok(peers),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("DHT lookup timed out".to_owned()),
+            };
+            DiscoverySourceResult::Dht(result)
+        });
+    }
+    if allow_dht {
+        sources.spawn(async move {
+            DiscoverySourceResult::Lsd(discover_lsd_peer(info_hash, &lsd_services).await)
+        });
+    }
+    services.tasks.spawn(forward_discovery_sources(
+        sources,
+        sender.clone(),
+        cancellation,
+        tracker_attempted,
+        allow_dht,
+    ));
+    drop(sender);
+    Ok(receiver)
+}
+
+async fn forward_discovery_sources(
+    mut sources: tokio::task::JoinSet<DiscoverySourceResult>,
+    sender: mpsc::Sender<DiscoveryEvent>,
+    cancellation: CancellationToken,
+    tracker_attempted: bool,
+    allow_dht: bool,
+) {
+    let mut found = false;
+    let mut last_error = None;
+    loop {
+        let joined = tokio::select! {
+            () = cancellation.cancelled() => return,
+            () = sender.closed() => return,
+            joined = sources.join_next() => joined,
         };
-        match tokio::time::timeout(
-            DHT_DISCOVERY_TIMEOUT,
-            client.get_peers(info_hash, &services.dht_bootstrap),
-        )
-        .await
-        {
-            Ok(Ok(discovered)) => {
-                debug!(peers = discovered.len(), "DHT peer discovery succeeded");
-                peers.extend(discovered);
+        let Some(joined) = joined else {
+            break;
+        };
+        let source = match joined {
+            Ok(source) => source,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
             }
-            Ok(Err(error)) => dht_error = Some(error.to_string()),
-            Err(_) => dht_error = Some("DHT lookup timed out".to_owned()),
+        };
+        let peers = match source {
+            DiscoverySourceResult::Tracker { url, result } => match result {
+                Ok(peers) => {
+                    debug!(tracker = %url, peers = peers.len(), "tracker announce succeeded");
+                    peers
+                }
+                Err(error) => {
+                    debug!(tracker = %url, %error, "tracker announce failed");
+                    last_error = Some(error);
+                    Vec::new()
+                }
+            },
+            DiscoverySourceResult::Dht(result) => match result {
+                Ok(peers) => {
+                    debug!(peers = peers.len(), "DHT peer discovery succeeded");
+                    peers
+                }
+                Err(error) => {
+                    debug!(%error, "DHT peer discovery failed");
+                    last_error = Some(error);
+                    Vec::new()
+                }
+            },
+            DiscoverySourceResult::Lsd(peers) => peers,
+        };
+        if !peers.is_empty() {
+            found = true;
+            if sender.send(DiscoveryEvent::Peers(peers)).await.is_err() {
+                return;
+            }
         }
     }
-    if peers.is_empty() && allow_dht {
-        peers.extend(discover_lsd_peer(info_hash, services).await);
-    }
-    if !peers.is_empty() {
-        return Ok(peers.into_iter().collect());
-    }
-    if let Some(error) = dht_error {
-        Err(ActorError::Peer(format!(
-            "tracker discovery failed ({}); DHT failed ({error}); local discovery found no peers",
-            tracker_error.map_or_else(|| "no peers".to_owned(), |error| error.to_string())
-        )))
+    let result = if found {
+        Ok(())
+    } else if !tracker_attempted && !allow_dht {
+        Err(ActorError::NoTracker)
     } else {
-        Err(tracker_error.unwrap_or(ActorError::NoPeers))
+        Err(last_error.map_or(ActorError::NoPeers, ActorError::Peer))
+    };
+    let _result_ignored = sender.send(DiscoveryEvent::Finished(result)).await;
+}
+
+#[cfg(test)]
+async fn collect_discovered_peers(
+    mut receiver: mpsc::Receiver<DiscoveryEvent>,
+) -> Result<Vec<SocketAddr>, ActorError> {
+    let mut peers = HashSet::new();
+    while let Some(event) = receiver.recv().await {
+        match event {
+            DiscoveryEvent::Peers(discovered) => peers.extend(discovered),
+            DiscoveryEvent::Finished(result) => {
+                if peers.is_empty() {
+                    result?;
+                }
+                return Ok(peers.into_iter().collect());
+            }
+        }
+    }
+    if peers.is_empty() {
+        Err(ActorError::NoPeers)
+    } else {
+        Ok(peers.into_iter().collect())
     }
 }
 
-async fn discover_tracker_peers(
-    trackers: &[Vec<String>],
+fn tracker_request(
     record: &TorrentRecord,
     services: &Services,
     info_hash: Sha1Hash,
     left: u64,
     announce_event: AnnounceEvent,
-) -> Result<Vec<SocketAddr>, ActorError> {
-    let tracker = HttpTrackerClient::new(services.tracker_response_limit)
-        .map_err(|error| ActorError::Peer(error.to_string()))?;
-    let udp_tracker = UdpTrackerClient::new(services.tracker_response_limit)
-        .map_err(|error| ActorError::Peer(error.to_string()))?;
-    let mut peers = HashSet::new();
+) -> TrackerRequest {
     let peer_id = services.peer_id.as_bytes();
-    let request = TrackerRequest {
+    TrackerRequest {
         info_hash,
         peer_id: services.peer_id,
         port: services.advertised_peer_port.load(Ordering::Acquire),
@@ -2650,50 +3021,63 @@ async fn discover_tracker_peers(
         numwant: PEER_LIMIT_PER_ANNOUNCE,
         key: u32::from_be_bytes([peer_id[16], peer_id[17], peer_id[18], peer_id[19]]),
         support_crypto: !matches!(services.encryption, EncryptionPolicy::Disabled),
-    };
-    let mut attempted = false;
-    for tier in trackers {
-        for tracker_url in tier {
-            let Ok(url) = Url::parse(tracker_url) else {
-                continue;
-            };
-            let announce = match url.scheme() {
-                "http" | "https" => {
-                    attempted = true;
-                    tracker
-                        .announce(&url, request)
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-                "udp" => {
-                    attempted = true;
-                    udp_tracker
-                        .announce(&url, request)
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-                _ => continue,
-            };
-            match announce {
-                Ok(announce) => {
-                    debug!(
-                        tracker = %url,
-                        peers = announce.peers.len(),
-                        "tracker announce succeeded"
-                    );
-                    peers.extend(announce.peers);
-                }
-                Err(error) => debug!(tracker = %url, %error, "tracker announce failed"),
-            }
-        }
     }
-    if !attempted {
-        return Err(ActorError::NoTracker);
+}
+
+fn tracker_urls(trackers: &[Vec<String>]) -> Vec<Url> {
+    let mut unique = HashSet::new();
+    trackers
+        .iter()
+        .flatten()
+        .filter_map(|tracker| Url::parse(tracker).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https" | "udp"))
+        .filter(|url| unique.insert(url.clone()))
+        .collect()
+}
+
+async fn announce_tracker(
+    http: &HttpTrackerClient,
+    udp: UdpTrackerClient,
+    url: &Url,
+    request: TrackerRequest,
+) -> Result<Vec<SocketAddr>, String> {
+    match url.scheme() {
+        "http" | "https" => http
+            .announce(url, request)
+            .await
+            .map(|announce| announce.peers)
+            .map_err(|error| error.to_string()),
+        "udp" => udp
+            .announce(url, request)
+            .await
+            .map(|announce| announce.peers)
+            .map_err(|error| error.to_string()),
+        _ => Err("unsupported tracker scheme".to_owned()),
     }
-    if peers.is_empty() {
-        return Err(ActorError::NoPeers);
-    }
-    Ok(peers.into_iter().collect())
+}
+
+#[cfg(test)]
+async fn discover_tracker_peers(
+    trackers: &[Vec<String>],
+    record: &TorrentRecord,
+    services: &Services,
+    info_hash: Sha1Hash,
+    left: u64,
+    announce_event: AnnounceEvent,
+) -> Result<Vec<SocketAddr>, ActorError> {
+    let receiver = start_peer_discovery(
+        services,
+        DiscoveryQuery {
+            trackers,
+            record,
+            info_hash,
+            left,
+            allow_dht: false,
+            announce_event,
+            cancellation: services.shutdown.child_token(),
+        },
+    )?;
+    collect_discovered_peers(receiver).await
 }
 
 async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<PeerWorkerCommand>) {
@@ -2737,11 +3121,7 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
                     length,
                     &piece_cancellation,
                     context.services.peer_message_timeout,
-                    PeerEventForwarder {
-                        events: &context.events,
-                        worker: context.worker,
-                        allow_extensions: context.allow_pex,
-                    },
+                    peer_event_forwarder(&context),
                 )
                 .await
                 {
@@ -2794,6 +3174,16 @@ async fn peer_worker(context: PeerWorkerContext, mut commands: mpsc::Receiver<Pe
         }
     }
     peer.shutdown();
+}
+
+fn peer_event_forwarder(context: &PeerWorkerContext) -> PeerEventForwarder<'_> {
+    PeerEventForwarder {
+        events: &context.events,
+        activity: &context.services.torrent_activity,
+        torrent_id: context.torrent_id,
+        worker: context.worker,
+        allow_extensions: context.allow_pex,
+    }
 }
 
 async fn establish_peer_worker(context: &PeerWorkerContext) -> Option<PeerConnection> {
@@ -3012,7 +3402,10 @@ async fn apply_piece_result(
                 .picker
                 .mark_complete(piece)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
-            record.downloaded = completed_bytes(metainfo, &record.completed_pieces)?;
+            record.downloaded = record
+                .downloaded
+                .checked_add(piece_content_length(metainfo, piece)?)
+                .ok_or(ActorError::Arithmetic)?;
             replace_record(services, record.clone()).await?;
             let wire_piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
             for handle in swarm.workers.values() {
@@ -3117,6 +3510,7 @@ async fn download_piece_blocks(
                 received = received
                     .checked_add(block.len())
                     .ok_or(ActorError::Arithmetic)?;
+                record_downloaded_block(&forwarder, block.len());
                 fill_request_pipeline(peer, piece, length, &mut next_begin, &mut pending).await?;
             }
             PeerEvent::Message(PeerMessage::Choke) => {
@@ -3143,6 +3537,16 @@ async fn download_piece_blocks(
         }
     }
     Ok(Bytes::from(output))
+}
+
+fn record_downloaded_block(forwarder: &PeerEventForwarder<'_>, bytes: usize) {
+    let Ok(bytes) = u64::try_from(bytes) else {
+        return;
+    };
+    if let Ok(mut torrents) = forwarder.activity.lock() {
+        let activity = torrents.entry(forwarder.torrent_id).or_default();
+        activity.downloaded_bytes = activity.downloaded_bytes.saturating_add(bytes);
+    }
 }
 
 async fn forward_transfer_peer_event(
@@ -3349,6 +3753,7 @@ async fn recheck(
 ) -> Result<(), ActorError> {
     update_record_state(record, TorrentState::Checking, services).await?;
     record.completed_pieces.fill(0);
+    record.downloaded = 0;
     let pieces = piece_count(metainfo)?;
     for index in 0..pieces {
         cancelled(cancellation)?;
@@ -3356,13 +3761,15 @@ async fn recheck(
             && verify_piece(metainfo, index, &piece)?
         {
             set_bit(&mut record.completed_pieces, index);
+            record.downloaded = record
+                .downloaded
+                .checked_add(piece_content_length(metainfo, index)?)
+                .ok_or(ActorError::Arithmetic)?;
         }
         if index % 64 == 63 {
-            record.downloaded = completed_bytes(metainfo, &record.completed_pieces)?;
             replace_record(services, record.clone()).await?;
         }
     }
-    record.downloaded = completed_bytes(metainfo, &record.completed_pieces)?;
     let state = if all_complete(&record.completed_pieces, pieces) {
         TorrentState::Seeding
     } else {
@@ -3441,29 +3848,37 @@ async fn write_piece(
     let segments = file_segments(wire_files(metainfo), start, piece.len())?;
     let mut consumed = 0_usize;
     let mut touched = HashSet::new();
+    let mut writes = Vec::new();
     for segment in segments {
         let end = consumed
             .checked_add(segment.length)
             .ok_or(ActorError::Arithmetic)?;
         if !segment.file.padding {
-            storage
-                .write(
-                    segment.file.path.clone(),
-                    segment.file_offset,
-                    piece.slice(consumed..end),
-                    segment.file.length,
-                )
-                .await?;
             touched.insert(segment.file.path.clone());
+            writes.push((
+                segment.file.path.clone(),
+                segment.file_offset,
+                piece.slice(consumed..end),
+                segment.file.length,
+            ));
         }
         consumed = end;
     }
     if consumed != piece.len() {
         return Err(ActorError::Arithmetic);
     }
-    for path in touched {
-        storage.sync(path).await?;
-    }
+    stream::iter(writes)
+        .map(|(path, offset, data, file_length)| async move {
+            storage.write(path, offset, data, file_length).await
+        })
+        .buffer_unordered(STORAGE_IO_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    stream::iter(touched)
+        .map(|path| async move { storage.sync(path).await })
+        .buffer_unordered(STORAGE_IO_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
     Ok(())
 }
 
@@ -3481,24 +3896,28 @@ fn file_segments(
     let end = start
         .checked_add(u64::try_from(length).map_err(|_| ActorError::Arithmetic)?)
         .ok_or(ActorError::Arithmetic)?;
-    let mut file_start = 0_u64;
     let mut segments = Vec::new();
-    for file in files {
-        let file_end = file_start
+    let first = files.partition_point(|file| {
+        file.wire_offset
+            .checked_add(file.length)
+            .is_some_and(|file_end| file_end <= start)
+    });
+    for file in &files[first..] {
+        let file_end = file
+            .wire_offset
             .checked_add(file.length)
             .ok_or(ActorError::Arithmetic)?;
-        let overlap_start = start.max(file_start);
+        let overlap_start = start.max(file.wire_offset);
         let overlap_end = end.min(file_end);
         if overlap_start < overlap_end {
             segments.push(FileSegment {
                 file,
-                file_offset: overlap_start - file_start,
+                file_offset: overlap_start - file.wire_offset,
                 length: usize::try_from(overlap_end - overlap_start)
                     .map_err(|_| ActorError::Arithmetic)?,
             });
         }
-        file_start = file_end;
-        if file_start >= end {
+        if file_end >= end {
             break;
         }
     }
@@ -3715,6 +4134,7 @@ fn v2_hash_pair(
     dendrite_core::Sha256Hash::from_bytes(digest.finalize().into())
 }
 
+#[cfg(test)]
 fn completed_bytes(metainfo: &Metainfo, completed: &[u8]) -> Result<u64, ActorError> {
     (0..piece_count(metainfo)?)
         .filter(|index| bit_is_set(completed, *index))
@@ -3884,12 +4304,14 @@ mod tests {
                 length: 3,
                 pieces_root: None,
                 padding: false,
+                wire_offset: 0,
             },
             FileEntry {
                 path: TorrentPath::new(["root".to_owned(), "b".to_owned()])?,
                 length: 5,
                 pieces_root: None,
                 padding: false,
+                wire_offset: 3,
             },
         ];
         let segments = file_segments(&files, 2, 4)?;
@@ -4110,7 +4532,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -4739,7 +5161,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -4809,6 +5231,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthy_tracker_streams_peers_without_waiting_for_stalled_tracker()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let stalled_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let healthy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let stalled_url = format!("http://{}/announce", stalled_listener.local_addr()?);
+        let healthy_url = format!("http://{}/announce", healthy_listener.local_addr()?);
+        let expected_peer = SocketAddr::from(([127, 0, 0, 1], 61_003));
+        let stalled_task = tokio::spawn(fake_stalled_tracker(stalled_listener));
+        let healthy_task = tokio::spawn(fake_tracker(healthy_listener, expected_peer));
+        let payload = Bytes::from_static(b"stream the first healthy tracker result");
+        let digest: [u8; 20] = Sha1::digest(&payload).into();
+        let raw = single_file_metainfo(&healthy_url, "stream.bin", &payload, digest);
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let record = test_record(&metainfo, raw);
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let services = test_services(
+            store,
+            StorageHandle::start_portable(&downloads, 8)?,
+            "tracker-stream-test",
+        );
+        let mut receiver = start_peer_discovery(
+            &services,
+            DiscoveryQuery {
+                trackers: &[vec![stalled_url], vec![healthy_url]],
+                record: &record,
+                info_hash,
+                left: metainfo.total_length,
+                allow_dht: false,
+                announce_event: AnnounceEvent::Started,
+                cancellation: CancellationToken::new(),
+            },
+        )?;
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await?
+            .ok_or("discovery channel closed before the healthy result")?;
+        assert!(matches!(
+            event,
+            DiscoveryEvent::Peers(peers) if peers == vec![expected_peer]
+        ));
+        drop(receiver);
+        stalled_task.abort();
+        healthy_task.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_worker_is_replaced_from_retained_candidate_queue()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = Bytes::from_static(b"retained candidate completed the transfer");
+        let digest: [u8; 20] = Sha1::digest(&payload).into();
+        let raw = single_file_metainfo("http://127.0.0.1/announce", "queue.bin", &payload, digest);
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let unavailable_address = unavailable_listener.local_addr()?;
+        drop(unavailable_listener);
+        let healthy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let healthy_address = healthy_listener.local_addr()?;
+        let healthy_peer = tokio::spawn(fake_peer(healthy_listener, info_hash, payload.clone()));
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let mut services = test_services(
+            store.clone(),
+            StorageHandle::start_portable(&downloads, 8)?,
+            "candidate-queue-test",
+        );
+        services.per_torrent_peer_limit = 1;
+        let mut record = test_record(&metainfo, raw);
+        normalize_completion(&mut record, 1);
+        store.put_torrent(record.clone()).await?;
+
+        run_peer_swarm(
+            vec![unavailable_address, healthy_address],
+            info_hash,
+            &metainfo,
+            &mut record,
+            &services,
+            &CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(tokio::fs::read(downloads.join("queue.bin")).await?, payload);
+        healthy_peer.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn trackerless_public_swarm_discovers_and_downloads_over_lsd()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = Bytes::from_static(b"LSD supplied this LAN peer");
@@ -4855,7 +5371,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -4929,7 +5445,7 @@ mod tests {
             encryption: EncryptionPolicy::Required,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -5142,7 +5658,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -5304,7 +5820,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -5935,7 +6451,9 @@ mod tests {
                 error,
                 ActorError::Storage(StorageError::Io(ref source)) if source.kind() == kind
             ));
-            assert_eq!(tokio::fs::read(downloads.join("root/a")).await?, first);
+            if let Ok(partial) = tokio::fs::read(downloads.join("root/a")).await {
+                assert_eq!(partial, first);
+            }
             assert!(!downloads.join("root/b").exists());
             let unchanged = store
                 .get_torrent(record.id)
@@ -7065,7 +7583,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
-            torrent_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -7215,6 +7733,13 @@ mod tests {
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(&body).await?;
         Ok(())
+    }
+
+    async fn fake_stalled_tracker(
+        listener: TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_stream, _) = listener.accept().await?;
+        std::future::pending().await
     }
 
     async fn fake_tracker_sequence(

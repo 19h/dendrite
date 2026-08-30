@@ -18,7 +18,7 @@ Current cases:
 |---|---|
 | `bencode_decode_strict` | strict decode of one small metainfo-shaped dictionary |
 | `peer_piece_decode_16k` | decode a 16 KiB peer-wire piece block |
-| `rarest_first_1024_pieces_32_peers` | construct availability from 32 bitfields and select over 1,024 pieces |
+| `rarest_first_1m_pieces_256_peers` | select from a populated million-piece, 256-peer availability model |
 
 Criterion stores sampled results under `target/criterion`. CI compiles these
 benchmarks but does not enforce wall-clock thresholds.
@@ -84,10 +84,11 @@ state, and is not a stable microbenchmark.
 
 ## Interpreting API rates
 
-Torrent summary rates are not continuously accumulated metrics. They are derived
-from changes in durable counters between summary requests, update after at least
-250 ms, and use saturating arithmetic. The first sample is zero. Do not use one
-response as a high-resolution benchmark or billing counter.
+Torrent summary rates are sampled when summaries are requested. Download rate
+comes from accepted peer blocks, so it responds before a complete piece is
+verified and committed; upload rate comes from the durable upload counter. Rates
+update after at least 250 ms and use saturating arithmetic. The first sample is
+zero. Do not use one response as a high-resolution benchmark or billing counter.
 
 ## Correctness gates for optimization
 

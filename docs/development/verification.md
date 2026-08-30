@@ -115,7 +115,7 @@ cargo bench --locked -p dendrite-benchmarks
 ```
 
 Current Criterion cases cover strict bencode decoding, 16 KiB peer-piece frame
-decoding, and rarest-first selection over 1,024 pieces/32 peers. See
+decoding, and rarest-first selection over one million pieces/256 peers. See
 [Performance](../operations/performance.md) for a reproducible report template.
 
 ## Documentation verification

@@ -32,18 +32,17 @@ fn peer_codec(criterion: &mut Criterion) {
 }
 
 fn rarest_first(criterion: &mut Criterion) {
-    let bitfield = vec![u8::MAX; 128];
-    criterion.bench_function("rarest_first_1024_pieces_32_peers", |bencher| {
+    const PIECES: usize = 1_000_000;
+    let bitfield = vec![u8::MAX; PIECES.div_ceil(8)];
+    let mut populated = PiecePicker::new(PIECES, 16);
+    for _ in 0..256 {
+        let _ = populated.add_peer_bitfield(&bitfield);
+    }
+    criterion.bench_function("rarest_first_1m_pieces_256_peers", |bencher| {
         bencher.iter_batched(
-            || {
-                let mut picker = PiecePicker::new(1_024, 16);
-                for _ in 0..32 {
-                    let _ = picker.add_peer_bitfield(&bitfield);
-                }
-                picker
-            },
+            || populated.clone(),
             |mut picker| picker.select(black_box(&bitfield), SelectionMode::RarestFirst),
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }

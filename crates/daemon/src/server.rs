@@ -1059,9 +1059,10 @@ fn sample_rates(state: &AppState, record: &TorrentRecord) -> (u64, u64) {
         return (0, 0);
     };
     let now = Instant::now();
+    let downloaded = state.engine.torrent_downloaded_bytes(record.id);
     let sample = samples.entry(record.id).or_insert(RateSample {
         sampled: now,
-        downloaded: record.downloaded,
+        downloaded,
         uploaded: record.uploaded,
         download_rate: 0,
         upload_rate: 0,
@@ -1069,8 +1070,7 @@ fn sample_rates(state: &AppState, record: &TorrentRecord) -> (u64, u64) {
     let elapsed = now.duration_since(sample.sampled);
     if elapsed >= Duration::from_millis(250) {
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1);
-        sample.download_rate = record
-            .downloaded
+        sample.download_rate = downloaded
             .saturating_sub(sample.downloaded)
             .saturating_mul(1_000_000_000)
             / nanos;
@@ -1080,7 +1080,7 @@ fn sample_rates(state: &AppState, record: &TorrentRecord) -> (u64, u64) {
             .saturating_mul(1_000_000_000)
             / nanos;
         sample.sampled = now;
-        sample.downloaded = record.downloaded;
+        sample.downloaded = downloaded;
         sample.uploaded = record.uploaded;
     }
     (sample.download_rate, sample.upload_rate)

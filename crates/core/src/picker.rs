@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+const RAREST_CANDIDATE_SAMPLE: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionMode {
     RarestFirst,
@@ -164,10 +166,27 @@ impl PiecePicker {
     }
 
     fn select_rarest(&self, peer_bitfield: &[u8], endgame: bool) -> Option<usize> {
-        (0..self.pieces.len())
-            .map(|relative| (self.cursor + relative) % self.pieces.len())
-            .filter(|index| selectable(*index, self.pieces[*index], peer_bitfield, endgame))
-            .min_by_key(|index| self.pieces[*index].availability)
+        let mut selected: Option<usize> = None;
+        let mut candidates = 0_usize;
+        for relative in 0..self.pieces.len() {
+            let index = (self.cursor + relative) % self.pieces.len();
+            let piece = self.pieces[index];
+            if !selectable(index, piece, peer_bitfield, endgame) {
+                continue;
+            }
+            candidates += 1;
+            if selected.is_none_or(|current| piece.availability < self.pieces[current].availability)
+            {
+                selected = Some(index);
+                if piece.availability == 1 {
+                    break;
+                }
+            }
+            if candidates >= RAREST_CANDIDATE_SAMPLE {
+                break;
+            }
+        }
+        selected
     }
 
     fn update_availability(&mut self, bitfield: &[u8], add: bool) -> Result<(), BitfieldError> {
