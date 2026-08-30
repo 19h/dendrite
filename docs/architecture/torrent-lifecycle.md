@@ -115,6 +115,12 @@ bytes arrived:
 After verification, storage writes are synchronized before the completion bit
 is committed. A crash can therefore lose recent progress, but the intended
 ordering avoids claiming data durable before the filesystem has received it.
+The completion bitmap and counters live in a compact progress record, so a
+piece commit never rewrites the torrent's potentially multi-megabyte metainfo.
+Verified pieces from different peers are finalized concurrently. Each peer is
+released for another assignment only after its previous piece is durable,
+bounding finalization memory to the active peer set while avoiding a global
+single-piece storage barrier.
 
 When every required piece is verified the record transitions to `seeding`.
 
@@ -136,6 +142,9 @@ The incoming peer service accepts globally admitted connections and matches
 their handshake identity to durable torrents in `downloading` or `seeding`.
 Only verified completed blocks can be served. A persisted `seeding` record does
 not need a download actor after restart to remain eligible for this service.
+Immutable parsed metainfo and metadata-exchange bytes are shared by concurrent
+incoming sessions. Upload accounting is sampled live and durably flushed once
+per second in a per-torrent batch.
 
 ## Pause, resume, remove, restart
 

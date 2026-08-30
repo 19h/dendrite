@@ -177,11 +177,11 @@ stopped --resume/--start--> starting --> downloading --> seeding
                                    \--> error
 ```
 
-`downloaded` and `uploaded` are durable byte counters. `download_rate` samples
-accepted peer blocks, including partial pieces, while `upload_rate` samples the
-durable upload counter. Rates are calculated when summaries are requested and
-may be zero on the first or closely spaced request. `peers` is the actor's
-current connected peer count.
+`downloaded` and `uploaded` are durable byte counters. `download_rate` and
+`upload_rate` sample accepted peer blocks, including partial pieces; durable
+upload accounting is flushed in one-second batches. Rates are calculated when
+summaries are requested and may be zero on the first or closely spaced request.
+`peers` is the actor's current connected peer count.
 
 The client `list` command requests one server-default page and has no cursor or
 limit flags. For more than the configured page size, use the paginated HTTP API.

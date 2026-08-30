@@ -1060,10 +1060,11 @@ fn sample_rates(state: &AppState, record: &TorrentRecord) -> (u64, u64) {
     };
     let now = Instant::now();
     let downloaded = state.engine.torrent_downloaded_bytes(record.id);
+    let uploaded = state.engine.torrent_uploaded_bytes(record.id);
     let sample = samples.entry(record.id).or_insert(RateSample {
         sampled: now,
         downloaded,
-        uploaded: record.uploaded,
+        uploaded,
         download_rate: 0,
         upload_rate: 0,
     });
@@ -1074,14 +1075,13 @@ fn sample_rates(state: &AppState, record: &TorrentRecord) -> (u64, u64) {
             .saturating_sub(sample.downloaded)
             .saturating_mul(1_000_000_000)
             / nanos;
-        sample.upload_rate = record
-            .uploaded
+        sample.upload_rate = uploaded
             .saturating_sub(sample.uploaded)
             .saturating_mul(1_000_000_000)
             / nanos;
         sample.sampled = now;
         sample.downloaded = downloaded;
-        sample.uploaded = record.uploaded;
+        sample.uploaded = uploaded;
     }
     (sample.download_rate, sample.upload_rate)
 }

@@ -84,11 +84,11 @@ state, and is not a stable microbenchmark.
 
 ## Interpreting API rates
 
-Torrent summary rates are sampled when summaries are requested. Download rate
-comes from accepted peer blocks, so it responds before a complete piece is
-verified and committed; upload rate comes from the durable upload counter. Rates
-update after at least 250 ms and use saturating arithmetic. The first sample is
-zero. Do not use one response as a high-resolution benchmark or billing counter.
+Torrent summary rates are sampled when summaries are requested. Download and
+upload rates come from accepted peer blocks, so they respond before the compact
+durable progress counters are flushed. Rates update after at least 250 ms and
+use saturating arithmetic. The first sample is zero. Do not use one response as
+a high-resolution benchmark or billing counter.
 
 ## Correctness gates for optimization
 
@@ -102,6 +102,12 @@ cargo run --locked -p dendrite-simulator -- --seed 24301
 
 For parser, peer-wire, tracker, extension, DHT, MSE, uTP, storage, or actor changes,
 run the owning tests and relevant fuzz smoke target in addition to the benchmark.
+
+Piece finalization is concurrent across peers but remains bounded to one
+pending durable write per peer. Mutable completion state is stored separately
+from immutable metainfo, and upload counters are flushed in per-torrent batches;
+these invariants prevent metadata size or peer block rate from amplifying state
+database writes.
 
 ## Reproducible result template
 

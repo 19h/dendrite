@@ -2,9 +2,11 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU16, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -32,7 +34,7 @@ use dendrite_net::{
 };
 use dendrite_persistence::{StateStoreHandle, StoreError, TorrentRecord};
 use dendrite_storage::{StorageError, StorageHandle};
-use futures_util::{StreamExt as _, TryStreamExt as _, stream};
+use futures_util::{StreamExt as _, TryStreamExt as _, stream, stream::FuturesUnordered};
 use reqwest::{
     Client, StatusCode,
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE},
@@ -61,6 +63,7 @@ const TRACKER_ANNOUNCE_CONCURRENCY: usize = 128;
 const DISCOVERY_EVENT_CAPACITY: usize = 256;
 const METADATA_PEER_CONCURRENCY: usize = 32;
 const STORAGE_IO_CONCURRENCY: usize = 256;
+const UPLOAD_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -93,6 +96,7 @@ struct SwarmState {
     picker: PiecePicker,
     connecting: usize,
     last_error: Option<String>,
+    writing: HashSet<usize>,
     candidates: VecDeque<PeerCandidate>,
     known_candidates: HashSet<PeerCandidate>,
     next_worker: usize,
@@ -139,7 +143,16 @@ struct DiscoveryQuery<'a> {
 enum SwarmLoopEvent {
     Worker(PeerWorkerEvent),
     Discovery(Option<DiscoveryEvent>),
+    Stored(PieceWriteResult),
 }
+
+struct PieceWriteResult {
+    worker: usize,
+    piece: usize,
+    result: Result<(), ActorError>,
+}
+
+type PieceWriteFuture<'a> = Pin<Box<dyn Future<Output = PieceWriteResult> + Send + 'a>>;
 
 enum PeerWorkerCommand {
     Download {
@@ -284,6 +297,7 @@ struct Services {
     lsd_cookie: String,
     encryption: EncryptionPolicy,
     rendezvous: Arc<Mutex<HashMap<(Sha1Hash, SocketAddr), RendezvousPeer>>>,
+    incoming_content: Arc<Mutex<HashMap<TorrentId, Weak<IncomingContent>>>>,
     connected_peers: Arc<AtomicUsize>,
     torrent_activity: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     payload_claims: Arc<std::sync::Mutex<HashMap<TorrentId, Vec<TorrentPath>>>>,
@@ -298,6 +312,12 @@ struct RendezvousPeer {
     sender: PeerSender,
 }
 
+struct IncomingContent {
+    metainfo: Metainfo,
+    pieces: usize,
+    info: Bytes,
+}
+
 struct ConnectionGuard {
     connected: Arc<AtomicUsize>,
     torrents: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
@@ -308,6 +328,8 @@ struct ConnectionGuard {
 struct TorrentActivity {
     peers: usize,
     downloaded_bytes: u64,
+    uploaded_bytes: u64,
+    pending_uploaded_bytes: u64,
 }
 
 struct PayloadClaim {
@@ -429,6 +451,7 @@ impl EngineHandle {
             lsd_cookie: format!("dendrite-{:016x}", rand::random::<u64>()),
             encryption: options.encryption,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -443,6 +466,9 @@ impl EngineHandle {
             services.clone(),
         ));
         services.tasks.spawn(run_lsd_announcer(services.clone()));
+        services
+            .tasks
+            .spawn(run_upload_accounting(services.clone()));
         Self {
             commands,
             events,
@@ -546,6 +572,16 @@ impl EngineHandle {
             .and_then(|peers| peers.get(&id).map(|activity| activity.downloaded_bytes))
             .unwrap_or(0)
     }
+
+    #[must_use]
+    pub fn torrent_uploaded_bytes(&self, id: TorrentId) -> u64 {
+        self.services
+            .torrent_activity
+            .lock()
+            .ok()
+            .and_then(|peers| peers.get(&id).map(|activity| activity.uploaded_bytes))
+            .unwrap_or(0)
+    }
 }
 
 fn track_connection(services: &Services, torrent_id: TorrentId) -> ConnectionGuard {
@@ -557,6 +593,56 @@ fn track_connection(services: &Services, torrent_id: TorrentId) -> ConnectionGua
         connected: services.connected_peers.clone(),
         torrents: services.torrent_activity.clone(),
         torrent_id,
+    }
+}
+
+fn record_uploaded_block(services: &Services, torrent_id: TorrentId, bytes: u64) {
+    if let Ok(mut torrents) = services.torrent_activity.lock() {
+        let activity = torrents.entry(torrent_id).or_default();
+        activity.uploaded_bytes = activity.uploaded_bytes.saturating_add(bytes);
+        activity.pending_uploaded_bytes = activity.pending_uploaded_bytes.saturating_add(bytes);
+    }
+}
+
+async fn run_upload_accounting(services: Services) {
+    let mut interval = tokio::time::interval(UPLOAD_FLUSH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            () = services.shutdown.cancelled() => {
+                flush_upload_accounting(&services).await;
+                return;
+            }
+            _ = interval.tick() => flush_upload_accounting(&services).await,
+        }
+    }
+}
+
+async fn flush_upload_accounting(services: &Services) {
+    let pending = if let Ok(mut torrents) = services.torrent_activity.lock() {
+        torrents
+            .iter_mut()
+            .filter_map(|(id, activity)| {
+                let bytes = std::mem::take(&mut activity.pending_uploaded_bytes);
+                (bytes > 0).then_some((*id, bytes))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        return;
+    };
+    for (id, bytes) in pending {
+        match services.store.increment_uploaded(id, bytes).await {
+            Ok(_) => {}
+            Err(error) => {
+                warn!(torrent_id = %id, %error, "failed to persist batched upload accounting");
+                if let Ok(mut torrents) = services.torrent_activity.lock() {
+                    let activity = torrents.entry(id).or_default();
+                    activity.pending_uploaded_bytes =
+                        activity.pending_uploaded_bytes.saturating_add(bytes);
+                }
+            }
+        }
     }
 }
 
@@ -833,9 +919,8 @@ async fn finish_incoming_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (record, metainfo) = find_incoming_torrent(remote.info_hash, services).await?;
-    let pieces = piece_count(&metainfo)?;
-    if record.completed_pieces.len() != pieces.div_ceil(8) {
+    let (record, content) = find_incoming_torrent(remote.info_hash, services).await?;
+    if record.completed_pieces.len() != content.pieces.div_ceil(8) {
         return Err(ActorError::Peer(
             "stored completion bitfield has the wrong length".to_owned(),
         ));
@@ -866,16 +951,14 @@ where
     .await
     .map_err(|error| ActorError::Peer(error.to_string()))?;
 
-    let info = raw_info_dictionary(&record.raw_metainfo, services.metainfo_limit)?;
     run_incoming_peer(
         &mut peer,
         address,
         remote,
         IncomingSeed {
-            record,
-            metainfo,
-            pieces,
-            info,
+            torrent_id: record.id,
+            completed_pieces: Arc::from(record.completed_pieces),
+            content,
             interested: false,
             remote_metadata_id: None,
             remote_holepunch_id: None,
@@ -887,10 +970,9 @@ where
 }
 
 struct IncomingSeed {
-    record: TorrentRecord,
-    metainfo: Metainfo,
-    pieces: usize,
-    info: Bytes,
+    torrent_id: TorrentId,
+    completed_pieces: Arc<[u8]>,
+    content: Arc<IncomingContent>,
     interested: bool,
     remote_metadata_id: Option<u8>,
     remote_holepunch_id: Option<u8>,
@@ -941,7 +1023,7 @@ async fn run_incoming_peer(
                 }
                 peer.send(PeerMessage::Extended {
                     extension_id: 0,
-                    payload: encode_extension_handshake(Some(seed.info.len())),
+                    payload: encode_extension_handshake(Some(seed.content.info.len())),
                 })
                 .await
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
@@ -953,14 +1035,14 @@ async fn run_incoming_peer(
                 serve_metadata_request(
                     peer,
                     seed.remote_metadata_id,
-                    &seed.info,
+                    &seed.content.info,
                     &payload,
                     services.metainfo_limit,
                 )
                 .await?;
             }
             PeerEvent::Message(PeerMessage::HashRequest(request)) => {
-                serve_hash_request(peer, &seed.metainfo, request).await?;
+                serve_hash_request(peer, &seed.content.metainfo, request).await?;
             }
             PeerEvent::Message(PeerMessage::Extended {
                 extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
@@ -1009,10 +1091,9 @@ async fn handle_seed_holepunch(
     match message.kind {
         HolePunchKind::Connect => {
             let seed = IncomingSeed {
-                record: seed.record.clone(),
-                metainfo: seed.metainfo.clone(),
-                pieces: seed.pieces,
-                info: seed.info.clone(),
+                torrent_id: seed.torrent_id,
+                completed_pieces: seed.completed_pieces.clone(),
+                content: seed.content.clone(),
                 interested: false,
                 remote_metadata_id: None,
                 remote_holepunch_id: None,
@@ -1093,7 +1174,7 @@ async fn serve_hole_punched_seed(
         .utp
         .as_ref()
         .ok_or_else(|| ActorError::Peer("hole punch requires a uTP endpoint".to_owned()))?;
-    let info_hash = wire_info_hash(&seed.metainfo)?;
+    let info_hash = wire_info_hash(&seed.content.metainfo)?;
     let mut reserved = [0_u8; 8];
     reserved[5] |= 0x10;
     let mut peer = endpoint
@@ -1108,9 +1189,9 @@ async fn serve_hole_punched_seed(
         )
         .await
         .map_err(|error| ActorError::Peer(error.to_string()))?;
-    let _connection = track_connection(services, seed.record.id);
+    let _connection = track_connection(services, seed.torrent_id);
     peer.send(PeerMessage::Bitfield(Bytes::copy_from_slice(
-        &seed.record.completed_pieces,
+        &seed.completed_pieces,
     )))
     .await
     .map_err(|error| ActorError::Peer(error.to_string()))?;
@@ -1141,7 +1222,7 @@ async fn run_hole_seed_peer(
                 serve_piece_request(peer, remote, &mut seed, request, services).await?;
             }
             PeerEvent::Message(PeerMessage::HashRequest(request)) => {
-                serve_hash_request(peer, &seed.metainfo, request).await?;
+                serve_hash_request(peer, &seed.content.metainfo, request).await?;
             }
             PeerEvent::Disconnected => return Ok(()),
             PeerEvent::Failed(error) => return Err(ActorError::Peer(error)),
@@ -1161,8 +1242,8 @@ async fn serve_piece_request(
     let length = usize::try_from(request.length).map_err(|_| ActorError::Arithmetic)?;
     if length == 0
         || length > BLOCK_BYTES
-        || index >= seed.pieces
-        || !bit_is_set(&seed.record.completed_pieces, index)
+        || index >= seed.content.pieces
+        || !bit_is_set(&seed.completed_pieces, index)
     {
         return reject_request(peer, remote, request).await;
     }
@@ -1171,10 +1252,10 @@ async fn serve_piece_request(
         .as_ref()
         .is_none_or(|(piece, _)| *piece != index)
     {
-        let Some(data) = read_piece(&seed.metainfo, index, &services.storage).await? else {
+        let Some(data) = read_piece(&seed.content.metainfo, index, &services.storage).await? else {
             return reject_request(peer, remote, request).await;
         };
-        if !verify_piece(&seed.metainfo, index, &data)? {
+        if !verify_piece(&seed.content.metainfo, index, &data)? {
             return Err(ActorError::Peer(
                 "refusing to upload a corrupt completed piece".to_owned(),
             ));
@@ -1198,46 +1279,69 @@ async fn serve_piece_request(
     .await
     .map_err(|error| ActorError::Peer(error.to_string()))?;
     let uploaded = u64::try_from(block.len()).map_err(|_| ActorError::Arithmetic)?;
-    if services
-        .store
-        .increment_uploaded(seed.record.id, uploaded)
-        .await?
-    {
-        Ok(())
-    } else {
-        Err(ActorError::Missing)
-    }
+    record_uploaded_block(services, seed.torrent_id, uploaded);
+    Ok(())
 }
 
 async fn find_incoming_torrent(
     info_hash: Sha1Hash,
     services: &Services,
-) -> Result<(TorrentRecord, Metainfo), ActorError> {
+) -> Result<(TorrentRecord, Arc<IncomingContent>), ActorError> {
     for record in services.store.list_torrents().await? {
         if !matches!(
             record.state,
             TorrentState::Downloading | TorrentState::Seeding
         ) || record.raw_metainfo.is_empty()
+            || stored_wire_info_hash(&record) != Some(info_hash)
         {
             continue;
         }
-        let Ok(metainfo) = Metainfo::parse(
+        if let Some(content) = services
+            .incoming_content
+            .lock()
+            .await
+            .get(&record.id)
+            .and_then(Weak::upgrade)
+        {
+            return Ok((record, content));
+        }
+        let metainfo = Metainfo::parse(
             &record.raw_metainfo,
             BencodeLimits {
                 input_bytes: services.metainfo_limit,
                 byte_string_bytes: services.metainfo_limit,
                 ..BencodeLimits::default()
             },
-        ) else {
-            continue;
-        };
-        if wire_info_hash(&metainfo)? == info_hash {
-            return Ok((record, metainfo));
-        }
+        )
+        .map_err(|error| ActorError::Metainfo(error.to_string()))?;
+        let content = Arc::new(IncomingContent {
+            pieces: piece_count(&metainfo)?,
+            info: raw_info_dictionary(&record.raw_metainfo, services.metainfo_limit)?,
+            metainfo,
+        });
+        let mut cache = services.incoming_content.lock().await;
+        let content = cache
+            .get(&record.id)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                cache.insert(record.id, Arc::downgrade(&content));
+                content
+            });
+        return Ok((record, content));
     }
     Err(ActorError::Peer(
         "incoming info hash is not active".to_owned(),
     ))
+}
+
+fn stored_wire_info_hash(record: &TorrentRecord) -> Option<Sha1Hash> {
+    record.v1_info_hash.or_else(|| {
+        record.v2_info_hash.map(|hash| {
+            let mut truncated = [0_u8; 20];
+            truncated.copy_from_slice(&hash.as_bytes()[..20]);
+            Sha1Hash::from_bytes(truncated)
+        })
+    })
 }
 
 fn raw_info_dictionary(raw: &[u8], limit: usize) -> Result<Bytes, ActorError> {
@@ -2278,7 +2382,7 @@ async fn download_from_web_seeds(
             .downloaded
             .checked_add(piece_content_length(metainfo, piece)?)
             .ok_or(ActorError::Arithmetic)?;
-        replace_record(services, record.clone()).await?;
+        persist_download_progress(services, record).await?;
     }
     Ok(())
 }
@@ -2535,44 +2639,17 @@ async fn run_peer_swarm_with_discovery(
     services: &Services,
     cancellation: &CancellationToken,
 ) -> Result<(), ActorError> {
-    let pieces = piece_count(metainfo)?;
-    let event_capacity = services.per_torrent_peer_limit.saturating_mul(4).max(1);
-    let (event_sender, mut events) = mpsc::channel(event_capacity);
-    let mut picker = PiecePicker::new(pieces, 4);
-    for index in 0..pieces {
-        if bit_is_set(&record.completed_pieces, index) {
-            picker
-                .mark_complete(index)
-                .map_err(|error| ActorError::Peer(error.to_string()))?;
-        }
-    }
-    let mut swarm = SwarmState {
-        workers: HashMap::with_capacity(services.per_torrent_peer_limit),
-        assignments: HashMap::new(),
-        picker,
-        connecting: 0,
-        last_error: None,
-        candidates: VecDeque::new(),
-        known_candidates: HashSet::new(),
-        next_worker: 0,
-        event_sender,
-        info_hash,
-        piece_count: pieces,
-        services: services.clone(),
-        cancellation: cancellation.child_token(),
-        allow_pex: !metainfo.private,
-        torrent_id: record.id,
-        peer_limit: services.per_torrent_peer_limit,
-    };
-    enqueue_peer_candidates(&mut swarm, peers, false);
-    fill_peer_slots(&mut swarm);
+    let (mut swarm, mut events) =
+        initialize_swarm(peers, info_hash, metainfo, record, services, cancellation)?;
+    let pieces = swarm.piece_count;
     let mut discovery_error = None;
+    let mut writes = FuturesUnordered::<PieceWriteFuture<'_>>::new();
     loop {
         if cancellation.is_cancelled() {
             shutdown_swarm(&swarm);
             return Err(ActorError::Cancelled);
         }
-        if all_complete(&record.completed_pieces, pieces) {
+        if all_complete(&record.completed_pieces, pieces) && writes.is_empty() {
             stop_workers(&swarm.workers, &swarm.assignments);
             return Ok(());
         }
@@ -2589,6 +2666,7 @@ async fn run_peer_swarm_with_discovery(
             && swarm.connecting == 0
             && swarm.assignments.is_empty()
             && swarm.workers.is_empty()
+            && writes.is_empty()
         {
             shutdown_swarm(&swarm);
             if let Some(error) = discovery_error {
@@ -2609,10 +2687,31 @@ async fn run_peer_swarm_with_discovery(
             event = receive_discovery_event(&mut discovery), if discovery.is_some() => {
                 SwarmLoopEvent::Discovery(event)
             },
+            stored = writes.next(), if !writes.is_empty() => {
+                SwarmLoopEvent::Stored(stored.ok_or(ActorError::Arithmetic)?)
+            },
         };
         match event {
+            SwarmLoopEvent::Worker(PeerWorkerEvent::Complete {
+                worker,
+                piece,
+                result,
+            }) => {
+                if let Some(data) =
+                    prepare_piece_result(&mut swarm, worker, piece, result, metainfo, record)?
+                {
+                    let storage = &services.storage;
+                    writes.push(Box::pin(async move {
+                        PieceWriteResult {
+                            worker,
+                            piece,
+                            result: write_piece(metainfo, piece, data, storage).await,
+                        }
+                    }));
+                }
+            }
             SwarmLoopEvent::Worker(event) => {
-                handle_worker_event(&mut swarm, event, metainfo, record, services).await?;
+                handle_worker_event(&mut swarm, event, record)?;
             }
             SwarmLoopEvent::Discovery(Some(DiscoveryEvent::Peers(peers))) => {
                 enqueue_peer_candidates(&mut swarm, peers, false);
@@ -2624,8 +2723,54 @@ async fn run_peer_swarm_with_discovery(
                 discovery = None;
             }
             SwarmLoopEvent::Discovery(None) => discovery = None,
+            SwarmLoopEvent::Stored(stored) => {
+                commit_stored_piece(&mut swarm, stored, metainfo, record, services).await?;
+            }
         }
     }
+}
+
+fn initialize_swarm(
+    peers: Vec<SocketAddr>,
+    info_hash: Sha1Hash,
+    metainfo: &Metainfo,
+    record: &TorrentRecord,
+    services: &Services,
+    cancellation: &CancellationToken,
+) -> Result<(SwarmState, mpsc::Receiver<PeerWorkerEvent>), ActorError> {
+    let pieces = piece_count(metainfo)?;
+    let event_capacity = services.per_torrent_peer_limit.saturating_mul(4).max(1);
+    let (event_sender, events) = mpsc::channel(event_capacity);
+    let mut picker = PiecePicker::new(pieces, 4);
+    for index in 0..pieces {
+        if bit_is_set(&record.completed_pieces, index) {
+            picker
+                .mark_complete(index)
+                .map_err(|error| ActorError::Peer(error.to_string()))?;
+        }
+    }
+    let mut swarm = SwarmState {
+        workers: HashMap::with_capacity(services.per_torrent_peer_limit),
+        assignments: HashMap::new(),
+        picker,
+        connecting: 0,
+        last_error: None,
+        writing: HashSet::new(),
+        candidates: VecDeque::new(),
+        known_candidates: HashSet::new(),
+        next_worker: 0,
+        event_sender,
+        info_hash,
+        piece_count: pieces,
+        services: services.clone(),
+        cancellation: cancellation.child_token(),
+        allow_pex: !metainfo.private,
+        torrent_id: record.id,
+        peer_limit: services.per_torrent_peer_limit,
+    };
+    enqueue_peer_candidates(&mut swarm, peers, false);
+    fill_peer_slots(&mut swarm);
+    Ok((swarm, events))
 }
 
 async fn receive_discovery_event(
@@ -2698,12 +2843,10 @@ fn per_torrent_peer_limit(global_limit: usize) -> usize {
     global_limit.div_ceil(4).clamp(1, ACTIVE_PEER_LIMIT)
 }
 
-async fn handle_worker_event(
+fn handle_worker_event(
     swarm: &mut SwarmState,
     event: PeerWorkerEvent,
-    metainfo: &Metainfo,
     record: &mut TorrentRecord,
-    services: &Services,
 ) -> Result<(), ActorError> {
     match event {
         PeerWorkerEvent::Ready {
@@ -2722,16 +2865,10 @@ async fn handle_worker_event(
             }
             enqueue_peer_candidates(swarm, peers, false);
         }
-        PeerWorkerEvent::Complete {
-            worker,
-            piece,
-            result,
-        } => {
-            swarm.assignments.remove(&worker);
-            if let Some(handle) = swarm.workers.get_mut(&worker) {
-                handle.idle = true;
-            }
-            apply_piece_result(swarm, worker, piece, result, metainfo, record, services).await?;
+        PeerWorkerEvent::Complete { .. } => {
+            return Err(ActorError::Peer(
+                "piece completion bypassed the storage pipeline".to_owned(),
+            ));
         }
         PeerWorkerEvent::Gone { worker, error } => {
             swarm.connecting = swarm.connecting.saturating_sub(usize::from(
@@ -3370,21 +3507,22 @@ fn schedule_pieces(
     Ok(scheduled)
 }
 
-async fn apply_piece_result(
+fn prepare_piece_result(
     swarm: &mut SwarmState,
     worker: usize,
     piece: usize,
     result: PieceResult,
     metainfo: &Metainfo,
-    record: &mut TorrentRecord,
-    services: &Services,
-) -> Result<(), ActorError> {
+    record: &TorrentRecord,
+) -> Result<Option<Bytes>, ActorError> {
+    swarm.assignments.remove(&worker);
     match result {
         PieceResult::Data(_data) if bit_is_set(&record.completed_pieces, piece) => {
             swarm
                 .picker
                 .mark_complete(piece)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
+            set_worker_idle(swarm, worker);
         }
         PieceResult::Data(data) => {
             if !verify_piece(metainfo, piece, &data)? {
@@ -3394,36 +3532,33 @@ async fn apply_piece_result(
                     .map_err(|error| ActorError::Peer(error.to_string()))?;
                 swarm.last_error = Some(format!("piece {piece} failed its integrity check"));
                 remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
-                return Ok(());
+                return Ok(None);
             }
-            write_piece(metainfo, piece, data, &services.storage).await?;
-            set_bit(&mut record.completed_pieces, piece);
+            if !swarm.writing.insert(piece) {
+                swarm
+                    .picker
+                    .mark_request_failed(piece)
+                    .map_err(|error| ActorError::Peer(error.to_string()))?;
+                set_worker_idle(swarm, worker);
+                return Ok(None);
+            }
             swarm
                 .picker
-                .mark_complete(piece)
+                .set_enabled(piece, piece.saturating_add(1), false)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
-            record.downloaded = record
-                .downloaded
-                .checked_add(piece_content_length(metainfo, piece)?)
-                .ok_or(ActorError::Arithmetic)?;
-            replace_record(services, record.clone()).await?;
-            let wire_piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
-            for handle in swarm.workers.values() {
-                let _result_ignored = handle
-                    .commands
-                    .try_send(PeerWorkerCommand::Have { piece: wire_piece });
-            }
             for (assigned_piece, token) in swarm.assignments.values() {
                 if *assigned_piece == piece {
                     token.cancel();
                 }
             }
+            return Ok(Some(data));
         }
         PieceResult::Cancelled => {
             swarm
                 .picker
                 .mark_request_failed(piece)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
+            set_worker_idle(swarm, worker);
         }
         PieceResult::Failed(error) => {
             swarm
@@ -3434,7 +3569,42 @@ async fn apply_piece_result(
             remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
         }
     }
+    Ok(None)
+}
+
+async fn commit_stored_piece(
+    swarm: &mut SwarmState,
+    stored: PieceWriteResult,
+    metainfo: &Metainfo,
+    record: &mut TorrentRecord,
+    services: &Services,
+) -> Result<(), ActorError> {
+    stored.result?;
+    swarm.writing.remove(&stored.piece);
+    set_bit(&mut record.completed_pieces, stored.piece);
+    swarm
+        .picker
+        .mark_complete(stored.piece)
+        .map_err(|error| ActorError::Peer(error.to_string()))?;
+    record.downloaded = record
+        .downloaded
+        .checked_add(piece_content_length(metainfo, stored.piece)?)
+        .ok_or(ActorError::Arithmetic)?;
+    persist_download_progress(services, record).await?;
+    set_worker_idle(swarm, stored.worker);
+    let wire_piece = u32::try_from(stored.piece).map_err(|_| ActorError::Arithmetic)?;
+    for handle in swarm.workers.values() {
+        let _result_ignored = handle
+            .commands
+            .try_send(PeerWorkerCommand::Have { piece: wire_piece });
+    }
     Ok(())
+}
+
+fn set_worker_idle(swarm: &mut SwarmState, worker: usize) {
+    if let Some(handle) = swarm.workers.get_mut(&worker) {
+        handle.idle = true;
+    }
 }
 
 fn remove_worker(
@@ -3767,7 +3937,7 @@ async fn recheck(
                 .ok_or(ActorError::Arithmetic)?;
         }
         if index % 64 == 63 {
-            replace_record(services, record.clone()).await?;
+            persist_download_progress(services, record).await?;
         }
     }
     let state = if all_complete(&record.completed_pieces, pieces) {
@@ -4170,7 +4340,7 @@ async fn update_record_state(
     services: &Services,
 ) -> Result<(), ActorError> {
     record.state = state;
-    replace_record(services, record.clone()).await?;
+    persist_download_progress(services, record).await?;
     let _subscriber_count = services.events.send(EngineEvent {
         torrent_id: record.id,
         state,
@@ -4199,7 +4369,7 @@ async fn set_error(services: &Services, id: TorrentId, detail: String) -> Result
         .await?
         .ok_or(ActorError::Missing)?;
     record.state = TorrentState::Error;
-    replace_record(services, record).await?;
+    persist_download_progress(services, &record).await?;
     let _subscriber_count = services.events.send(EngineEvent {
         torrent_id: id,
         state: TorrentState::Error,
@@ -4210,6 +4380,26 @@ async fn set_error(services: &Services, id: TorrentId, detail: String) -> Result
 
 async fn replace_record(services: &Services, record: TorrentRecord) -> Result<(), ActorError> {
     if services.store.replace_torrent(record).await? {
+        Ok(())
+    } else {
+        Err(ActorError::Missing)
+    }
+}
+
+async fn persist_download_progress(
+    services: &Services,
+    record: &TorrentRecord,
+) -> Result<(), ActorError> {
+    if services
+        .store
+        .update_download_progress(
+            record.id,
+            record.state,
+            record.completed_pieces.clone(),
+            record.downloaded,
+        )
+        .await?
+    {
         Ok(())
     } else {
         Err(ActorError::Missing)
@@ -4531,6 +4721,7 @@ mod tests {
             lsd_cookie: "pex-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5160,6 +5351,7 @@ mod tests {
             lsd_cookie: "swarm-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5370,6 +5562,7 @@ mod tests {
             lsd_cookie: "lsd-downloader-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5444,6 +5637,7 @@ mod tests {
             lsd_cookie: "mse-out-test".to_owned(),
             encryption: EncryptionPolicy::Required,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5657,6 +5851,7 @@ mod tests {
             lsd_cookie: "endgame-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5819,6 +6014,7 @@ mod tests {
             lsd_cookie: "scheduler-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -7582,6 +7778,7 @@ mod tests {
             lsd_cookie: cookie.to_owned(),
             encryption: EncryptionPolicy::Disabled,
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            incoming_content: Arc::new(Mutex::new(HashMap::new())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),

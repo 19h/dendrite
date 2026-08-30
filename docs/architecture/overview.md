@@ -89,15 +89,18 @@ limit becomes an explicit error or rejection instead of unbounded work.
 
 ## Durable state
 
-`state.redb` contains versioned torrent records and unique v1/v2 hash indexes.
-Mutations that affect a record and its indexes are transactional. Records are
-encoded separately from the database schema so their format can be versioned.
-Undecodable records are quarantined instead of being returned as healthy
-torrents.
+`state.redb` contains versioned torrent records, compact mutable-progress
+records, and unique v1/v2 hash indexes. Large immutable metainfo is written on
+import or metadata acquisition; hot completion/counter updates modify only the
+compact progress record. Mutations that affect a record and its indexes are
+transactional. Undecodable records are quarantined instead of being returned as
+healthy torrents.
 
 Actor updates use replace-only persistence: a late update may replace an
 existing record but cannot recreate one removed at the same time. Completion is
-persisted only after payload data is synchronized.
+persisted only after payload data is synchronized. Upload bytes are accumulated
+in memory and transactionally flushed in per-torrent batches rather than
+forcing a database commit for every 16 KiB peer block.
 
 See [Storage and security](storage-security.md) and
 [Data layout](../reference/data-layout.md).
