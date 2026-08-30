@@ -58,11 +58,13 @@ const BLOCK_BYTES: usize = 16 * 1024;
 const BLOCK_PIPELINE: usize = 64;
 const PEER_COMMAND_CAPACITY: usize = 64;
 const ACTIVE_PEER_LIMIT: usize = 256;
+const PEER_CONNECT_CONCURRENCY: usize = 64;
 const INCOMING_PEER_LIMIT: usize = 256;
 const TRACKER_ANNOUNCE_CONCURRENCY: usize = 128;
 const DISCOVERY_EVENT_CAPACITY: usize = 256;
 const METADATA_PEER_CONCURRENCY: usize = 32;
 const STORAGE_IO_CONCURRENCY: usize = 256;
+const PIECE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const UPLOAD_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -144,15 +146,23 @@ enum SwarmLoopEvent {
     Worker(PeerWorkerEvent),
     Discovery(Option<DiscoveryEvent>),
     Stored(PieceWriteResult),
+    Flushed(PieceFlushResult),
+    FlushTick,
 }
 
 struct PieceWriteResult {
     worker: usize,
     piece: usize,
+    result: Result<HashSet<TorrentPath>, ActorError>,
+}
+
+struct PieceFlushResult {
+    pieces: Vec<usize>,
     result: Result<(), ActorError>,
 }
 
 type PieceWriteFuture<'a> = Pin<Box<dyn Future<Output = PieceWriteResult> + Send + 'a>>;
+type PieceFlushFuture<'a> = Pin<Box<dyn Future<Output = PieceFlushResult> + Send + 'a>>;
 
 enum PeerWorkerCommand {
     Download {
@@ -2644,12 +2654,20 @@ async fn run_peer_swarm_with_discovery(
     let pieces = swarm.piece_count;
     let mut discovery_error = None;
     let mut writes = FuturesUnordered::<PieceWriteFuture<'_>>::new();
+    let mut flush_tasks = FuturesUnordered::<PieceFlushFuture<'_>>::new();
+    let mut pending_pieces = Vec::new();
+    let mut pending_paths = HashSet::new();
+    let mut flush_interval = tokio::time::interval(PIECE_FLUSH_INTERVAL);
+    flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    flush_interval.tick().await;
     loop {
         if cancellation.is_cancelled() {
             shutdown_swarm(&swarm);
             return Err(ActorError::Cancelled);
         }
-        if all_complete(&record.completed_pieces, pieces) && writes.is_empty() {
+        let pending_io =
+            !writes.is_empty() || !flush_tasks.is_empty() || !pending_pieces.is_empty();
+        if all_complete(&record.completed_pieces, pieces) && !pending_io {
             stop_workers(&swarm.workers, &swarm.assignments);
             return Ok(());
         }
@@ -2660,14 +2678,7 @@ async fn run_peer_swarm_with_discovery(
             &mut swarm.picker,
             metainfo,
         )?;
-        if scheduled == 0
-            && discovery.is_none()
-            && swarm.candidates.is_empty()
-            && swarm.connecting == 0
-            && swarm.assignments.is_empty()
-            && swarm.workers.is_empty()
-            && writes.is_empty()
-        {
+        if scheduled == 0 && swarm_is_exhausted(&swarm, discovery.is_none(), pending_io) {
             shutdown_swarm(&swarm);
             if let Some(error) = discovery_error {
                 return Err(error);
@@ -2690,6 +2701,10 @@ async fn run_peer_swarm_with_discovery(
             stored = writes.next(), if !writes.is_empty() => {
                 SwarmLoopEvent::Stored(stored.ok_or(ActorError::Arithmetic)?)
             },
+            flushed = flush_tasks.next(), if !flush_tasks.is_empty() => {
+                SwarmLoopEvent::Flushed(flushed.ok_or(ActorError::Arithmetic)?)
+            },
+            _ = flush_interval.tick() => SwarmLoopEvent::FlushTick,
         };
         match event {
             SwarmLoopEvent::Worker(PeerWorkerEvent::Complete {
@@ -2700,14 +2715,7 @@ async fn run_peer_swarm_with_discovery(
                 if let Some(data) =
                     prepare_piece_result(&mut swarm, worker, piece, result, metainfo, record)?
                 {
-                    let storage = &services.storage;
-                    writes.push(Box::pin(async move {
-                        PieceWriteResult {
-                            worker,
-                            piece,
-                            result: write_piece(metainfo, piece, data, storage).await,
-                        }
-                    }));
+                    queue_piece_write(&mut writes, worker, piece, data, metainfo, services);
                 }
             }
             SwarmLoopEvent::Worker(event) => {
@@ -2724,10 +2732,67 @@ async fn run_peer_swarm_with_discovery(
             }
             SwarmLoopEvent::Discovery(None) => discovery = None,
             SwarmLoopEvent::Stored(stored) => {
-                commit_stored_piece(&mut swarm, stored, metainfo, record, services).await?;
+                stage_stored_piece(&mut swarm, stored, &mut pending_pieces, &mut pending_paths)?;
+            }
+            SwarmLoopEvent::Flushed(flushed) => {
+                commit_flushed_pieces(&mut swarm, flushed, metainfo, record, services).await?;
+            }
+            SwarmLoopEvent::FlushTick => {
+                queue_piece_flush(
+                    &mut flush_tasks,
+                    &mut pending_pieces,
+                    &mut pending_paths,
+                    &services.storage,
+                );
             }
         }
     }
+}
+
+fn queue_piece_write<'a>(
+    writes: &mut FuturesUnordered<PieceWriteFuture<'a>>,
+    worker: usize,
+    piece: usize,
+    data: Bytes,
+    metainfo: &'a Metainfo,
+    services: &'a Services,
+) {
+    let storage = &services.storage;
+    writes.push(Box::pin(async move {
+        PieceWriteResult {
+            worker,
+            piece,
+            result: write_piece_unflushed(metainfo, piece, data, storage).await,
+        }
+    }));
+}
+
+fn swarm_is_exhausted(swarm: &SwarmState, discovery_finished: bool, pending_io: bool) -> bool {
+    discovery_finished
+        && !pending_io
+        && swarm.candidates.is_empty()
+        && swarm.connecting == 0
+        && swarm.assignments.is_empty()
+        && swarm.workers.is_empty()
+}
+
+fn queue_piece_flush<'a>(
+    flush_tasks: &mut FuturesUnordered<PieceFlushFuture<'a>>,
+    pending_pieces: &mut Vec<usize>,
+    pending_paths: &mut HashSet<TorrentPath>,
+    storage: &'a StorageHandle,
+) {
+    if !flush_tasks.is_empty() || pending_pieces.is_empty() {
+        return;
+    }
+    let batch_pieces = std::mem::take(pending_pieces);
+    let batch_paths = std::mem::take(pending_paths);
+    flush_tasks.push(Box::pin(async move {
+        PieceFlushResult {
+            pieces: batch_pieces,
+            result: sync_paths(batch_paths, storage).await,
+        }
+    }));
 }
 
 fn initialize_swarm(
@@ -2801,7 +2866,9 @@ fn enqueue_peer_candidates(
 }
 
 fn fill_peer_slots(swarm: &mut SwarmState) {
-    while swarm.workers.len() < swarm.peer_limit {
+    while swarm.workers.len() < swarm.peer_limit
+        && swarm.connecting < PEER_CONNECT_CONCURRENCY.min(swarm.peer_limit)
+    {
         let Some(candidate) = swarm.candidates.pop_front() else {
             break;
         };
@@ -3572,25 +3639,18 @@ fn prepare_piece_result(
     Ok(None)
 }
 
-async fn commit_stored_piece(
+fn stage_stored_piece(
     swarm: &mut SwarmState,
     stored: PieceWriteResult,
-    metainfo: &Metainfo,
-    record: &mut TorrentRecord,
-    services: &Services,
+    pending_pieces: &mut Vec<usize>,
+    pending_paths: &mut HashSet<TorrentPath>,
 ) -> Result<(), ActorError> {
-    stored.result?;
-    swarm.writing.remove(&stored.piece);
-    set_bit(&mut record.completed_pieces, stored.piece);
+    pending_paths.extend(stored.result?);
     swarm
         .picker
         .mark_complete(stored.piece)
         .map_err(|error| ActorError::Peer(error.to_string()))?;
-    record.downloaded = record
-        .downloaded
-        .checked_add(piece_content_length(metainfo, stored.piece)?)
-        .ok_or(ActorError::Arithmetic)?;
-    persist_download_progress(services, record).await?;
+    pending_pieces.push(stored.piece);
     set_worker_idle(swarm, stored.worker);
     let wire_piece = u32::try_from(stored.piece).map_err(|_| ActorError::Arithmetic)?;
     for handle in swarm.workers.values() {
@@ -3598,6 +3658,26 @@ async fn commit_stored_piece(
             .commands
             .try_send(PeerWorkerCommand::Have { piece: wire_piece });
     }
+    Ok(())
+}
+
+async fn commit_flushed_pieces(
+    swarm: &mut SwarmState,
+    flushed: PieceFlushResult,
+    metainfo: &Metainfo,
+    record: &mut TorrentRecord,
+    services: &Services,
+) -> Result<(), ActorError> {
+    flushed.result?;
+    for piece in flushed.pieces {
+        swarm.writing.remove(&piece);
+        set_bit(&mut record.completed_pieces, piece);
+        record.downloaded = record
+            .downloaded
+            .checked_add(piece_content_length(metainfo, piece)?)
+            .ok_or(ActorError::Arithmetic)?;
+    }
+    persist_download_progress(services, record).await?;
     Ok(())
 }
 
@@ -4004,15 +4084,25 @@ async fn write_piece(
     piece: Bytes,
     storage: &StorageHandle,
 ) -> Result<(), ActorError> {
+    let touched = write_piece_unflushed(metainfo, index, piece, storage).await?;
+    sync_paths(touched, storage).await
+}
+
+async fn write_piece_unflushed(
+    metainfo: &Metainfo,
+    index: usize,
+    piece: Bytes,
+    storage: &StorageHandle,
+) -> Result<HashSet<TorrentPath>, ActorError> {
     if metainfo.v1_piece_hashes.is_empty() {
         let (file, _, offset) = v2_piece_location(metainfo, index)?;
         if !file.padding {
             storage
                 .write(file.path.clone(), offset, piece, file.length)
                 .await?;
-            storage.sync(file.path.clone()).await?;
+            return Ok(HashSet::from([file.path.clone()]));
         }
-        return Ok(());
+        return Ok(HashSet::new());
     }
     let start = piece_start(metainfo, index)?;
     let segments = file_segments(wire_files(metainfo), start, piece.len())?;
@@ -4044,7 +4134,14 @@ async fn write_piece(
         .buffer_unordered(STORAGE_IO_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
-    stream::iter(touched)
+    Ok(touched)
+}
+
+async fn sync_paths(
+    paths: HashSet<TorrentPath>,
+    storage: &StorageHandle,
+) -> Result<(), ActorError> {
+    stream::iter(paths)
         .map(|path| async move { storage.sync(path).await })
         .buffer_unordered(STORAGE_IO_CONCURRENCY)
         .try_collect::<Vec<_>>()

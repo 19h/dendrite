@@ -103,11 +103,16 @@ cargo run --locked -p dendrite-simulator -- --seed 24301
 For parser, peer-wire, tracker, extension, DHT, MSE, uTP, storage, or actor changes,
 run the owning tests and relevant fuzz smoke target in addition to the benchmark.
 
-Piece finalization is concurrent across peers but remains bounded to one
-pending durable write per peer. Mutable completion state is stored separately
-from immutable metainfo, and upload counters are flushed in per-torrent batches;
-these invariants prevent metadata size or peer block rate from amplifying state
-database writes.
+Piece writes are concurrent across peers, and verified peers resume downloading
+before a one-second group durability barrier commits their completion bits.
+Full piece buffers remain bounded by the active write set. Mutable completion
+state is stored separately from immutable metainfo, and upload counters are
+flushed in per-torrent batches; these invariants prevent metadata size or peer
+block rate from amplifying state database writes.
+
+Outbound connection establishment is limited to 64 concurrent handshakes per
+torrent even when the ready-peer ceiling is higher. This avoids synchronized
+timeout waves consuming the entire candidate pool.
 
 ## Reproducible result template
 

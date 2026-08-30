@@ -112,15 +112,16 @@ bytes arrived:
 - hybrid metadata must satisfy the identities and layouts required by both
   forms.
 
-After verification, storage writes are synchronized before the completion bit
-is committed. A crash can therefore lose recent progress, but the intended
-ordering avoids claiming data durable before the filesystem has received it.
-The completion bitmap and counters live in a compact progress record, so a
-piece commit never rewrites the torrent's potentially multi-megabyte metainfo.
-Verified pieces from different peers are finalized concurrently. Each peer is
-released for another assignment only after its previous piece is durable,
-bounding finalization memory to the active peer set while avoiding a global
-single-piece storage barrier.
+After verification, storage writes are grouped into one-second durability
+batches. A peer is released for another assignment as soon as its piece write
+finishes, while the completion bits and counters are committed only after the
+batch's touched files have been synchronized. A crash can therefore lose recent
+progress, but the intended ordering avoids claiming data durable before the
+filesystem has received it. The completion bitmap and counters live in a
+compact progress record, so a batch commit never rewrites the torrent's
+potentially multi-megabyte metainfo. Full piece buffers remain bounded by the
+active write set; pieces awaiting the batch barrier retain only their indexes
+and touched paths.
 
 When every required piece is verified the record transitions to `seeding`.
 
