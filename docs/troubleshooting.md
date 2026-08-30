@@ -218,6 +218,12 @@ over time. A large `peers` total with zero active downloaders usually means the
 connected population is choked or currently has no useful pieces. Do not infer
 corruption or completion from a single rate field.
 
+While downloading, an unknown peer can receive up to 4 MiB per daemon run through an optimistic
+slot. Further upload requires byte-for-byte credit from data received and
+piece-verified from that same peer. A full seed cannot be rewarded with payload
+because it already has every piece and will not request any; Dendrite instead
+retains full seeds preferentially and schedules them before partial sources.
+
 ## Recheck ends in `stopped`
 
 At least one required piece is absent or does not match its cryptographic

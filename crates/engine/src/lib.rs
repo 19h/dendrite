@@ -72,6 +72,7 @@ const UPLOAD_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const UPLOAD_CHOKE_INTERVAL: Duration = Duration::from_secs(10);
 const REGULAR_UPLOAD_SLOTS: usize = 8;
 const OPTIMISTIC_UPLOAD_SLOTS: usize = 2;
+const RECIPROCAL_BOOTSTRAP_BYTES: u64 = 4 * 1024 * 1024;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -389,6 +390,7 @@ struct UploadSession {
     torrent_id: TorrentId,
     peer: PeerKey,
     sender: PeerSender,
+    reciprocal: bool,
     interested: bool,
     unchoked: bool,
     uploaded: u64,
@@ -893,6 +895,7 @@ fn register_upload_session(
     torrent_id: TorrentId,
     peer: PeerKey,
     sender: PeerSender,
+    reciprocal: bool,
 ) -> (UploadSessionContext, UploadSessionGuard) {
     let session = rand::random();
     if let Ok(mut policy) = services.upload_policy.lock() {
@@ -902,6 +905,7 @@ fn register_upload_session(
                 torrent_id,
                 peer,
                 sender,
+                reciprocal,
                 interested: false,
                 unchoked: false,
                 uploaded: 0,
@@ -923,9 +927,25 @@ fn set_upload_interest(services: &Services, session: u64, interested: bool) -> b
     let Ok(mut policy) = services.upload_policy.lock() else {
         return false;
     };
-    let Some(torrent_id) = policy.sessions.get(&session).map(|entry| entry.torrent_id) else {
+    let Some((torrent_id, peer, reciprocal, already_unchoked)) =
+        policy.sessions.get(&session).map(|entry| {
+            (
+                entry.torrent_id,
+                entry.peer,
+                entry.reciprocal,
+                entry.unchoked,
+            )
+        })
+    else {
         return false;
     };
+    let reputation = policy
+        .reputation
+        .get(&(torrent_id, peer))
+        .copied()
+        .unwrap_or_default();
+    let has_credit = !reciprocal || has_reciprocal_upload_credit(reputation);
+    let contributes = !reciprocal || reciprocal_contribution(reputation) > 0;
     let occupied = policy
         .sessions
         .values()
@@ -935,18 +955,55 @@ fn set_upload_interest(services: &Services, session: u64, interested: bool) -> b
         return false;
     };
     entry.interested = interested;
-    entry.unchoked =
-        interested && (entry.unchoked || occupied < REGULAR_UPLOAD_SLOTS + OPTIMISTIC_UPLOAD_SLOTS);
+    let limit = if contributes {
+        REGULAR_UPLOAD_SLOTS + OPTIMISTIC_UPLOAD_SLOTS
+    } else {
+        OPTIMISTIC_UPLOAD_SLOTS
+    };
+    entry.unchoked = interested && has_credit && (already_unchoked || occupied < limit);
     entry.unchoked
 }
 
 fn upload_allowed(services: &Services, session: u64) -> bool {
-    services
-        .upload_policy
-        .lock()
-        .ok()
-        .and_then(|policy| policy.sessions.get(&session).map(|entry| entry.unchoked))
-        .unwrap_or(false)
+    let Ok(mut policy) = services.upload_policy.lock() else {
+        return false;
+    };
+    let Some((torrent_id, peer, reciprocal, unchoked)) =
+        policy.sessions.get(&session).map(|entry| {
+            (
+                entry.torrent_id,
+                entry.peer,
+                entry.reciprocal,
+                entry.unchoked,
+            )
+        })
+    else {
+        return false;
+    };
+    let reputation = policy
+        .reputation
+        .get(&(torrent_id, peer))
+        .copied()
+        .unwrap_or_default();
+    let allowed = unchoked && (!reciprocal || has_reciprocal_upload_credit(reputation));
+    if !allowed && let Some(entry) = policy.sessions.get_mut(&session) {
+        entry.unchoked = false;
+    }
+    allowed
+}
+
+fn reciprocal_contribution(reputation: PeerReputation) -> u64 {
+    reputation
+        .verified_from
+        .saturating_sub(reputation.uploaded_to)
+        .saturating_sub(u64::from(reputation.failures).saturating_mul(1024 * 1024))
+}
+
+fn has_reciprocal_upload_credit(reputation: PeerReputation) -> bool {
+    reputation.uploaded_to
+        < reputation
+            .verified_from
+            .saturating_add(RECIPROCAL_BOOTSTRAP_BYTES)
 }
 
 fn record_verified_download(services: &Services, torrent_id: TorrentId, peer: PeerKey, bytes: u64) {
@@ -985,6 +1042,7 @@ struct UploadCandidate {
     session: u64,
     contribution_score: u64,
     recent_upload: u64,
+    eligible: bool,
 }
 
 fn select_upload_sessions(
@@ -1002,13 +1060,15 @@ fn select_upload_sessions(
     }
     let mut desired = candidates
         .iter()
-        .filter(|peer| state == TorrentState::Seeding || peer.contribution_score > 0)
+        .filter(|peer| {
+            peer.eligible && (state == TorrentState::Seeding || peer.contribution_score > 0)
+        })
         .take(REGULAR_UPLOAD_SLOTS)
         .map(|peer| peer.session)
         .collect::<HashSet<_>>();
     let optimistic = candidates
         .iter()
-        .filter(|peer| !desired.contains(&peer.session))
+        .filter(|peer| peer.eligible && !desired.contains(&peer.session))
         .collect::<Vec<_>>();
     if !optimistic.is_empty() {
         let start = usize::try_from(round).unwrap_or(0) % optimistic.len();
@@ -1051,13 +1111,12 @@ async fn rebalance_upload_slots(services: &Services) {
                 continue;
             }
             let peer = reputation.get(&(entry.torrent_id, entry.peer));
-            let contribution_score = peer.map_or(0, |score| {
-                score
-                    .verified_from
-                    .saturating_mul(2)
-                    .saturating_sub(score.uploaded_to)
-                    .saturating_sub(u64::from(score.failures).saturating_mul(1024 * 1024))
-            });
+            let reputation = peer.copied().unwrap_or_default();
+            let reciprocal = matches!(
+                states.get(&entry.torrent_id),
+                Some(TorrentState::Downloading | TorrentState::Starting)
+            );
+            let contribution_score = reciprocal_contribution(reputation);
             by_torrent
                 .entry(entry.torrent_id)
                 .or_default()
@@ -1065,6 +1124,7 @@ async fn rebalance_upload_slots(services: &Services) {
                     session: *session,
                     contribution_score,
                     recent_upload: entry.uploaded.saturating_sub(entry.sampled_uploaded),
+                    eligible: !reciprocal || has_reciprocal_upload_credit(reputation),
                 });
         }
         let mut desired = HashSet::new();
@@ -1078,6 +1138,10 @@ async fn rebalance_upload_slots(services: &Services) {
         policy.round = policy.round.wrapping_add(OPTIMISTIC_UPLOAD_SLOTS as u64);
         let mut actions = Vec::new();
         for (session, entry) in &mut policy.sessions {
+            entry.reciprocal = matches!(
+                states.get(&entry.torrent_id),
+                Some(TorrentState::Downloading | TorrentState::Starting)
+            );
             entry.recent_upload = entry.uploaded.saturating_sub(entry.sampled_uploaded);
             entry.sampled_uploaded = entry.uploaded;
             let unchoked = entry.interested && desired.contains(session);
@@ -1403,8 +1467,10 @@ where
     .await
     .map_err(|error| ActorError::Peer(error.to_string()))?;
 
+    let reciprocal = record.state != TorrentState::Seeding;
     let seed = IncomingSeed {
         torrent_id: record.id,
+        reciprocal,
         completed_pieces: record.completed_pieces,
         content,
         interested: false,
@@ -1453,6 +1519,7 @@ where
 
 struct IncomingSeed {
     torrent_id: TorrentId,
+    reciprocal: bool,
     completed_pieces: Vec<u8>,
     content: Arc<IncomingContent>,
     interested: bool,
@@ -1484,6 +1551,7 @@ async fn run_incoming_peer(
             peer_id: remote.peer_id,
         },
         peer.sender(),
+        seed.reciprocal,
     );
     let session = upload.session;
     loop {
@@ -1702,6 +1770,7 @@ async fn handle_seed_holepunch(
         HolePunchKind::Connect => {
             let seed = IncomingSeed {
                 torrent_id: seed.torrent_id,
+                reciprocal: seed.reciprocal,
                 completed_pieces: seed.completed_pieces.clone(),
                 content: seed.content.clone(),
                 interested: false,
@@ -1828,6 +1897,7 @@ async fn run_hole_seed_peer(
             peer_id: peer.remote_peer_id(),
         },
         peer.sender(),
+        seed.reciprocal,
     );
     loop {
         match next_peer_event(peer).await? {
@@ -4256,6 +4326,7 @@ async fn promoted_incoming_peer_worker(
             peer_id: incoming.remote.peer_id,
         },
         peer.sender(),
+        incoming.seed.reciprocal,
     );
     let mut upload = PeerUploadContext {
         address: incoming.address,
@@ -4528,7 +4599,7 @@ async fn outgoing_peer_upload_context(
     completed_pieces: &[u8],
     peer: &PeerConnection,
 ) -> Option<PeerUploadContext> {
-    let (_, content) = find_incoming_torrent(info_hash, services).await.ok()?;
+    let (record, content) = find_incoming_torrent(info_hash, services).await.ok()?;
     let remote = Handshake {
         reserved: peer.remote_reserved(),
         info_hash,
@@ -4542,12 +4613,14 @@ async fn outgoing_peer_upload_context(
             peer_id: remote.peer_id,
         },
         peer.sender(),
+        record.state != TorrentState::Seeding,
     );
     Some(PeerUploadContext {
         address,
         remote,
         seed: IncomingSeed {
             torrent_id,
+            reciprocal: record.state != TorrentState::Seeding,
             completed_pieces: completed_pieces.to_vec(),
             content,
             interested: false,
@@ -4570,7 +4643,15 @@ fn schedule_pieces(
         .iter()
         .filter_map(|(worker, handle)| (handle.idle && !handle.choked).then_some(*worker))
         .collect();
-    idle.sort_unstable();
+    idle.sort_unstable_by_key(|worker| {
+        std::cmp::Reverse(workers.get(worker).map_or((false, false, 0), |handle| {
+            (
+                handle.seed,
+                handle.last_verified.is_some(),
+                handle.verified_bytes,
+            )
+        }))
+    });
     let mut scheduled = 0_usize;
     for worker in idle {
         let Some(handle) = workers.get_mut(&worker) else {
@@ -5727,6 +5808,7 @@ mod tests {
                 session,
                 contribution_score: 12 - session,
                 recent_upload: session,
+                eligible: true,
             })
             .collect::<Vec<_>>();
         let first = select_upload_sessions(TorrentState::Downloading, &mut candidates, 0);
@@ -5750,6 +5832,7 @@ mod tests {
                 session,
                 contribution_score: 0,
                 recent_upload: session * 1024,
+                eligible: true,
             })
             .collect::<Vec<_>>();
         let selected = select_upload_sessions(TorrentState::Seeding, &mut candidates, 0);
@@ -5760,6 +5843,60 @@ mod tests {
         for fast in 4_u64..12 {
             assert!(selected.contains(&fast));
         }
+    }
+
+    #[test]
+    fn downloading_upload_credit_is_strictly_reciprocal_after_bootstrap() {
+        let balanced = PeerReputation {
+            verified_from: 32 * 1024 * 1024,
+            uploaded_to: 32 * 1024 * 1024,
+            failures: 0,
+        };
+        assert!(has_reciprocal_upload_credit(balanced));
+        assert_eq!(reciprocal_contribution(balanced), 0);
+
+        let exhausted = PeerReputation {
+            uploaded_to: balanced
+                .verified_from
+                .saturating_add(RECIPROCAL_BOOTSTRAP_BYTES),
+            ..balanced
+        };
+        assert!(!has_reciprocal_upload_credit(exhausted));
+
+        let contributor = PeerReputation {
+            verified_from: 64 * 1024 * 1024,
+            uploaded_to: 16 * 1024 * 1024,
+            failures: 0,
+        };
+        assert_eq!(reciprocal_contribution(contributor), 48 * 1024 * 1024);
+    }
+
+    #[test]
+    fn exhausted_peer_cannot_consume_regular_or_optimistic_upload_slot() {
+        let mut candidates = [
+            UploadCandidate {
+                session: 1,
+                contribution_score: u64::MAX,
+                recent_upload: u64::MAX,
+                eligible: false,
+            },
+            UploadCandidate {
+                session: 2,
+                contribution_score: 1024,
+                recent_upload: 0,
+                eligible: true,
+            },
+            UploadCandidate {
+                session: 3,
+                contribution_score: 0,
+                recent_upload: 0,
+                eligible: true,
+            },
+        ];
+        let selected = select_upload_sessions(TorrentState::Downloading, &mut candidates, 0);
+        assert!(!selected.contains(&1));
+        assert!(selected.contains(&2));
+        assert!(selected.contains(&3));
     }
 
     #[test]

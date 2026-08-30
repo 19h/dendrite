@@ -106,9 +106,12 @@ torrent is promoted into this same bidirectional worker pool instead of being
 restricted to an upload-only session.
 
 During downloads, regular upload slots favor peers that supplied verified data,
-with two rotating optimistic unchokes so unknown peers can establish value.
-Once the torrent is seeding, slot ordering switches to recent upload rate while
-retaining the optimistic rotation.
+with two rotating optimistic unchokes so unknown peers can establish value. Each
+peer receives a 4 MiB bootstrap allowance per daemon run; after that, served bytes may not run
+ahead of bytes received and piece-verified from that peer. Full seeds are chosen
+first when scheduling available sources, although they normally request no data
+themselves. Once the torrent is seeding, reciprocal credit no longer applies and
+slot ordering switches to recent upload rate while retaining optimistic rotation.
 
 Web seeds are a fallback data source for declared HTTP(S) URLs. Requests enforce
 range and response limits. Private-address web seeds are rejected in the daemon

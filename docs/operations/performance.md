@@ -116,10 +116,12 @@ timeout waves consuming the entire candidate pool.
 
 While downloading, verified byte rate, useful-piece availability, failures,
 and upload/download reciprocity influence peer retention. Full seeds receive a
-retention preference; stale or choked non-seeds are rotated so queued candidates
-can be classified. Upload choking favors verified contributors and keeps two
-rotating optimistic slots. In `seeding`, recent upload rate supplies the fair
-slot ordering instead.
+retention preference and scheduling priority; stale or choked non-seeds are
+rotated so queued candidates can be classified. During download, upload credit
+is limited to verified bytes received from the same peer plus a 4 MiB
+bootstrap allowance. Two rotating optimistic slots expose that allowance to
+unknown peers. In `seeding`, reciprocal credit is disabled and recent upload
+rate supplies the fair slot ordering instead.
 
 ## Reproducible result template
 
