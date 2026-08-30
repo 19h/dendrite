@@ -114,6 +114,13 @@ Outbound connection establishment is limited to 128 concurrent handshakes per
 torrent even when the ready-peer ceiling is higher. This avoids synchronized
 timeout waves consuming the entire candidate pool.
 
+While downloading, verified byte rate, useful-piece availability, failures,
+and upload/download reciprocity influence peer retention. Full seeds receive a
+retention preference; stale or choked non-seeds are rotated so queued candidates
+can be classified. Upload choking favors verified contributors and keeps two
+rotating optimistic slots. In `seeding`, recent upload rate supplies the fair
+slot ordering instead.
+
 ## Reproducible result template
 
 ```text

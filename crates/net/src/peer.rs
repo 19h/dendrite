@@ -38,7 +38,7 @@ impl Default for PeerCodecLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PeerId([u8; 20]);
 
 impl PeerId {

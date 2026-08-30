@@ -97,7 +97,8 @@ Options:
 `watch` is the human-facing live progress view. Without an ID it follows the
 entire queue, traversing every API page; with an ID it shows a larger progress
 bar and details for that torrent. Both views include verified bytes, total size,
-live download/upload rates, connected peers, and estimated time remaining.
+live download/upload rates, inbound/outbound connections, full seeds, active
+piece sources, and estimated time remaining.
 
 ```sh
 dendritectl watch

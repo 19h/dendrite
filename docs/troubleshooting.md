@@ -154,9 +154,11 @@ transient; use logs over time.
 
 ## Torrent has one peer and is extremely slow
 
-The sampled `peers` value counts connected sessions, not tracker seeders. One
-connection can therefore mean that discovery found only one usable endpoint,
-or that every other candidate failed during connect or negotiation.
+The sampled `peers` value counts connected sessions, not the tracker population.
+Use `inbound_peers`, `outbound_peers`, `seed_peers`, and `active_downloaders` to
+separate reachable sessions from full sources that are actually sending data.
+One connection can therefore mean that discovery found only one usable
+endpoint, or that every other candidate failed during connect or negotiation.
 
 On a dual-stack host, Dendrite prefers IPv6 for HTTP tracker announces and falls
 back to IPv4. This matters because some trackers return different IPv4 and IPv6
@@ -168,8 +170,11 @@ check the other tracker tiers and configured DHT bootstrap nodes.
 
 Tracker tiers, DHT, and local discovery run concurrently. Usable results are
 connected immediately, while later results remain available as replacements for
-failed sessions. A long list of dead trackers should therefore increase log
-noise but must not delay a healthy tracker or an already discovered peer.
+failed sessions. While downloading, discovery refreshes periodically, inbound
+sessions can join the active swarm, full seeds are preferentially retained, and
+idle or choked non-seeds are rotated when unused candidates remain. A long list
+of dead trackers should therefore increase log noise but must not delay a
+healthy tracker or an already discovered peer.
 
 Measure progress with two summary requests at least 250 ms apart. The live
 `download_rate` includes accepted peer blocks, including partial pieces; the
@@ -208,7 +213,9 @@ The first summary rate sample is zero and later rates update only when summaries
 are separated by at least 250 ms. A quiet interval, choking peers, discovery,
 metadata acquisition, verification, or completed seeding can all produce zero.
 
-Check state, durable byte counters, peer count, and logs over time. Do not infer
+Check state, durable byte counters, `seed_peers`, `active_downloaders`, and logs
+over time. A large `peers` total with zero active downloaders usually means the
+connected population is choked or currently has no useful pieces. Do not infer
 corruption or completion from a single rate field.
 
 ## Recheck ends in `stopped`

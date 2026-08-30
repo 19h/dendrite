@@ -77,9 +77,9 @@ For public torrents, initial discovery runs all sources concurrently:
 
 Each result streams immediately into a deduplicated candidate queue. PEX adds
 more candidates after compatible peer sessions exist. Unused candidates remain
-available to replace failed sessions, and discovery is repeated only after the
-live swarm and candidate queue are exhausted. Private torrents use their
-declared trackers and suppress DHT, local discovery, and PEX.
+available to replace failed sessions, and an active download refreshes discovery
+periodically. Private torrents use their declared trackers and suppress DHT,
+local discovery, and PEX.
 
 With the default empty DHT bootstrap list, a torrent that has no working
 tracker cannot rely on DHT discovery until the operator supplies bootstrap
@@ -96,6 +96,19 @@ and cancel redundant work when one copy arrives.
 Peer availability, choke state, timeouts, invalid messages, failed hashes, and
 global connection admission all influence useful concurrency. The constants
 above are upper implementation bounds, not throughput guarantees.
+
+Connections are classified after peer-wire negotiation. A complete bitfield
+marks a full seed. Verified byte rate, remaining useful pieces, integrity
+failures, and reciprocal transfer contribute to retention ordering. Full seeds
+and recent contributors are protected, while stale or choked non-seeds rotate
+when queued candidates need an audition. An inbound peer for a downloading
+torrent is promoted into this same bidirectional worker pool instead of being
+restricted to an upload-only session.
+
+During downloads, regular upload slots favor peers that supplied verified data,
+with two rotating optimistic unchokes so unknown peers can establish value.
+Once the torrent is seeding, slot ordering switches to recent upload rate while
+retaining the optimistic rotation.
 
 Web seeds are a fallback data source for declared HTTP(S) URLs. Requests enforce
 range and response limits. Private-address web seeds are rejected in the daemon
@@ -141,8 +154,10 @@ Resume an incomplete torrent to reacquire them.
 
 The incoming peer service accepts globally admitted connections and matches
 their handshake identity to durable torrents in `downloading` or `seeding`.
-Only verified completed blocks can be served. A persisted `seeding` record does
-not need a download actor after restart to remain eligible for this service.
+During a download, useful incoming peers join the active transfer swarm and can
+both upload and download on the same session. Only verified completed blocks can
+be served. A persisted `seeding` record does not need a download actor after
+restart to remain eligible for this service.
 Immutable parsed metainfo and metadata-exchange bytes are shared by concurrent
 incoming sessions. Upload accounting is sampled live and durably flushed once
 per second in a per-torrent batch.

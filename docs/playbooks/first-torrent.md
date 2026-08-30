@@ -125,7 +125,11 @@ Successful output resembles:
   "uploaded": 0,
   "download_rate": 0,
   "upload_rate": 0,
-  "peers": 0
+  "peers": 0,
+  "inbound_peers": 0,
+  "outbound_peers": 0,
+  "seed_peers": 0,
+  "active_downloaders": 0
 }
 ```
 
@@ -181,7 +185,11 @@ stopped --resume/--start--> starting --> downloading --> seeding
 `upload_rate` sample accepted peer blocks, including partial pieces; durable
 upload accounting is flushed in one-second batches. Rates are calculated when
 summaries are requested and may be zero on the first or closely spaced request.
-`peers` is the actor's current connected peer count.
+`peers` is the current connected-session total. `inbound_peers` and
+`outbound_peers` split it by connection direction; `seed_peers` counts sessions
+whose complete bitfield identifies them as full sources; and
+`active_downloaders` counts sessions currently serving requested piece data.
+These live values can change independently of tracker-reported population.
 
 The client `list` command requests one server-default page and has no cursor or
 limit flags. For more than the configured page size, use the paginated HTTP API.

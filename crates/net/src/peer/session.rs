@@ -49,6 +49,7 @@ pub struct PeerConnection {
     events: mpsc::Receiver<PeerEvent>,
     cancellation: CancellationToken,
     remote_reserved: [u8; 8],
+    remote_peer_id: PeerId,
 }
 
 /// A cloneable, send-only view of a live peer session. This lets bounded
@@ -224,6 +225,7 @@ impl PeerConnection {
             events: event_receiver,
             cancellation,
             remote_reserved: remote.reserved,
+            remote_peer_id: remote.peer_id,
         }
     }
 
@@ -245,6 +247,16 @@ impl PeerConnection {
     #[must_use]
     pub const fn remote_supports_extensions(&self) -> bool {
         self.remote_reserved[5] & 0x10 != 0
+    }
+
+    #[must_use]
+    pub const fn remote_peer_id(&self) -> PeerId {
+        self.remote_peer_id
+    }
+
+    #[must_use]
+    pub const fn remote_reserved(&self) -> [u8; 8] {
+        self.remote_reserved
     }
 
     pub fn shutdown(&self) {

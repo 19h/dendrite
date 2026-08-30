@@ -111,13 +111,20 @@ Add, get, list items, and action responses use:
   "uploaded": 0,
   "download_rate": 131072,
   "upload_rate": 0,
-  "peers": 4
+  "peers": 4,
+  "inbound_peers": 1,
+  "outbound_peers": 3,
+  "seed_peers": 2,
+  "active_downloaders": 2
 }
 ```
 
 States are `stopped`, `starting`, `downloading`, `seeding`, `checking`, `error`,
 and `stopping`. Rates are bytes per second sampled in process; counters are
-bytes. A newly added magnet can have `total_length: 0` until metadata arrives.
+bytes. `peers` is the connected total, while the four additional peer fields
+report connection direction, full-seed classification, and currently active
+piece sources. A newly added magnet can have `total_length: 0` until metadata
+arrives.
 
 ## List and pagination
 

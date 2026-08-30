@@ -43,6 +43,14 @@ pub struct TorrentSummary {
     pub download_rate: u64,
     pub upload_rate: u64,
     pub peers: u32,
+    #[serde(default)]
+    pub inbound_peers: u32,
+    #[serde(default)]
+    pub outbound_peers: u32,
+    #[serde(default)]
+    pub seed_peers: u32,
+    #[serde(default)]
+    pub active_downloaders: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

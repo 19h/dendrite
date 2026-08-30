@@ -1039,6 +1039,7 @@ fn session_cookie(value: &str, max_age: u64, secure: bool) -> Result<HeaderValue
 
 fn summary(state: &AppState, record: &TorrentRecord) -> TorrentSummary {
     let (download_rate, upload_rate) = sample_rates(state, record);
+    let peers = state.engine.torrent_peer_stats(record.id);
     TorrentSummary {
         id: record.id,
         name: record.name.clone(),
@@ -1050,7 +1051,11 @@ fn summary(state: &AppState, record: &TorrentRecord) -> TorrentSummary {
         uploaded: record.uploaded,
         download_rate,
         upload_rate,
-        peers: u32::try_from(state.engine.torrent_peer_count(record.id)).unwrap_or(u32::MAX),
+        peers: u32::try_from(peers.total).unwrap_or(u32::MAX),
+        inbound_peers: u32::try_from(peers.inbound).unwrap_or(u32::MAX),
+        outbound_peers: u32::try_from(peers.outbound).unwrap_or(u32::MAX),
+        seed_peers: u32::try_from(peers.seeds).unwrap_or(u32::MAX),
+        active_downloaders: u32::try_from(peers.active_downloaders).unwrap_or(u32::MAX),
     }
 }
 

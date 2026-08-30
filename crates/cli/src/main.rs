@@ -315,8 +315,14 @@ fn render_torrent_detail(torrent: &TorrentSummary) -> String {
     );
     let _ = writeln!(
         output,
-        "Peers    {}   ETA {}",
-        torrent.peers,
+        "Peers    {} total   {} inbound   {} outbound",
+        torrent.peers, torrent.inbound_peers, torrent.outbound_peers
+    );
+    let _ = writeln!(
+        output,
+        "Sources  {} seeds   {} active downloaders   ETA {}",
+        torrent.seed_peers,
+        torrent.active_downloaders,
         format_eta(torrent)
     );
     output
@@ -332,6 +338,18 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
     let peers = torrents.iter().fold(0_u64, |total, torrent| {
         total.saturating_add(u64::from(torrent.peers))
     });
+    let inbound_peers = torrents.iter().fold(0_u64, |total, torrent| {
+        total.saturating_add(u64::from(torrent.inbound_peers))
+    });
+    let outbound_peers = torrents.iter().fold(0_u64, |total, torrent| {
+        total.saturating_add(u64::from(torrent.outbound_peers))
+    });
+    let seed_peers = torrents.iter().fold(0_u64, |total, torrent| {
+        total.saturating_add(u64::from(torrent.seed_peers))
+    });
+    let active_downloaders = torrents.iter().fold(0_u64, |total, torrent| {
+        total.saturating_add(u64::from(torrent.active_downloaders))
+    });
     let mut output = String::new();
     let noun = if torrents.len() == 1 {
         "torrent"
@@ -345,10 +363,14 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
     );
     let _ = writeln!(
         output,
-        "Total: ↓ {}   ↑ {}   peers {}\n",
+        "Total: ↓ {}   ↑ {}   peers {} ({} in / {} out)   sources {} seeds / {} active\n",
         format_rate(download_rate),
         format_rate(upload_rate),
-        peers
+        peers,
+        inbound_peers,
+        outbound_peers,
+        seed_peers,
+        active_downloaders
     );
     if torrents.is_empty() {
         let _ = writeln!(output, "No torrents.");
@@ -356,8 +378,16 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
     }
     let _ = writeln!(
         output,
-        "{:<20} {:<11} {:<19} {:>21} {:>12} {:>12} {:>5} {:>9}",
-        "NAME", "STATE", "PROGRESS", "DONE / TOTAL", "DOWN", "UP", "PEERS", "ETA"
+        "{:<20} {:<11} {:<19} {:>21} {:>12} {:>12} {:>15} {:>11} {:>9}",
+        "NAME",
+        "STATE",
+        "PROGRESS",
+        "DONE / TOTAL",
+        "DOWN",
+        "UP",
+        "PEERS T/I/O",
+        "SEEDS/ACTIVE",
+        "ETA"
     );
     for torrent in torrents {
         let size = format!(
@@ -367,7 +397,7 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
         );
         let _ = writeln!(
             output,
-            "{:<20} {:<11} {:<19} {:>21} {:>12} {:>12} {:>5} {:>9}",
+            "{:<20} {:<11} {:<19} {:>21} {:>12} {:>12} {:>15} {:>11} {:>9}",
             truncate(&torrent.name, 20),
             state_label(torrent.state),
             format!(
@@ -378,7 +408,11 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
             size,
             format_rate(torrent.download_rate),
             format_rate(torrent.upload_rate),
-            torrent.peers,
+            format!(
+                "{}/{}/{}",
+                torrent.peers, torrent.inbound_peers, torrent.outbound_peers
+            ),
+            format!("{}/{}", torrent.seed_peers, torrent.active_downloaders),
             format_eta(torrent)
         );
     }
@@ -678,11 +712,15 @@ mod tests {
         assert!(detail.contains("steam2"));
         assert!(detail.contains("25.00%"));
         assert!(detail.contains("↓ 1.00 KiB/s"));
+        assert!(detail.contains("31 inbound"));
+        assert!(detail.contains("8 seeds"));
         assert!(detail.contains("ETA 3s"));
 
         let table = render_torrent_table(&[torrent]);
         assert!(table.contains("1 torrent"));
         assert!(table.contains("Total: ↓ 1.00 KiB/s"));
+        assert!(table.contains("51/31/20"));
+        assert!(table.contains("8/6"));
         assert!(table.contains("DOWN"));
         assert!(table.contains("steam2"));
         assert!(render_torrent_table(&[]).contains("No torrents."));
@@ -701,6 +739,10 @@ mod tests {
             download_rate: 1_024,
             upload_rate: 0,
             peers: 51,
+            inbound_peers: 31,
+            outbound_peers: 20,
+            seed_peers: 8,
+            active_downloaders: 6,
         }
     }
 }
