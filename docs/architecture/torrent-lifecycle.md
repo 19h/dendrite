@@ -89,7 +89,7 @@ nodes.
 
 The actor connects to a bounded set of discovered peers over TCP or uTP,
 performs protocol negotiation, and chooses pieces rarest-first. The current
-transfer scheduler uses up to 256 peers, with a 64-block request pipeline per
+transfer scheduler uses up to 256 peers, with a 128-block request pipeline per
 peer. Near completion, endgame scheduling can duplicate outstanding requests
 and cancel redundant work when one copy arrives.
 

@@ -110,7 +110,7 @@ state is stored separately from immutable metainfo, and upload counters are
 flushed in per-torrent batches; these invariants prevent metadata size or peer
 block rate from amplifying state database writes.
 
-Outbound connection establishment is limited to 64 concurrent handshakes per
+Outbound connection establishment is limited to 128 concurrent handshakes per
 torrent even when the ready-peer ceiling is higher. This avoids synchronized
 timeout waves consuming the entire candidate pool.
 
