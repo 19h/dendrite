@@ -55,6 +55,13 @@ For v2 torrents the actor also obtains the required piece layers before normal
 verification and transfer. Until metadata is accepted, provisional fields such
 as total length can be zero and the display name can come from `dn`.
 
+Metadata acquisition probes up to 32 candidates per torrent, but admits at most
+four metadata payload transfers globally. Buffers grow only as bounded metadata
+blocks arrive; an advertised total size does not reserve the configured
+metainfo limit up front. Each admitted session pipelines up to 16 block requests
+so latency does not serialize a large metadata transfer. Connected sessions
+appear as outbound peers while the torrent remains in `starting`.
+
 ## Actor preparation
 
 One actor generation owns active work for one UUID. It loads durable metadata,

@@ -114,6 +114,13 @@ Outbound connection establishment is limited to 128 concurrent handshakes per
 torrent even when the ready-peer ceiling is higher. This avoids synchronized
 timeout waves consuming the entire candidate pool.
 
+Magnet metadata discovery can probe 32 candidates per torrent, while metadata
+payload transfer is separately limited to four concurrent sessions across the
+daemon. Each session pipelines up to 16 metadata block requests. Advertised
+metadata size is allocated incrementally as validated blocks arrive. This
+preserves broad discovery without letting simultaneous 64 MiB-limit magnets
+multiply memory into gigabytes or one round trip serialize every block.
+
 While downloading, verified byte rate, useful-piece availability, failures,
 and upload/download reciprocity influence peer retention. Full seeds receive a
 retention preference and scheduling priority; stale or choked non-seeds are

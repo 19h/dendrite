@@ -186,6 +186,8 @@ synced, and committed.
 For a magnet, metadata must be obtained from a compatible peer and match every
 declared identity. Logs can distinguish no metadata peers, repeated identity
 mismatches, missing v2 piece layers, path conflicts, or storage setup failures.
+During this phase `total_length` remains zero; outbound peer telemetry counts
+live metadata sessions.
 
 For a `.torrent`, preparation can still fail while claiming paths or opening
 storage. Do not repeatedly resume in a tight loop; capture the actor error,

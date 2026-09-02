@@ -63,6 +63,8 @@ const INCOMING_PEER_LIMIT: usize = 256;
 const TRACKER_ANNOUNCE_CONCURRENCY: usize = 128;
 const DISCOVERY_EVENT_CAPACITY: usize = 256;
 const METADATA_PEER_CONCURRENCY: usize = 32;
+const METADATA_GLOBAL_CONCURRENCY: usize = 4;
+const METADATA_REQUEST_PIPELINE: usize = 16;
 const STORAGE_IO_CONCURRENCY: usize = 256;
 const PIECE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_RETENTION_INTERVAL: Duration = Duration::from_secs(10);
@@ -336,6 +338,7 @@ struct Services {
     peer_id: PeerId,
     events: broadcast::Sender<EngineEvent>,
     peer_slots: Arc<Semaphore>,
+    metadata_slots: Arc<Semaphore>,
     per_torrent_peer_limit: usize,
     lsd_cookie: String,
     encryption: EncryptionPolicy,
@@ -635,6 +638,7 @@ impl EngineHandle {
             peer_id: generate_peer_id(),
             events: events.clone(),
             peer_slots: Arc::new(Semaphore::new(options.peer_connection_limit.max(1))),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(options.peer_connection_limit),
             lsd_cookie: format!("dendrite-{:016x}", rand::random::<u64>()),
             encryption: options.encryption,
@@ -2491,6 +2495,7 @@ async fn acquire_metadata_from_discovery(
     services: &Services,
     cancellation: &CancellationToken,
 ) -> Result<(), ActorError> {
+    let torrent_id = record.id;
     let attempts_cancellation = cancellation.child_token();
     let mut attempts = tokio::task::JoinSet::new();
     let mut candidates = VecDeque::new();
@@ -2506,8 +2511,19 @@ async fn acquire_metadata_from_discovery(
             let services = services.clone();
             let cancellation = attempts_cancellation.child_token();
             attempts.spawn(async move {
-                fetch_and_validate_metadata(address, info_hash, &magnet, &services, &cancellation)
-                    .await
+                let result = fetch_and_validate_metadata(
+                    torrent_id,
+                    address,
+                    info_hash,
+                    &magnet,
+                    &services,
+                    &cancellation,
+                )
+                .await;
+                if let Err(error) = &result {
+                    debug!(%torrent_id, %address, %error, "metadata peer failed");
+                }
+                result
             });
         }
         if discovery_done && attempts.is_empty() && candidates.is_empty() {
@@ -2555,13 +2571,15 @@ async fn acquire_metadata_from_discovery(
 }
 
 async fn fetch_and_validate_metadata(
+    torrent_id: TorrentId,
     address: SocketAddr,
     info_hash: Sha1Hash,
     magnet: &Magnet,
     services: &Services,
     cancellation: &CancellationToken,
 ) -> Result<(Vec<u8>, Metainfo), ActorError> {
-    let (info, mut peer) = fetch_metadata(address, info_hash, services, cancellation).await?;
+    let (info, mut peer, _metadata_slot, _connection) =
+        fetch_metadata(torrent_id, address, info_hash, services, cancellation).await?;
     let result = validate_acquired_metadata(&info, &mut peer, magnet, services).await;
     peer.shutdown();
     result
@@ -2579,8 +2597,8 @@ async fn acquire_metadata_from_peers(
     let mut last_error = None;
     for address in peers {
         cancelled(cancellation)?;
-        match fetch_metadata(address, info_hash, services, cancellation).await {
-            Ok((info, mut peer)) => {
+        match fetch_metadata(record.id, address, info_hash, services, cancellation).await {
+            Ok((info, mut peer, _metadata_slot, _connection)) => {
                 let validated =
                     validate_acquired_metadata(&info, &mut peer, magnet, services).await;
                 peer.shutdown();
@@ -2629,7 +2647,11 @@ async fn validate_acquired_metadata(
     let raw_without_layers = wrap_info_dictionary(info, magnet.trackers.first(), &BTreeMap::new());
     let preliminary = Metainfo::parse_allow_missing_piece_layers(&raw_without_layers, limits)
         .map_err(|error| ActorError::Metainfo(error.to_string()))?;
-    let layers = fetch_piece_layers(peer, &preliminary, services.metainfo_limit).await?;
+    let layers = if preliminary.v2_info_hash.is_some() {
+        fetch_piece_layers(peer, &preliminary, services.metainfo_limit).await?
+    } else {
+        BTreeMap::new()
+    };
     let raw = wrap_info_dictionary(info, magnet.trackers.first(), &layers);
     let parsed =
         Metainfo::parse(&raw, limits).map_err(|error| ActorError::Metainfo(error.to_string()))?;
@@ -2650,11 +2672,20 @@ async fn validate_acquired_metadata(
 }
 
 async fn fetch_metadata(
+    torrent_id: TorrentId,
     address: SocketAddr,
     info_hash: Sha1Hash,
     services: &Services,
     cancellation: &CancellationToken,
-) -> Result<(Vec<u8>, PeerConnection), ActorError> {
+) -> Result<
+    (
+        Vec<u8>,
+        PeerConnection,
+        tokio::sync::OwnedSemaphorePermit,
+        ConnectionGuard,
+    ),
+    ActorError,
+> {
     let mut reserved = [0_u8; 8];
     reserved[5] |= 0x10;
     let mut peer = connect_outgoing_peer(
@@ -2673,6 +2704,7 @@ async fn fetch_metadata(
     )
     .await
     .map_err(|error| ActorError::Metadata(error.to_string()))?;
+    let connection = track_connection(services, torrent_id, PeerDirection::Outbound, false);
     peer.send(PeerMessage::Extended {
         extension_id: 0,
         payload: encode_extension_handshake(None),
@@ -2682,29 +2714,66 @@ async fn fetch_metadata(
 
     let (remote_extension_id, total_size) =
         negotiate_metadata(&mut peer, services.metainfo_limit, cancellation).await?;
+    let metadata_slot = acquire_metadata_slot(services, cancellation).await?;
     let piece_count = total_size.div_ceil(METADATA_BLOCK_BYTES);
-    let mut metadata = Vec::with_capacity(total_size);
-    for piece in 0..piece_count {
+    let mut pieces = vec![None; piece_count];
+    let mut requested = 0_usize;
+    let mut received = 0_usize;
+    while requested < piece_count && requested < METADATA_REQUEST_PIPELINE {
         cancelled(cancellation)?;
-        let piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
+        let piece = u32::try_from(requested).map_err(|_| ActorError::Arithmetic)?;
         peer.send(PeerMessage::Extended {
             extension_id: remote_extension_id,
             payload: encode_metadata_request(piece),
         })
         .await
         .map_err(|error| ActorError::Metadata(error.to_string()))?;
-        let remaining = total_size.saturating_sub(metadata.len());
-        let block = receive_metadata_piece(
+        requested += 1;
+    }
+    while received < piece_count {
+        cancelled(cancellation)?;
+        let (piece, block) = receive_metadata_piece(
             &mut peer,
-            piece,
+            requested,
+            &pieces,
             total_size,
-            remaining.min(METADATA_BLOCK_BYTES),
             services.metainfo_limit,
         )
         .await?;
-        metadata.extend_from_slice(&block);
+        pieces[piece] = Some(block);
+        received += 1;
+        if requested < piece_count {
+            let piece = u32::try_from(requested).map_err(|_| ActorError::Arithmetic)?;
+            peer.send(PeerMessage::Extended {
+                extension_id: remote_extension_id,
+                payload: encode_metadata_request(piece),
+            })
+            .await
+            .map_err(|error| ActorError::Metadata(error.to_string()))?;
+            requested += 1;
+        }
     }
-    Ok((metadata, peer))
+    let mut metadata = Vec::with_capacity(total_size.min(METADATA_BLOCK_BYTES));
+    for block in pieces {
+        metadata.extend_from_slice(
+            block
+                .as_deref()
+                .ok_or_else(|| ActorError::Metadata("metadata piece is missing".to_owned()))?,
+        );
+    }
+    Ok((metadata, peer, metadata_slot, connection))
+}
+
+async fn acquire_metadata_slot(
+    services: &Services,
+    cancellation: &CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ActorError> {
+    tokio::select! {
+        () = cancellation.cancelled() => Err(ActorError::Cancelled),
+        permit = services.metadata_slots.clone().acquire_owned() => {
+            permit.map_err(|_| ActorError::Cancelled)
+        }
+    }
 }
 
 async fn negotiate_metadata(
@@ -2744,11 +2813,11 @@ async fn negotiate_metadata(
 
 async fn receive_metadata_piece(
     peer: &mut PeerConnection,
-    piece: u32,
+    requested: usize,
+    pieces: &[Option<Bytes>],
     total_size: usize,
-    expected_length: usize,
     metainfo_limit: usize,
-) -> Result<Bytes, ActorError> {
+) -> Result<(usize, Bytes), ActorError> {
     loop {
         match next_peer_event(peer).await? {
             PeerEvent::Message(PeerMessage::Extended {
@@ -2761,20 +2830,38 @@ async fn receive_metadata_piece(
                     piece: response_piece,
                     total_size: response_size,
                     block,
-                } if response_piece == piece
-                    && response_size == total_size
-                    && block.len() == expected_length =>
-                {
-                    return Ok(block);
+                } => {
+                    let piece =
+                        usize::try_from(response_piece).map_err(|_| ActorError::Arithmetic)?;
+                    let offset = piece
+                        .checked_mul(METADATA_BLOCK_BYTES)
+                        .ok_or(ActorError::Arithmetic)?;
+                    let expected_length = total_size
+                        .checked_sub(offset)
+                        .map(|remaining| remaining.min(METADATA_BLOCK_BYTES));
+                    if piece >= requested
+                        || pieces.get(piece).is_none_or(Option::is_some)
+                        || response_size != total_size
+                        || expected_length != Some(block.len())
+                    {
+                        return Err(ActorError::Metadata(
+                            "peer returned an unexpected metadata message".to_owned(),
+                        ));
+                    }
+                    return Ok((piece, block));
                 }
-                MetadataMessage::Reject {
-                    piece: response_piece,
-                } if response_piece == piece => {
+                MetadataMessage::Reject { piece } => {
+                    let piece = usize::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
+                    if piece >= requested || pieces.get(piece).is_none_or(Option::is_some) {
+                        return Err(ActorError::Metadata(
+                            "peer returned an unexpected metadata message".to_owned(),
+                        ));
+                    }
                     return Err(ActorError::Metadata(
                         "peer rejected a metadata request".to_owned(),
                     ));
                 }
-                _ => {
+                MetadataMessage::Request { .. } => {
                     return Err(ActorError::Metadata(
                         "peer returned an unexpected metadata message".to_owned(),
                     ));
@@ -6130,6 +6217,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "pex-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -6248,6 +6336,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn incoming_seed_is_promoted_into_the_active_download_swarm()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = Bytes::from_static(b"an inbound seed can drive the entire verified download");
@@ -6909,6 +6998,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "swarm-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -7122,6 +7212,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "lsd-downloader-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -7199,6 +7290,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "mse-out-test".to_owned(),
             encryption: EncryptionPolicy::Required,
@@ -7415,6 +7507,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "endgame-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -7580,6 +7673,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "scheduler-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -8995,7 +9089,13 @@ mod tests {
             services.metainfo_limit = LIMIT;
             let result = tokio::time::timeout(
                 Duration::from_secs(2),
-                fetch_metadata(address, info_hash, &services, &CancellationToken::new()),
+                fetch_metadata(
+                    TorrentId::new(),
+                    address,
+                    info_hash,
+                    &services,
+                    &CancellationToken::new(),
+                ),
             )
             .await
             .map_err(|_| format!("{attack:?} metadata peer was not bounded"))?;
@@ -9005,6 +9105,124 @@ mod tests {
             );
             peer.await.map_err(|error| error.to_string())??;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_fetches_share_a_bounded_global_admission_pool()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 4)?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let storage = StorageHandle::start_portable(&downloads, 4)?;
+        let services = test_services(store, storage, "metadata-admission");
+        let occupied = services
+            .metadata_slots
+            .clone()
+            .acquire_many_owned(u32::try_from(METADATA_GLOBAL_CONCURRENCY)?)
+            .await?;
+        let cancellation = CancellationToken::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                acquire_metadata_slot(&services, &cancellation),
+            )
+            .await
+            .is_err()
+        );
+        drop(occupied);
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_metadata_slot(&services, &cancellation),
+        )
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_pipeline_accepts_out_of_order_blocks()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let info_hash = Sha1Hash::from_bytes([42; 20]);
+        let metadata = Bytes::from(
+            (0..METADATA_BLOCK_BYTES * 2 + 7)
+                .map(|index| u8::try_from(index % 251))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let peer = tokio::spawn(fake_pipelined_metadata_peer(
+            listener,
+            info_hash,
+            metadata.clone(),
+        ));
+        let directory = tempfile::tempdir()?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 4)?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let storage = StorageHandle::start_portable(&downloads, 4)?;
+        let mut services = test_services(store, storage, "metadata-pipeline");
+        services.metainfo_limit = metadata.len();
+        let (received, connection, _slot, _guard) = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_metadata(
+                TorrentId::new(),
+                address,
+                info_hash,
+                &services,
+                &CancellationToken::new(),
+            ),
+        )
+        .await??;
+        connection.shutdown();
+        assert_eq!(received, metadata);
+        peer.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn large_v1_magnet_does_not_require_v2_piece_layers()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload_pieces = [
+            Bytes::from(vec![1; BLOCK_BYTES * BLOCK_PIPELINE]),
+            Bytes::from(vec![2; BLOCK_BYTES * BLOCK_PIPELINE]),
+        ];
+        let raw = multi_piece_v1_metainfo("large-v1.bin", &payload_pieces);
+        let parsed = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = parsed.v1_info_hash.ok_or("missing v1 info hash")?;
+        let info = Bytes::copy_from_slice(metainfo_info_bytes(&raw)?);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let peer = tokio::spawn(fake_metadata_only_peer(listener, info_hash, info));
+        let directory = tempfile::tempdir()?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 4)?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let storage = StorageHandle::start_portable(&downloads, 4)?;
+        let services = test_services(store, storage, "large-v1-magnet");
+        let magnet = Magnet {
+            v1_info_hash: Some(info_hash),
+            v2_info_hash: None,
+            display_name: Some("large-v1.bin".to_owned()),
+            trackers: Vec::new(),
+            web_seeds: Vec::new(),
+        };
+        let (_, acquired) = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_and_validate_metadata(
+                TorrentId::new(),
+                address,
+                info_hash,
+                &magnet,
+                &services,
+                &CancellationToken::new(),
+            ),
+        )
+        .await??;
+        assert_eq!(acquired.v1_info_hash, Some(info_hash));
+        assert_eq!(acquired.v2_info_hash, None);
+        assert!(acquired.total_length > u64::from(acquired.piece_length.get()));
+        peer.await.map_err(|error| error.to_string())??;
         Ok(())
     }
 
@@ -9347,6 +9565,7 @@ mod tests {
             peer_id: generate_peer_id(),
             events,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: cookie.to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -9745,6 +9964,68 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    async fn fake_pipelined_metadata_peer(
+        listener: TcpListener,
+        info_hash: Sha1Hash,
+        metadata: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (stream, _) = listener.accept().await?;
+        let mut peer = test_peer_connection(stream, info_hash).await?;
+        loop {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Extended {
+                    extension_id: 0, ..
+                })) => break,
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+        peer.send(PeerMessage::Extended {
+            extension_id: 0,
+            payload: encode_extension_handshake(Some(metadata.len())),
+        })
+        .await?;
+        let piece_count = metadata.len().div_ceil(METADATA_BLOCK_BYTES);
+        let mut requested = Vec::with_capacity(piece_count);
+        while requested.len() < piece_count {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Extended {
+                    extension_id: LOCAL_METADATA_EXTENSION_ID,
+                    payload,
+                })) => {
+                    let MetadataMessage::Request { piece } =
+                        decode_metadata_message(&payload, metadata.len())?
+                    else {
+                        return Err("client sent unexpected metadata message".into());
+                    };
+                    requested.push(usize::try_from(piece)?);
+                }
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+        requested.sort_unstable();
+        if requested != (0..piece_count).collect::<Vec<_>>() {
+            return Err("client did not pipeline each metadata request once".into());
+        }
+        for piece in requested.into_iter().rev() {
+            let start = piece * METADATA_BLOCK_BYTES;
+            let end = metadata.len().min(start + METADATA_BLOCK_BYTES);
+            peer.send(PeerMessage::Extended {
+                extension_id: LOCAL_METADATA_EXTENSION_ID,
+                payload: encode_metadata_data(
+                    u32::try_from(piece)?,
+                    metadata.len(),
+                    &metadata[start..end],
+                ),
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     impl MetadataAttack {
