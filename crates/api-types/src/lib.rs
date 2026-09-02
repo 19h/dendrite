@@ -38,6 +38,8 @@ pub struct TorrentSummary {
     pub v1_info_hash: Option<Sha1Hash>,
     pub v2_info_hash: Option<Sha256Hash>,
     pub total_length: u64,
+    #[serde(default)]
+    pub stop_on_complete: bool,
     pub downloaded: u64,
     pub uploaded: u64,
     pub download_rate: u64,
@@ -60,6 +62,8 @@ pub struct AddTorrentOptions {
     pub destination: Option<String>,
     #[serde(default)]
     pub sequential: bool,
+    #[serde(default)]
+    pub stop_on_complete: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

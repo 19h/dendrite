@@ -62,6 +62,12 @@ metainfo limit up front. Each admitted session pipelines up to 16 block requests
 so latency does not serialize a large metadata transfer. Connected sessions
 appear as outbound peers while the torrent remains in `starting`.
 
+If every candidate in a metadata round fails, the actor remains in `starting`,
+waits with exponential backoff from one to 30 seconds, and starts fresh tracker,
+DHT, and local-discovery work. It repeats indefinitely until metadata validates
+or an explicit pause, remove, recheck, or daemon shutdown cancels the actor.
+Malformed local magnet state and persistence failures remain terminal errors.
+
 ## Actor preparation
 
 One actor generation owns active work for one UUID. It loads durable metadata,
@@ -146,14 +152,17 @@ potentially multi-megabyte metainfo. Full piece buffers remain bounded by the
 active write set; pieces awaiting the batch barrier retain only their indexes
 and touched paths.
 
-When every required piece is verified the record transitions to `seeding`.
+When every required piece is verified the record transitions to `seeding`, or
+to `stopped` when its persistent stop-on-complete mode is enabled. The latter
+ends the actor immediately and excludes the torrent from incoming seed service.
 
 ## Recheck
 
 Recheck cancels active transfer, reads the payload through the confined storage
 root, and rebuilds completion from cryptographic metadata. Its result is:
 
-- `seeding` if every required piece verifies;
+- `seeding` if every required piece verifies, or `stopped` when
+  stop-on-complete is enabled;
 - `stopped` if any required piece is absent or invalid;
 - `error` if metadata, path, or storage operations fail.
 

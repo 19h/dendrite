@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-const CURRENT_SCHEMA: u32 = 3;
+const CURRENT_SCHEMA: u32 = 4;
 const META: TableDefinition<'static, &str, u64> = TableDefinition::new("meta");
 const TORRENTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("torrents");
 const PROGRESS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("progress");
@@ -26,6 +26,7 @@ pub struct TorrentRecord {
     pub total_length: u64,
     pub raw_metainfo: Vec<u8>,
     pub magnet_uri: Option<String>,
+    pub stop_on_complete: bool,
     pub completed_pieces: Vec<u8>,
     pub downloaded: u64,
     pub uploaded: u64,
@@ -33,7 +34,45 @@ pub struct TorrentRecord {
 }
 
 impl TorrentRecord {
-    pub const RECORD_VERSION: u16 = 1;
+    pub const RECORD_VERSION: u16 = 2;
+}
+
+#[derive(Serialize, Deserialize)]
+struct TorrentRecordV1 {
+    record_version: u16,
+    id: TorrentId,
+    name: String,
+    state: TorrentState,
+    v1_info_hash: Option<Sha1Hash>,
+    v2_info_hash: Option<Sha256Hash>,
+    total_length: u64,
+    raw_metainfo: Vec<u8>,
+    magnet_uri: Option<String>,
+    completed_pieces: Vec<u8>,
+    downloaded: u64,
+    uploaded: u64,
+    added_at_unix_ms: u64,
+}
+
+impl From<TorrentRecordV1> for TorrentRecord {
+    fn from(record: TorrentRecordV1) -> Self {
+        Self {
+            record_version: Self::RECORD_VERSION,
+            id: record.id,
+            name: record.name,
+            state: record.state,
+            v1_info_hash: record.v1_info_hash,
+            v2_info_hash: record.v2_info_hash,
+            total_length: record.total_length,
+            raw_metainfo: record.raw_metainfo,
+            magnet_uri: record.magnet_uri,
+            stop_on_complete: false,
+            completed_pieces: record.completed_pieces,
+            downloaded: record.downloaded,
+            uploaded: record.uploaded,
+            added_at_unix_ms: record.added_at_unix_ms,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -669,11 +708,17 @@ fn hash_keys(record: &TorrentRecord) -> Vec<Vec<u8>> {
 }
 
 fn decode_record(bytes: &[u8]) -> Result<TorrentRecord, StoreError> {
-    let record: TorrentRecord = postcard::from_bytes(bytes)?;
-    if record.record_version != TorrentRecord::RECORD_VERSION {
+    if let Ok(record) = postcard::from_bytes::<TorrentRecord>(bytes) {
+        if record.record_version != TorrentRecord::RECORD_VERSION {
+            return Err(StoreError::RecordVersion(record.record_version));
+        }
+        return Ok(record);
+    }
+    let record: TorrentRecordV1 = postcard::from_bytes(bytes)?;
+    if record.record_version != 1 {
         return Err(StoreError::RecordVersion(record.record_version));
     }
-    Ok(record)
+    Ok(record.into())
 }
 
 fn database_error(error: impl std::fmt::Display) -> StoreError {
@@ -707,6 +752,7 @@ mod tests {
             total_length: 4,
             raw_metainfo: b"test".to_vec(),
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: Vec::new(),
             downloaded: 0,
             uploaded: 0,
@@ -733,6 +779,33 @@ mod tests {
     }
 
     #[test]
+    fn version_one_records_migrate_with_normal_completion_behavior()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = TorrentId::new();
+        let encoded = postcard::to_allocvec(&TorrentRecordV1 {
+            record_version: 1,
+            id,
+            name: "legacy".to_owned(),
+            state: TorrentState::Downloading,
+            v1_info_hash: Some(Sha1Hash::from_bytes([3; 20])),
+            v2_info_hash: None,
+            total_length: 42,
+            raw_metainfo: b"legacy-metainfo".to_vec(),
+            magnet_uri: None,
+            completed_pieces: vec![0x80],
+            downloaded: 42,
+            uploaded: 7,
+            added_at_unix_ms: 9,
+        })?;
+        let record = decode_record(&encoded)?;
+        assert_eq!(record.record_version, TorrentRecord::RECORD_VERSION);
+        assert_eq!(record.id, id);
+        assert!(!record.stop_on_complete);
+        assert_eq!(record.downloaded, 42);
+        Ok(())
+    }
+
+    #[test]
     fn committed_progress_survives_database_restart() -> Result<(), Box<dyn std::error::Error>> {
         let path = temporary_database();
         let id = TorrentId::new();
@@ -748,6 +821,7 @@ mod tests {
                 total_length: 32_768,
                 raw_metainfo: b"durable-metainfo".to_vec(),
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: vec![0b1000_0000],
                 downloaded: 16_384,
                 uploaded: 4_096,
@@ -782,6 +856,7 @@ mod tests {
             total_length: 16 * 1024 * 1024,
             raw_metainfo: vec![0x55; 2 * 1024 * 1024],
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: vec![0; 128 * 1024],
             downloaded: 0,
             uploaded: 0,
@@ -859,6 +934,7 @@ mod tests {
                 total_length: 1,
                 raw_metainfo: Vec::new(),
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: vec![0],
                 downloaded: 0,
                 uploaded: 0,
@@ -896,6 +972,7 @@ mod tests {
                 total_length: 1,
                 raw_metainfo: Vec::new(),
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: vec![0b1000_0000],
                 downloaded: 1,
                 uploaded: 0,
@@ -991,6 +1068,7 @@ mod tests {
                 total_length: 1,
                 raw_metainfo: Vec::new(),
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: vec![0],
                 downloaded: 0,
                 uploaded: 0,
@@ -1054,6 +1132,7 @@ mod tests {
             total_length: 16,
             raw_metainfo: Vec::new(),
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: vec![0],
             downloaded: 0,
             uploaded: 0,
@@ -1146,6 +1225,7 @@ mod tests {
             total_length: 1,
             raw_metainfo: Vec::new(),
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: vec![0],
             downloaded: 0,
             uploaded: 0,
@@ -1207,6 +1287,7 @@ mod tests {
             total_length: 1,
             raw_metainfo: Vec::new(),
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: vec![0],
             downloaded: 0,
             uploaded: 0,
@@ -1269,6 +1350,7 @@ mod tests {
             total_length: 1,
             raw_metainfo: Vec::new(),
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: vec![0x80],
             downloaded: 1,
             uploaded: u64::MAX,
@@ -1319,6 +1401,7 @@ mod tests {
                 total_length: 1,
                 raw_metainfo: Vec::new(),
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: vec![0x80],
                 downloaded: 1,
                 uploaded: 0,

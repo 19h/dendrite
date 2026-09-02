@@ -107,6 +107,7 @@ Add, get, list items, and action responses use:
   "v1_info_hash": "40 lowercase hex characters or null",
   "v2_info_hash": "64 lowercase hex characters or null",
   "total_length": 1048576,
+  "stop_on_complete": true,
   "downloaded": 524288,
   "uploaded": 0,
   "download_rate": 131072,
@@ -161,11 +162,14 @@ curl --fail --show-error \
   "$API/torrents"
 ```
 
-Supported option:
+Supported options:
 
 ```json
-{"start": true}
+{"start": true, "stop_on_complete": true}
 ```
+
+`stop_on_complete` defaults to false. When true, successful download or recheck
+completion transitions to `stopped` instead of `seeding`.
 
 The shared options type also contains `destination` and `sequential`, but API
 v2.0 rejects a non-null destination or `sequential: true`. All payloads use the
@@ -187,7 +191,7 @@ The tagged request shape is:
 {
   "source": "magnet",
   "uri": "magnet URI",
-  "options": {"start": false}
+  "options": {"start": false, "stop_on_complete": false}
 }
 ```
 

@@ -120,6 +120,7 @@ Arguments:
 
 Options:
       --start
+      --stop-on-complete
 ```
 
 If `SOURCE` starts exactly with `magnet:`, the client sends it to the magnet
@@ -129,11 +130,14 @@ multipart upload. Quote magnet URIs in a shell:
 ```sh
 dendritectl add ./image.torrent
 dendritectl add ./image.torrent --start
+dendritectl add ./image.torrent --start --stop-on-complete
 dendritectl add 'magnet:?xt=urn:btih:…&tr=…' --start
 ```
 
 `--start` asks the daemon to schedule transfer after the record commits. Without
-it, the new record remains `stopped`.
+it, the new record remains `stopped`. `--stop-on-complete` persists a completion
+mode that transitions the torrent to `stopped`, rather than `seeding`, after all
+pieces verify. It can be supplied with or without `--start`.
 
 ### `pause`, `resume`, and `recheck`
 

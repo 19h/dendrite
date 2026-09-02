@@ -53,6 +53,9 @@ enum Command {
         source: String,
         #[arg(long)]
         start: bool,
+        /// Stop instead of seeding after every piece has been verified.
+        #[arg(long)]
+        stop_on_complete: bool,
     },
     Pause {
         id: String,
@@ -129,39 +132,29 @@ async fn run(arguments: Arguments) -> Result<(), CliError> {
             )
             .await?;
         }
-        Command::Add { source, start } => {
-            let torrent = add(&client, &arguments.api, &authorization, source, start).await?;
-            println!("{}", serde_json::to_string_pretty(&torrent)?);
-        }
-        Command::Pause { id } => {
-            print_action(
+        Command::Add {
+            source,
+            start,
+            stop_on_complete,
+        } => {
+            print_add(
                 &client,
                 &arguments.api,
                 &authorization,
-                &id,
-                TorrentAction::Pause,
+                source,
+                start,
+                stop_on_complete,
             )
             .await?;
         }
-        Command::Resume { id } => {
-            print_action(
-                &client,
-                &arguments.api,
-                &authorization,
-                &id,
-                TorrentAction::Resume,
-            )
-            .await?;
-        }
-        Command::Recheck { id } => {
-            print_action(
-                &client,
-                &arguments.api,
-                &authorization,
-                &id,
-                TorrentAction::Recheck,
-            )
-            .await?;
+        command @ (Command::Pause { .. } | Command::Resume { .. } | Command::Recheck { .. }) => {
+            let (id, action) = match command {
+                Command::Pause { id } => (id, TorrentAction::Pause),
+                Command::Resume { id } => (id, TorrentAction::Resume),
+                Command::Recheck { id } => (id, TorrentAction::Recheck),
+                _ => unreachable!(),
+            };
+            print_action(&client, &arguments.api, &authorization, &id, action).await?;
         }
         Command::Remove { id } => {
             checked(
@@ -295,6 +288,15 @@ fn render_torrent_detail(torrent: &TorrentSummary) -> String {
     let _ = writeln!(output, "{}", torrent.name);
     let _ = writeln!(output, "ID       {}", torrent.id);
     let _ = writeln!(output, "State    {}", state_label(torrent.state));
+    let _ = writeln!(
+        output,
+        "Complete {}",
+        if torrent.stop_on_complete {
+            "stop"
+        } else {
+            "seed"
+        }
+    );
     let _ = writeln!(
         output,
         "Progress {} {}",
@@ -557,9 +559,11 @@ async fn add(
     authorization: &HeaderValue,
     source: String,
     start: bool,
+    stop_on_complete: bool,
 ) -> Result<TorrentSummary, CliError> {
     let options = AddTorrentOptions {
         start,
+        stop_on_complete,
         ..AddTorrentOptions::default()
     };
     if source.starts_with("magnet:") {
@@ -611,6 +615,19 @@ async fn print_action(
         &TorrentActionRequest { action },
     )
     .await?;
+    println!("{}", serde_json::to_string_pretty(&torrent)?);
+    Ok(())
+}
+
+async fn print_add(
+    client: &reqwest::Client,
+    base: &str,
+    authorization: &HeaderValue,
+    source: String,
+    start: bool,
+    stop_on_complete: bool,
+) -> Result<(), CliError> {
+    let torrent = add(client, base, authorization, source, start, stop_on_complete).await?;
     println!("{}", serde_json::to_string_pretty(&torrent)?);
     Ok(())
 }
@@ -714,6 +731,7 @@ mod tests {
         assert!(detail.contains("↓ 1.00 KiB/s"));
         assert!(detail.contains("31 inbound"));
         assert!(detail.contains("8 seeds"));
+        assert!(detail.contains("Complete stop"));
         assert!(detail.contains("ETA 3s"));
 
         let table = render_torrent_table(&[torrent]);
@@ -726,6 +744,26 @@ mod tests {
         assert!(render_torrent_table(&[]).contains("No torrents."));
     }
 
+    #[test]
+    fn add_accepts_stop_on_complete_flag() -> Result<(), Box<dyn std::error::Error>> {
+        let arguments = Arguments::try_parse_from([
+            "dendritectl",
+            "add",
+            "payload.torrent",
+            "--start",
+            "--stop-on-complete",
+        ])?;
+        assert!(matches!(
+            arguments.command,
+            Command::Add {
+                start: true,
+                stop_on_complete: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
     fn fixture_torrent() -> TorrentSummary {
         TorrentSummary {
             id: TorrentId::new(),
@@ -734,6 +772,7 @@ mod tests {
             v1_info_hash: None,
             v2_info_hash: None,
             total_length: 4_096,
+            stop_on_complete: true,
             downloaded: 1_024,
             uploaded: 0,
             download_rate: 1_024,

@@ -2464,27 +2464,62 @@ async fn acquire_magnet_metadata(
         .cloned()
         .map(|tracker| vec![tracker])
         .collect();
-    let discovery = start_peer_discovery(
-        services,
-        DiscoveryQuery {
-            trackers: &trackers,
-            record,
-            info_hash,
-            left: 0,
-            allow_dht: true,
-            announce_event: AnnounceEvent::Started,
-            cancellation: cancellation.child_token(),
-        },
-    )?;
-    acquire_metadata_from_discovery(
-        record,
-        &magnet,
-        info_hash,
-        discovery,
-        services,
-        cancellation,
+    let mut delay = SWARM_RETRY_MIN;
+    let mut announce_event = AnnounceEvent::Started;
+    loop {
+        cancelled(cancellation)?;
+        let round = start_peer_discovery(
+            services,
+            DiscoveryQuery {
+                trackers: &trackers,
+                record,
+                info_hash,
+                left: 0,
+                allow_dht: true,
+                announce_event,
+                cancellation: cancellation.child_token(),
+            },
+        );
+        let result = match round {
+            Ok(discovery) => {
+                acquire_metadata_from_discovery(
+                    record,
+                    &magnet,
+                    info_hash,
+                    discovery,
+                    services,
+                    cancellation,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(ActorError::Cancelled) => return Err(ActorError::Cancelled),
+            Err(error) if retryable_metadata_failure(&error) => {
+                debug!(%error, ?delay, "magnet metadata round exhausted; retrying discovery");
+            }
+            Err(error) => return Err(error),
+        }
+        announce_event = AnnounceEvent::None;
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(ActorError::Cancelled),
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = delay.saturating_mul(2).min(SWARM_RETRY_MAX);
+    }
+}
+
+fn retryable_metadata_failure(error: &ActorError) -> bool {
+    matches!(
+        error,
+        ActorError::Metadata(_)
+            | ActorError::Metainfo(_)
+            | ActorError::NoTracker
+            | ActorError::NoPeers
+            | ActorError::Peer(_)
     )
-    .await
 }
 
 async fn acquire_metadata_from_discovery(
@@ -3026,7 +3061,16 @@ async fn download(
         }
         download_from_web_seeds(metainfo, record, services, cancellation).await?;
     }
-    update_record_state(record, TorrentState::Seeding, services).await
+    let state = completion_state(record);
+    update_record_state(record, state, services).await
+}
+
+const fn completion_state(record: &TorrentRecord) -> TorrentState {
+    if record.stop_on_complete {
+        TorrentState::Stopped
+    } else {
+        TorrentState::Seeding
+    }
 }
 
 async fn download_from_peers_with_retry(
@@ -5326,7 +5370,7 @@ async fn recheck(
         }
     }
     let state = if all_complete(&record.completed_pieces, pieces) {
-        TorrentState::Seeding
+        completion_state(record)
     } else {
         TorrentState::Stopped
     };
@@ -7839,7 +7883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervised_actor_downloads_and_verifies_a_piece()
+    async fn supervised_actor_stops_after_completing_stop_on_complete_torrent()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = Bytes::from_static(b"a rigorously verified local torrent payload");
         let piece_digest: [u8; 20] = Sha1::digest(&payload).into();
@@ -7877,6 +7921,7 @@ mod tests {
                 total_length: metainfo.total_length,
                 raw_metainfo: metainfo_bytes,
                 magnet_uri: None,
+                stop_on_complete: true,
                 completed_pieces: Vec::new(),
                 downloaded: 0,
                 uploaded: 0,
@@ -7903,7 +7948,7 @@ mod tests {
                         .detail
                         .unwrap_or_else(|| "unknown actor error".to_owned()));
                 }
-                if event.state == TorrentState::Seeding {
+                if event.state == TorrentState::Stopped {
                     return Ok(());
                 }
             }
@@ -7914,7 +7959,7 @@ mod tests {
         let written = tokio::fs::read(directory.path().join("downloads/payload.bin")).await?;
         assert_eq!(written, payload);
         let record = store.get_torrent(id).await?.ok_or("record disappeared")?;
-        assert_eq!(record.state, TorrentState::Seeding);
+        assert_eq!(record.state, TorrentState::Stopped);
         assert_eq!(record.downloaded, payload.len() as u64);
         tracker_task.await.map_err(|error| error.to_string())??;
         peer_task.await.map_err(|error| error.to_string())??;
@@ -8004,7 +8049,7 @@ mod tests {
         let info_hash = wire_info_hash(&metainfo)?;
         let tracker = tokio::spawn(fake_tracker_sequence(
             tracker_listener,
-            [first_address, second_address],
+            [(first_address, true), (second_address, false)],
         ));
         let first_peer = tokio::spawn(fake_piece_then_disconnect(
             first_listener,
@@ -8246,6 +8291,7 @@ mod tests {
                 total_length: metainfo.total_length,
                 raw_metainfo: raw,
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: Vec::new(),
                 downloaded: 0,
                 uploaded: 0,
@@ -9031,6 +9077,7 @@ mod tests {
                 total_length: 0,
                 raw_metainfo: Vec::new(),
                 magnet_uri: Some(magnet.to_string()),
+                stop_on_complete: false,
                 completed_pieces: Vec::new(),
                 downloaded: 0,
                 uploaded: 0,
@@ -9059,6 +9106,93 @@ mod tests {
         );
         tracker_task.await.map_err(|error| error.to_string())??;
         peer_task.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn magnet_metadata_reannounces_after_exhausting_a_bad_peer_round()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = Bytes::from_static(b"metadata retry eventually downloads this payload");
+        let piece_digest: [u8; 20] = Sha1::digest(&payload).into();
+        let bad_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let bad_address = bad_listener.local_addr()?;
+        let healthy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let healthy_address = healthy_listener.local_addr()?;
+        let tracker_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let tracker_url = format!("http://{}/announce", tracker_listener.local_addr()?);
+        let full_metainfo = single_file_metainfo(&tracker_url, "retry.bin", &payload, piece_digest);
+        let metainfo = Metainfo::parse(&full_metainfo, BencodeLimits::default())?;
+        let info_hash = metainfo.v1_info_hash.ok_or("missing v1 info hash")?;
+        let info = Bytes::copy_from_slice(metainfo_info_bytes(&full_metainfo)?);
+        let mut magnet = Url::parse("magnet:?")?;
+        magnet
+            .query_pairs_mut()
+            .append_pair("xt", &format!("urn:btih:{info_hash}"))
+            .append_pair("dn", "retry.bin")
+            .append_pair("tr", &tracker_url);
+
+        let tracker = tokio::spawn(fake_tracker_sequence(
+            tracker_listener,
+            [
+                (bad_address, true),
+                (healthy_address, false),
+                (healthy_address, true),
+            ],
+        ));
+        let bad_peer = tokio::spawn(fake_metadata_handshake_disconnect_peer(
+            bad_listener,
+            info_hash,
+        ));
+        let healthy_peer = tokio::spawn(fake_metadata_then_payload_peer(
+            healthy_listener,
+            info_hash,
+            info,
+            payload.clone(),
+        ));
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
+        let storage = StorageHandle::start_portable(&downloads, 32)?;
+        let metainfo_limit = 64 * 1024;
+        let id = TorrentId::new();
+        store
+            .put_torrent(TorrentRecord {
+                record_version: TorrentRecord::RECORD_VERSION,
+                id,
+                name: "retry.bin".to_owned(),
+                state: TorrentState::Starting,
+                v1_info_hash: Some(info_hash),
+                v2_info_hash: None,
+                total_length: 0,
+                raw_metainfo: Vec::new(),
+                magnet_uri: Some(magnet.to_string()),
+                stop_on_complete: false,
+                completed_pieces: Vec::new(),
+                downloaded: 0,
+                uploaded: 0,
+                added_at_unix_ms: 0,
+            })
+            .await?;
+        let engine = EngineHandle::start(
+            store.clone(),
+            storage,
+            metainfo_limit,
+            metainfo_limit,
+            Vec::new(),
+            None,
+            6881,
+        );
+        let mut events = engine.subscribe();
+        engine.resume(id).await?;
+        tokio::time::timeout(Duration::from_secs(10), wait_for_seeding(&mut events))
+            .await
+            .map_err(|_| "metadata retry did not reach seeding")??;
+        assert_eq!(tokio::fs::read(downloads.join("retry.bin")).await?, payload);
+        tracker.await.map_err(|error| error.to_string())??;
+        bad_peer.await.map_err(|error| error.to_string())??;
+        healthy_peer.await.map_err(|error| error.to_string())??;
+        engine.shutdown().await?;
         Ok(())
     }
 
@@ -9280,6 +9414,7 @@ mod tests {
             total_length: 0,
             raw_metainfo: Vec::new(),
             magnet_uri: Some(magnet.to_string()),
+            stop_on_complete: false,
             completed_pieces: Vec::new(),
             downloaded: 0,
             uploaded: 0,
@@ -9334,6 +9469,7 @@ mod tests {
                 total_length: metainfo.total_length,
                 raw_metainfo: raw,
                 magnet_uri: None,
+                stop_on_complete: false,
                 completed_pieces: Vec::new(),
                 downloaded: 0,
                 uploaded: 0,
@@ -9541,6 +9677,7 @@ mod tests {
             total_length: metainfo.total_length,
             raw_metainfo: raw,
             magnet_uri: None,
+            stop_on_complete: false,
             completed_pieces: Vec::new(),
             downloaded: 0,
             uploaded: 0,
@@ -9733,11 +9870,11 @@ mod tests {
         std::future::pending().await
     }
 
-    async fn fake_tracker_sequence(
+    async fn fake_tracker_sequence<const N: usize>(
         listener: TcpListener,
-        peers: [SocketAddr; 2],
+        peers: [(SocketAddr, bool); N],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for (index, peer) in peers.into_iter().enumerate() {
+        for (peer, expected_started) in peers {
             let (mut stream, _) = listener.accept().await?;
             let mut request = Vec::new();
             loop {
@@ -9752,11 +9889,8 @@ mod tests {
                 }
             }
             let request = std::str::from_utf8(&request)?;
-            if index == 0 && !request.contains("event=started") {
-                return Err("initial announce did not carry the started event".into());
-            }
-            if index > 0 && request.contains("event=") {
-                return Err("repeat announce incorrectly repeated a lifecycle event".into());
+            if request.contains("event=started") != expected_started {
+                return Err("tracker announce carried the wrong lifecycle event".into());
             }
             let IpAddr::V4(ip) = peer.ip() else {
                 return Err("test peer must use IPv4".into());
@@ -9959,6 +10093,24 @@ mod tests {
                     .await?;
                     return Ok(());
                 }
+                Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
+                _ => {}
+            }
+        }
+    }
+
+    async fn fake_metadata_handshake_disconnect_peer(
+        listener: TcpListener,
+        info_hash: Sha1Hash,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (stream, _) = listener.accept().await?;
+        let mut peer = test_peer_connection(stream, info_hash).await?;
+        loop {
+            match peer.next_event().await {
+                Some(PeerEvent::Message(PeerMessage::Extended {
+                    extension_id: 0, ..
+                })) => return Ok(()),
                 Some(PeerEvent::Failed(error)) => return Err(error.into()),
                 Some(PeerEvent::Disconnected) | None => return Err("peer disconnected".into()),
                 _ => {}

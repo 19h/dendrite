@@ -187,7 +187,10 @@ For a magnet, metadata must be obtained from a compatible peer and match every
 declared identity. Logs can distinguish no metadata peers, repeated identity
 mismatches, missing v2 piece layers, path conflicts, or storage setup failures.
 During this phase `total_length` remains zero; outbound peer telemetry counts
-live metadata sessions.
+live metadata sessions. Exhausting a round of missing, incompatible, or
+disconnecting metadata peers does not move the torrent to `error`; Dendrite
+backs off to at most 30 seconds and automatically starts another discovery
+round until metadata succeeds or the torrent is cancelled.
 
 For a `.torrent`, preparation can still fail while claiming paths or opening
 storage. Do not repeatedly resume in a tight loop; capture the actor error,
@@ -195,8 +198,10 @@ correct the prerequisite, then resume once.
 
 ## Torrent is in `error`
 
-The summary contains the state but not its error detail. Read daemon logs. For a
-transient network failure, resume. After external payload changes or a storage
+The summary contains the state but not its error detail. Read daemon logs.
+Magnet discovery and peer-metadata failures recover while remaining in
+`starting`; an `error` now indicates a local/configuration failure or a transfer
+failure after metadata acquisition. After external payload changes or a storage
 failure, recheck first:
 
 ```sh

@@ -69,6 +69,7 @@ Metainfo file:
 
 ```sh
 dendritectl add ./release.torrent --start
+dendritectl add ./release.torrent --start --stop-on-complete
 ```
 
 Magnet:
@@ -78,7 +79,9 @@ dendritectl add 'magnet:?xt=urn:btih:…&tr=…' --start
 ```
 
 Without `--start`, the record is created in `stopped`. With it, the record is
-created as `starting` and scheduled after the transaction commits.
+created as `starting` and scheduled after the transaction commits. Add
+`--stop-on-complete` to persist a mode that stops the torrent once every piece
+verifies instead of keeping it active for seeding.
 
 The CLI exposes no destination or sequential option because API v2.0 rejects
 both. All payloads use the daemon's global `download_dir`; scheduling remains
@@ -124,7 +127,7 @@ hybrid. It does not contact peers to “trust” their state.
 
 | Result | Final state |
 |---|---|
-| every required piece verifies | `seeding` |
+| every required piece verifies | `seeding`, or `stopped` with stop-on-complete |
 | at least one piece is absent/corrupt | `stopped` |
 | metadata/path/storage operation fails | `error` |
 

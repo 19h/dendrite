@@ -517,6 +517,7 @@ async fn add_torrent(
         total_length: metainfo.total_length,
         raw_metainfo: metainfo.raw,
         magnet_uri: None,
+        stop_on_complete: options.stop_on_complete,
         completed_pieces: Vec::new(),
         downloaded: 0,
         uploaded: 0,
@@ -581,6 +582,7 @@ async fn add_magnet(
         total_length: 0,
         raw_metainfo: Vec::new(),
         magnet_uri: Some(uri),
+        stop_on_complete: options.stop_on_complete,
         completed_pieces: Vec::new(),
         downloaded: 0,
         uploaded: 0,
@@ -1047,6 +1049,7 @@ fn summary(state: &AppState, record: &TorrentRecord) -> TorrentSummary {
         v1_info_hash: record.v1_info_hash,
         v2_info_hash: record.v2_info_hash,
         total_length: record.total_length,
+        stop_on_complete: record.stop_on_complete,
         downloaded: record.downloaded,
         uploaded: record.uploaded,
         download_rate,
@@ -1457,6 +1460,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn magnet_add_persists_stop_on_complete_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, state, token) = test_state(100)?;
+        let app = build_router(&test_settings(), &state)?;
+        let request = Request::post("/api/v2/torrents/magnet")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "source": "magnet",
+                    "uri": "magnet:?xt=urn:btih:0303030303030303030303030303030303030303&dn=stop-me",
+                    "options": {
+                        "start": false,
+                        "stop_on_complete": true
+                    }
+                })
+                .to_string(),
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let summary: TorrentSummary =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+        assert!(summary.stop_on_complete);
+        let record = state
+            .store
+            .get_torrent(summary.id)
+            .await?
+            .ok_or("added torrent disappeared")?;
+        assert!(record.stop_on_complete);
+        state.engine.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_cookie_requires_csrf_for_mutations() -> Result<(), Box<dyn std::error::Error>>
     {
         let (_directory, state, token) = test_state(100)?;
@@ -1551,6 +1587,7 @@ mod tests {
                     total_length: 1,
                     raw_metainfo: Vec::new(),
                     magnet_uri: None,
+                    stop_on_complete: false,
                     completed_pieces: Vec::new(),
                     downloaded: 0,
                     uploaded: 0,
