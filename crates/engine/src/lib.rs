@@ -65,7 +65,7 @@ const DEFAULT_DOWNLOAD_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_PIECE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const PEER_COMMAND_CAPACITY: usize = 64;
-const ACTIVE_PEER_LIMIT: usize = 256;
+const ACTIVE_PEER_LIMIT: usize = 512;
 const PEER_CONNECT_CONCURRENCY: usize = 128;
 const INCOMING_PEER_LIMIT: usize = 256;
 const INCOMING_HANDSHAKE_LIMIT: usize = 256;
@@ -87,6 +87,9 @@ const RECIPROCAL_BOOTSTRAP_BYTES: u64 = 8 * 1024 * 1024;
 const REPUTATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const KNOWN_CANDIDATE_LIMIT: usize = 8192;
 const QUEUED_CANDIDATE_LIMIT: usize = 4096;
+/// A candidate address may be dialled again this long after its last attempt,
+/// so peers that dropped are recovered when discovery reports them again.
+const CANDIDATE_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(25);
 const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -158,7 +161,7 @@ struct SwarmState {
     last_error: Option<String>,
     writing: HashSet<usize>,
     candidates: VecDeque<PeerCandidate>,
-    known_candidates: HashSet<PeerCandidate>,
+    known_candidates: HashMap<PeerCandidate, Instant>,
     next_worker: usize,
     event_sender: mpsc::Sender<PeerWorkerEvent>,
     info_hash: Sha1Hash,
@@ -4356,7 +4359,7 @@ fn initialize_swarm(
         last_error: None,
         writing: HashSet::new(),
         candidates: VecDeque::new(),
-        known_candidates: HashSet::new(),
+        known_candidates: HashMap::new(),
         next_worker: 0,
         event_sender,
         info_hash,
@@ -4392,22 +4395,39 @@ fn enqueue_peer_candidates(
     peers: impl IntoIterator<Item = SocketAddr>,
     force_utp: bool,
 ) {
+    let now = Instant::now();
     for address in peers {
         if is_self_candidate(&swarm.services, address) {
             continue;
         }
         let candidate = PeerCandidate { address, force_utp };
+        if swarm
+            .known_candidates
+            .get(&candidate)
+            .is_some_and(|seen| now.duration_since(*seen) < CANDIDATE_RETRY_INTERVAL)
+        {
+            continue;
+        }
+        if swarm
+            .workers
+            .values()
+            .any(|handle| handle.address == address)
+        {
+            // Already connected; refresh the timestamp so the address is not
+            // dialled the moment it drops, but leave the queue alone.
+            swarm.known_candidates.insert(candidate, now);
+            continue;
+        }
         if swarm.known_candidates.len() >= KNOWN_CANDIDATE_LIMIT {
             // Reset the deduplication window rather than grow without bound;
             // a returning address is simply retried later.
             swarm.known_candidates.clear();
         }
-        if swarm.known_candidates.insert(candidate) {
-            if swarm.candidates.len() >= QUEUED_CANDIDATE_LIMIT {
-                swarm.candidates.pop_front();
-            }
-            swarm.candidates.push_back(candidate);
+        swarm.known_candidates.insert(candidate, now);
+        if swarm.candidates.len() >= QUEUED_CANDIDATE_LIMIT {
+            swarm.candidates.pop_front();
         }
+        swarm.candidates.push_back(candidate);
     }
 }
 
@@ -6700,8 +6720,10 @@ struct V2Check {
 impl PieceVerification {
     fn verify(&self, piece: &[u8]) -> bool {
         if let Some(expected) = self.v1 {
-            let actual: [u8; 20] = Sha1::digest(piece).into();
-            if Sha1Hash::from_bytes(actual) != expected {
+            // OpenSSL's assembly SHA-1 is about twice as fast as the pure
+            // Rust implementation on CPUs without SHA extensions; piece
+            // verification is the daemon's largest CPU cost.
+            if Sha1Hash::from_bytes(openssl::sha::sha1(piece)) != expected {
                 return false;
             }
         }
@@ -6879,7 +6901,7 @@ fn v2_piece_root(piece: &[u8], piece_length: u32) -> dendrite_core::Sha256Hash {
     let leaf_count = usize::try_from(piece_length / (16 * 1024)).map_or(1, |value| value);
     let mut hashes: Vec<_> = piece
         .chunks(16 * 1024)
-        .map(|block| dendrite_core::Sha256Hash::from_bytes(Sha256::digest(block).into()))
+        .map(|block| dendrite_core::Sha256Hash::from_bytes(openssl::sha::sha256(block)))
         .collect();
     hashes.resize(leaf_count, dendrite_core::Sha256Hash::from_bytes([0; 32]));
     while hashes.len() > 1 {

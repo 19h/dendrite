@@ -102,7 +102,7 @@ nodes.
 
 The actor connects to a bounded set of discovered peers over TCP or uTP,
 performs protocol negotiation, and chooses pieces rarest-first. The current
-transfer scheduler uses up to 256 peers. Each peer holds a queue of assigned
+transfer scheduler uses up to 512 peers per torrent. Each peer holds a queue of assigned
 pieces sized by its measured rate (2–16 MiB), and its request pipeline spans
 piece boundaries so a piece completing never drains the connection; the
 pipeline grows from 128 to 1024 outstanding blocks with the peer's rate, capped

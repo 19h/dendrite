@@ -116,7 +116,9 @@ Piece writes are concurrent across peers, and verified peers resume downloading
 before a one-second group durability barrier commits their completion bits.
 Full piece buffers are bounded globally by `limits.download_buffer_bytes`.
 Piece verification runs on the blocking pool with at most half the CPU
-threads hashing at once. Mutable counters, the completion bitfield, and the
+threads hashing at once, using OpenSSL's assembly SHA-1 and SHA-256, which on
+CPUs without SHA extensions run about twice as fast as the pure-Rust
+implementations (1.1 GB/s versus 0.5 GB/s per core on a Skylake Xeon). Mutable counters, the completion bitfield, and the
 immutable metainfo are stored in separate tables, upload counters are flushed
 in per-torrent batches without a durable commit of their own, and summaries and
 info-hash lookups are served from an in-memory mirror; these invariants prevent
@@ -130,6 +132,10 @@ listening port every fifteen minutes. Trackers are re-announced only when the
 interval they returned has elapsed (clamped to one minute–four hours), while
 DHT, local discovery, and PEX refresh every minute. Announces ask for 200
 peers.
+
+Candidate addresses are deduplicated for ten minutes rather than forever, so a
+peer that dropped is dialled again when discovery reports it. Connected
+addresses are never re-dialled.
 
 Outgoing block requests and cancels are queued without waiting for the socket
 write, and the writer coalesces every queued message into one write; socket

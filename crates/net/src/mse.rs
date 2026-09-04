@@ -61,15 +61,41 @@ impl Rc4 {
         Self { state, i: 0, j: 0 }
     }
 
+    /// Applies the keystream in place. The cipher indices stay in registers
+    /// for the whole call and the output is combined eight bytes at a time; the
+    /// per-byte loop with struct fields stored on every step was the
+    /// daemon's largest CPU cost once encrypted peers dominated inbound.
     fn apply(&mut self, bytes: &mut [u8]) {
-        for byte in bytes {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.state[usize::from(self.i)]);
-            self.state.swap(usize::from(self.i), usize::from(self.j));
-            let index =
-                self.state[usize::from(self.i)].wrapping_add(self.state[usize::from(self.j)]);
-            *byte ^= self.state[usize::from(index)];
+        let mut i = self.i;
+        let mut j = self.j;
+        let state = &mut self.state;
+        let mut chunks = bytes.chunks_exact_mut(8);
+        for chunk in &mut chunks {
+            let mut keystream = [0_u8; 8];
+            for key_byte in &mut keystream {
+                i = i.wrapping_add(1);
+                let si = state[usize::from(i)];
+                j = j.wrapping_add(si);
+                let sj = state[usize::from(j)];
+                state[usize::from(i)] = sj;
+                state[usize::from(j)] = si;
+                *key_byte = state[usize::from(si.wrapping_add(sj))];
+            }
+            let word = u64::from_ne_bytes(<[u8; 8]>::try_from(&*chunk).unwrap_or_default())
+                ^ u64::from_ne_bytes(keystream);
+            chunk.copy_from_slice(&word.to_ne_bytes());
         }
+        for byte in chunks.into_remainder() {
+            i = i.wrapping_add(1);
+            let si = state[usize::from(i)];
+            j = j.wrapping_add(si);
+            let sj = state[usize::from(j)];
+            state[usize::from(i)] = sj;
+            state[usize::from(j)] = si;
+            *byte ^= state[usize::from(si.wrapping_add(sj))];
+        }
+        self.i = i;
+        self.j = j;
     }
 
     fn discard(&mut self) {
@@ -351,7 +377,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MseStream<S> {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         }
-        let mut encrypted = buffer.to_vec();
+        let mut encrypted = std::mem::take(&mut self.pending);
+        encrypted.clear();
+        encrypted.extend_from_slice(buffer);
         self.encrypt.apply(&mut encrypted);
         self.pending = encrypted;
         let accepted = buffer.len();

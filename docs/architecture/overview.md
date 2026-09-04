@@ -79,7 +79,7 @@ generation before installing the replacement.
 The daemon separately enforces configured limits for loaded and active
 torrents, peer connections, API concurrency, API request rate, browser
 sessions, response page size, and accepted body sizes. Per-torrent download
-work is also bounded: the current scheduler uses at most 256 peers and a
+work is also bounded: the current scheduler uses at most 512 peers per torrent and a
 128-block request pipeline per peer. Tracker, DHT, and local-discovery results
 stream into the scheduler as they arrive, so a slow discovery source cannot
 hold usable peers behind its timeout.
