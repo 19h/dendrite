@@ -19,8 +19,11 @@ dht_bootstrap = [
 # NAT-PMP is opt-in. Uncomment only when this is the actual local IPv4 gateway.
 # nat_pmp_gateway = "192.168.1.1:5351"
 
-# disabled | preferred | required
-peer_encryption = "preferred"
+# disabled | preferred | plaintext_preferred | required
+# plaintext_preferred dials plaintext first and falls back to MSE, which saves
+# the per-byte RC4 cost for every peer that allows plaintext; inbound
+# encrypted peers are still accepted.
+peer_encryption = "plaintext_preferred"
 
 # These are required together when api is not bound to loopback:
 # tls_certificate = "/etc/dendrite/tls/cert.pem"
@@ -43,6 +46,12 @@ list_page_size = 200
 # peers on large-piece torrents.
 download_buffer_bytes = 8589934592
 piece_cache_bytes = 1073741824
+
+[storage]
+# Seconds between the group fsync barriers that commit verified pieces. On
+# ZFS with a separate log device, a longer interval keeps most payload out of
+# the log; a crash can force at most this many seconds of pieces to re-download.
+flush_interval_seconds = 20
 
 [transfer]
 # Regular slots reward peers by the rate they deliver verified data; optimistic

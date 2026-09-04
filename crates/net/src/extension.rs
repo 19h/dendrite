@@ -15,7 +15,7 @@ pub const LOCAL_HOLEPUNCH_EXTENSION_ID: u8 = 3;
 pub const METADATA_BLOCK_BYTES: usize = 16 * 1024;
 pub const PEX_PEER_LIMIT: usize = 50;
 /// Outstanding block requests we accept per peer, advertised as `reqq`.
-pub const REQUEST_QUEUE_LIMIT: usize = 512;
+pub const REQUEST_QUEUE_LIMIT: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtensionHandshake {

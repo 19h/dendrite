@@ -105,7 +105,7 @@ performs protocol negotiation, and chooses pieces rarest-first. The current
 transfer scheduler uses up to 256 peers. Each peer holds a queue of assigned
 pieces sized by its measured rate (2–16 MiB), and its request pipeline spans
 piece boundaries so a piece completing never drains the connection; the
-pipeline grows from 128 to 512 outstanding blocks with the peer's rate, capped
+pipeline grows from 128 to 1024 outstanding blocks with the peer's rate, capped
 by the `reqq` the peer advertises. Piece selection is skipped for a peer until
 something it could use becomes selectable, so scheduling cost does not grow
 with piece count. The buffers assigned across every torrent are bounded by

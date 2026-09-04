@@ -37,6 +37,15 @@ with a bounded DHT lookup when bootstrap nodes are configured. Local discovery
 is tried when neither wide-area source returns a peer. Exhausted swarms repeat
 discovery with bounded backoff.
 
+The DHT lookup is iterative: eight `get_peers` queries stay in flight toward
+the closest unqueried nodes, peers are collected from every responder, and the
+walk stops once the sixteen closest responders have answered. Responsive nodes
+are remembered for later lookups, and `announce_peer` is sent with the returned
+tokens every fifteen minutes so other clients can discover this daemon. The
+daemon does not answer DHT queries. Trackers are re-announced only after the
+interval they returned has elapsed; DHT, local discovery, and PEX refresh every
+minute.
+
 HTTP announces prefer IPv6 on dual-stack hosts because trackers may return a
 different peer population according to the request's address family. If IPv6
 cannot connect, the same request falls back to the normal dual-stack client.

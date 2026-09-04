@@ -12,13 +12,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::{
-    Handshake, PeerCodecError, PeerCodecLimits, PeerId, PeerMessage, decode_message, encode_message,
+    Handshake, PeerCodecError, PeerCodecLimits, PeerId, PeerMessage, decode_message,
+    encode_message_into,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_CAPACITY: usize = 256;
-const EVENT_CAPACITY: usize = 1024;
-const READ_CHUNK_BYTES: usize = 16 * 1024;
+const EVENT_CAPACITY: usize = 256;
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+const READ_RESERVE_BYTES: usize = 512 * 1024;
+const WRITE_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerEvent {
@@ -62,7 +65,8 @@ pub struct PeerSender {
 
 struct PeerCommand {
     message: PeerMessage,
-    written: oneshot::Sender<()>,
+    /// Present when the sender waits for the bytes to reach the socket.
+    written: Option<oneshot::Sender<()>>,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -233,6 +237,13 @@ impl PeerConnection {
         self.sender().send(message).await
     }
 
+    /// Queues a message without waiting for it to reach the socket. Ordering
+    /// with acknowledged sends is preserved; back-pressure comes from the
+    /// bounded command queue.
+    pub async fn send_unacked(&self, message: PeerMessage) -> Result<(), PeerSessionError> {
+        self.sender().send_unacked(message).await
+    }
+
     #[must_use]
     pub fn sender(&self) -> PeerSender {
         PeerSender {
@@ -268,10 +279,23 @@ impl PeerSender {
     pub async fn send(&self, message: PeerMessage) -> Result<(), PeerSessionError> {
         let (written, acknowledgement) = oneshot::channel();
         self.commands
-            .send(PeerCommand { message, written })
+            .send(PeerCommand {
+                message,
+                written: Some(written),
+            })
             .await
             .map_err(|_| PeerSessionError::Closed)?;
         acknowledgement.await.map_err(|_| PeerSessionError::Closed)
+    }
+
+    pub async fn send_unacked(&self, message: PeerMessage) -> Result<(), PeerSessionError> {
+        self.commands
+            .send(PeerCommand {
+                message,
+                written: None,
+            })
+            .await
+            .map_err(|_| PeerSessionError::Closed)
     }
 }
 
@@ -290,31 +314,39 @@ async fn read_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buffered = BytesMut::with_capacity(READ_CHUNK_BYTES * 2);
-    let mut scratch = vec![0_u8; READ_CHUNK_BYTES];
+    let mut buffered = BytesMut::with_capacity(READ_RESERVE_BYTES);
+    let maximum_buffered = limits
+        .frame_bytes
+        .checked_add(4)
+        .ok_or(PeerCodecError::FrameLimit {
+            actual: usize::MAX,
+            maximum: limits.frame_bytes,
+        })?;
     loop {
+        // Read straight into the frame buffer. Decoded frames alias this
+        // allocation, so reserve in large steps: a fresh block is allocated
+        // only once the previous one has been fully handed out as frames.
+        if buffered.capacity() - buffered.len() < READ_CHUNK_BYTES {
+            buffered.reserve(READ_RESERVE_BYTES);
+        }
         tokio::select! {
             () = cancellation.cancelled() => return Ok(()),
-            result = reader.read(&mut scratch) => {
+            result = reader.read_buf(&mut buffered) => {
                 let read = result?;
                 if read == 0 {
                     return Ok(());
                 }
-                let maximum_buffered = limits.frame_bytes.checked_add(4).ok_or(
-                    PeerCodecError::FrameLimit {
-                        actual: usize::MAX,
-                        maximum: limits.frame_bytes,
-                    },
-                )?;
-                if buffered.len().saturating_add(read) > maximum_buffered {
-                    return Err(PeerCodecError::FrameLimit {
-                        actual: buffered.len().saturating_add(read),
-                        maximum: limits.frame_bytes,
-                    }.into());
-                }
-                buffered.extend_from_slice(&scratch[..read]);
                 while let Some(message) = decode_message(&mut buffered, limits)? {
                     events.send(PeerEvent::Message(message)).await.map_err(|_| PeerSessionError::Closed)?;
+                }
+                // A single read may carry many complete frames; only an
+                // incomplete frame that has already outgrown the limit is
+                // an error.
+                if buffered.len() > maximum_buffered {
+                    return Err(PeerCodecError::FrameLimit {
+                        actual: buffered.len(),
+                        maximum: limits.frame_bytes,
+                    }.into());
                 }
             }
         }
@@ -329,6 +361,8 @@ async fn write_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut batch = BytesMut::with_capacity(WRITE_BATCH_BYTES);
+    let mut acknowledgements = Vec::new();
     loop {
         tokio::select! {
             () = cancellation.cancelled() => {
@@ -340,9 +374,24 @@ where
                     writer.shutdown().await?;
                     return Ok(());
                 };
-                let encoded = encode_message(&command.message)?;
-                writer.write_all(&encoded).await?;
-                let _result_ignored = command.written.send(());
+                // Coalesce every queued message into one write so pipelined
+                // requests and served blocks cost one syscall per batch.
+                batch.clear();
+                encode_message_into(&mut batch, &command.message)?;
+                acknowledgements.extend(command.written);
+                while batch.len() < WRITE_BATCH_BYTES {
+                    match commands.try_recv() {
+                        Ok(command) => {
+                            encode_message_into(&mut batch, &command.message)?;
+                            acknowledgements.extend(command.written);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                writer.write_all(&batch).await?;
+                for written in acknowledgements.drain(..) {
+                    let _result_ignored = written.send(());
+                }
             }
         }
     }

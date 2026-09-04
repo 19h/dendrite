@@ -53,7 +53,7 @@ use url::Url;
 
 const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 4096;
-const PEER_LIMIT_PER_ANNOUNCE: u16 = 80;
+const PEER_LIMIT_PER_ANNOUNCE: u16 = 200;
 const BLOCK_BYTES: usize = 16 * 1024;
 const BLOCK_PIPELINE: usize = 128;
 const BLOCK_PIPELINE_MAX: usize = REQUEST_QUEUE_LIMIT;
@@ -88,7 +88,10 @@ const REPUTATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const KNOWN_CANDIDATE_LIMIT: usize = 8192;
 const QUEUED_CANDIDATE_LIMIT: usize = 4096;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
-const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(25);
+const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const TRACKER_INTERVAL_MIN: Duration = Duration::from_secs(60);
+const TRACKER_INTERVAL_MAX: Duration = Duration::from_secs(4 * 60 * 60);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
 const SWARM_RETRY_MAX: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
@@ -176,13 +179,18 @@ struct PeerCandidate {
 
 enum DiscoveryEvent {
     Peers(Vec<SocketAddr>),
+    /// A tracker asked to be re-announced no sooner than `interval` from now.
+    TrackerInterval {
+        url: String,
+        interval: Duration,
+    },
     Finished(Result<(), ActorError>),
 }
 
 enum DiscoverySourceResult {
     Tracker {
         url: Url,
-        result: Result<Vec<SocketAddr>, String>,
+        result: Result<(Vec<SocketAddr>, Duration), String>,
     },
     Dht(Result<Vec<SocketAddr>, String>),
     Lsd(Vec<SocketAddr>),
@@ -194,6 +202,8 @@ struct DiscoveryQuery<'a> {
     info_hash: Sha1Hash,
     left: u64,
     allow_dht: bool,
+    /// Announce our listening port to the DHT after the lookup.
+    dht_announce: bool,
     announce_event: AnnounceEvent,
     cancellation: CancellationToken,
 }
@@ -284,9 +294,8 @@ enum PeerWorkerInput {
     Event(PeerEvent),
 }
 
-struct PeerEventForwarder<'a> {
-    activity: &'a Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
-    torrent_id: TorrentId,
+struct PeerEventForwarder {
+    downloaded_bytes: Arc<AtomicU64>,
 }
 
 enum PieceResult {
@@ -363,6 +372,8 @@ pub struct EngineOptions {
     /// Global bound on verified pieces cached for uploads.
     pub piece_cache_bytes: usize,
     pub transfer: TransferPolicy,
+    /// Cadence of the group fsync barrier that commits verified pieces.
+    pub piece_flush_interval: Duration,
 }
 
 #[derive(Debug, Error)]
@@ -426,6 +437,7 @@ struct Services {
     piece_cache_budget: Arc<CacheBudget>,
     hash_slots: Arc<Semaphore>,
     transfer: TransferPolicy,
+    piece_flush_interval: Duration,
     /// Addresses this daemon is reachable at, learned from local interfaces
     /// and from peers' `yourip`; candidates on our own peer port at these
     /// addresses are never dialled.
@@ -753,7 +765,9 @@ struct TorrentActivity {
     outbound_peers: usize,
     seed_peers: usize,
     active_downloaders: usize,
-    downloaded_bytes: u64,
+    /// Updated per block by every downloading worker without taking the map
+    /// lock; readers sample it.
+    downloaded_bytes: Arc<AtomicU64>,
     uploaded_bytes: u64,
     pending_uploaded_bytes: u64,
 }
@@ -923,6 +937,7 @@ impl EngineHandle {
                 download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
                 piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
                 transfer: TransferPolicy::default(),
+                piece_flush_interval: PIECE_FLUSH_INTERVAL,
             },
         )
     }
@@ -972,6 +987,7 @@ impl EngineHandle {
             piece_cache_budget: Arc::new(CacheBudget::new(options.piece_cache_bytes)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: options.transfer,
+            piece_flush_interval: options.piece_flush_interval.max(Duration::from_millis(100)),
             self_addresses: Arc::new(std::sync::RwLock::new(local_outbound_addresses())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -1106,7 +1122,11 @@ impl EngineHandle {
             .torrent_activity
             .lock()
             .ok()
-            .and_then(|peers| peers.get(&id).map(|activity| activity.downloaded_bytes))
+            .and_then(|peers| {
+                peers
+                    .get(&id)
+                    .map(|activity| activity.downloaded_bytes.load(Ordering::Relaxed))
+            })
             .unwrap_or(0)
     }
 
@@ -2953,6 +2973,7 @@ async fn acquire_magnet_metadata(
                 info_hash,
                 left: 0,
                 allow_dht: true,
+                dht_announce: false,
                 announce_event,
                 cancellation: cancellation.child_token(),
             },
@@ -3051,6 +3072,7 @@ async fn acquire_metadata_from_discovery(
                 Some(DiscoveryEvent::Peers(peers)) => {
                     candidates.extend(peers.into_iter().filter(|address| known.insert(*address)));
                 }
+                Some(DiscoveryEvent::TrackerInterval { .. }) => {}
                 Some(DiscoveryEvent::Finished(result)) => {
                     if let Err(error) = result {
                         last_error = Some(error);
@@ -3627,6 +3649,7 @@ async fn download_from_peer_round(
             info_hash,
             left: metainfo.total_length.saturating_sub(record.downloaded),
             allow_dht: !metainfo.private,
+            dht_announce: true,
             announce_event,
             cancellation: cancellation.child_token(),
         },
@@ -3970,13 +3993,15 @@ async fn run_peer_swarm_with_discovery(
     let mut flush_tasks = FuturesUnordered::<PieceFlushFuture<'_>>::new();
     let mut pending_pieces = Vec::new();
     let mut pending_paths = HashSet::new();
-    let mut flush_interval = tokio::time::interval(PIECE_FLUSH_INTERVAL);
+    let mut flush_interval = tokio::time::interval(services.piece_flush_interval);
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_interval.tick().await;
     let mut retention_interval = tokio::time::interval(PEER_RETENTION_INTERVAL);
     retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     retention_interval.tick().await;
     let mut last_discovery = Instant::now();
+    let mut last_dht_announce = Instant::now();
+    let mut tracker_next_due: HashMap<String, Instant> = HashMap::new();
     loop {
         if cancellation.is_cancelled() {
             shutdown_swarm(&swarm);
@@ -4062,6 +4087,10 @@ async fn run_peer_swarm_with_discovery(
             SwarmLoopEvent::Discovery(Some(DiscoveryEvent::Peers(peers))) => {
                 enqueue_peer_candidates(&mut swarm, peers, false);
             }
+            SwarmLoopEvent::Discovery(Some(DiscoveryEvent::TrackerInterval { url, interval })) => {
+                let interval = interval.clamp(TRACKER_INTERVAL_MIN, TRACKER_INTERVAL_MAX);
+                tracker_next_due.insert(url, Instant::now() + interval);
+            }
             SwarmLoopEvent::Discovery(Some(DiscoveryEvent::Finished(result))) => {
                 if let Err(error) = result {
                     discovery_error = Some(error);
@@ -4086,12 +4115,19 @@ async fn run_peer_swarm_with_discovery(
             SwarmLoopEvent::RetentionTick => {
                 retain_productive_peers(&mut swarm)?;
                 if discovery.is_none() && last_discovery.elapsed() >= PEER_REANNOUNCE_INTERVAL {
+                    let due_trackers = due_tracker_tiers(&metainfo.trackers, &tracker_next_due);
+                    let dht_announce = last_dht_announce.elapsed() >= DHT_ANNOUNCE_INTERVAL;
+                    if dht_announce {
+                        last_dht_announce = Instant::now();
+                    }
                     discovery = Some(restart_peer_discovery(
                         services,
+                        &due_trackers,
                         metainfo,
                         record,
                         info_hash,
                         cancellation,
+                        dht_announce,
                     )?);
                     last_discovery = Instant::now();
                 }
@@ -4102,23 +4138,50 @@ async fn run_peer_swarm_with_discovery(
 
 fn restart_peer_discovery(
     services: &Services,
+    trackers: &[Vec<String>],
     metainfo: &Metainfo,
     record: &TorrentRecord,
     info_hash: Sha1Hash,
     cancellation: &CancellationToken,
+    dht_announce: bool,
 ) -> Result<mpsc::Receiver<DiscoveryEvent>, ActorError> {
     start_peer_discovery(
         services,
         DiscoveryQuery {
-            trackers: &metainfo.trackers,
+            trackers,
             record,
             info_hash,
             left: metainfo.total_length.saturating_sub(record.downloaded),
             allow_dht: !metainfo.private,
+            dht_announce,
             announce_event: AnnounceEvent::None,
             cancellation: cancellation.child_token(),
         },
     )
+}
+
+/// Tracker tiers reduced to the trackers whose requested interval has
+/// elapsed, so re-discovery every minute re-uses DHT, LSD, and PEX without
+/// hammering trackers that asked for a longer interval.
+fn due_tracker_tiers(
+    tiers: &[Vec<String>],
+    next_due: &HashMap<String, Instant>,
+) -> Vec<Vec<String>> {
+    let now = Instant::now();
+    tiers
+        .iter()
+        .map(|tier| {
+            tier.iter()
+                .filter(|tracker| {
+                    Url::parse(tracker).map_or(true, |url| {
+                        next_due.get(&url.to_string()).is_none_or(|due| *due <= now)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect()
 }
 
 fn register_incoming_swarm(
@@ -4720,6 +4783,7 @@ async fn discover_with_dht(
             info_hash,
             left,
             allow_dht,
+            dht_announce: false,
             announce_event,
             cancellation: services.shutdown.child_token(),
         },
@@ -4758,6 +4822,9 @@ fn start_peer_discovery(
     let tracker_attempted = !urls.is_empty();
     let info_hash = query.info_hash;
     let allow_dht = query.allow_dht;
+    let dht_announce_port = query
+        .dht_announce
+        .then(|| services.advertised_peer_port.load(Ordering::Acquire));
     let cancellation = query.cancellation;
     let (sender, receiver) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
     let slots = Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY));
@@ -4776,12 +4843,16 @@ fn start_peer_discovery(
     }
     if let Some(dht) = dht {
         sources.spawn(async move {
-            let result = match tokio::time::timeout(
-                DHT_DISCOVERY_TIMEOUT,
-                dht.get_peers(info_hash, &bootstrap),
-            )
-            .await
-            {
+            let lookup = async {
+                match dht_announce_port {
+                    Some(port) => {
+                        dht.get_peers_and_announce(info_hash, &bootstrap, port)
+                            .await
+                    }
+                    None => dht.get_peers(info_hash, &bootstrap).await,
+                }
+            };
+            let result = match tokio::time::timeout(DHT_DISCOVERY_TIMEOUT, lookup).await {
                 Ok(Ok(peers)) => Ok(peers),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err("DHT lookup timed out".to_owned()),
@@ -4832,8 +4903,18 @@ async fn forward_discovery_sources(
         };
         let peers = match source {
             DiscoverySourceResult::Tracker { url, result } => match result {
-                Ok(peers) => {
-                    debug!(tracker = %url, peers = peers.len(), "tracker announce succeeded");
+                Ok((peers, interval)) => {
+                    debug!(tracker = %url, peers = peers.len(), ?interval, "tracker announce succeeded");
+                    if sender
+                        .send(DiscoveryEvent::TrackerInterval {
+                            url: url.to_string(),
+                            interval,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     peers
                 }
                 Err(error) => {
@@ -4880,6 +4961,7 @@ async fn collect_discovered_peers(
     while let Some(event) = receiver.recv().await {
         match event {
             DiscoveryEvent::Peers(discovered) => peers.extend(discovered),
+            DiscoveryEvent::TrackerInterval { .. } => {}
             DiscoveryEvent::Finished(result) => {
                 if peers.is_empty() {
                     result?;
@@ -4928,22 +5010,34 @@ fn tracker_urls(trackers: &[Vec<String>]) -> Vec<Url> {
         .collect()
 }
 
+/// Announces to one tracker and returns its peers with the re-announce
+/// interval it asked for (the larger of `interval` and `min interval`).
 async fn announce_tracker(
     http: &HttpTrackerClient,
     udp: UdpTrackerClient,
     url: &Url,
     request: TrackerRequest,
-) -> Result<Vec<SocketAddr>, String> {
+) -> Result<(Vec<SocketAddr>, Duration), String> {
     match url.scheme() {
         "http" | "https" => http
             .announce(url, request)
             .await
-            .map(|announce| announce.peers)
+            .map(|announce| {
+                let interval = announce
+                    .interval
+                    .max(announce.minimum_interval.unwrap_or(Duration::ZERO));
+                (announce.peers, interval)
+            })
             .map_err(|error| error.to_string()),
         "udp" => udp
             .announce(url, request)
             .await
-            .map(|announce| announce.peers)
+            .map(|announce| {
+                let interval = announce
+                    .interval
+                    .max(announce.minimum_interval.unwrap_or(Duration::ZERO));
+                (announce.peers, interval)
+            })
             .map_err(|error| error.to_string()),
         _ => Err("unsupported tracker scheme".to_owned()),
     }
@@ -4966,6 +5060,7 @@ async fn discover_tracker_peers(
             info_hash,
             left,
             allow_dht: false,
+            dht_announce: false,
             announce_event,
             cancellation: services.shutdown.child_token(),
         },
@@ -5358,7 +5453,7 @@ async fn cancel_queued_piece(
     cancelled.sort_unstable();
     for (begin, length) in cancelled {
         let _result_ignored = peer
-            .send(PeerMessage::Cancel(BlockRequest {
+            .send_unacked(PeerMessage::Cancel(BlockRequest {
                 piece,
                 begin,
                 length,
@@ -5373,7 +5468,7 @@ fn receive_block(
     piece: u32,
     begin: u32,
     block: &Bytes,
-    forwarder: &PeerEventForwarder<'_>,
+    forwarder: &PeerEventForwarder,
 ) -> Result<Option<(usize, Bytes)>, ActorError> {
     let expected = pipeline
         .pending
@@ -5502,11 +5597,20 @@ async fn promoted_incoming_peer_worker(
     }
 }
 
-fn peer_event_forwarder(context: &PeerWorkerContext) -> PeerEventForwarder<'_> {
-    PeerEventForwarder {
-        activity: &context.services.torrent_activity,
-        torrent_id: context.torrent_id,
-    }
+fn peer_event_forwarder(context: &PeerWorkerContext) -> PeerEventForwarder {
+    let downloaded_bytes = context
+        .services
+        .torrent_activity
+        .lock()
+        .map(|mut torrents| {
+            torrents
+                .entry(context.torrent_id)
+                .or_default()
+                .downloaded_bytes
+                .clone()
+        })
+        .unwrap_or_default();
+    PeerEventForwarder { downloaded_bytes }
 }
 
 async fn establish_peer_worker(
@@ -6053,13 +6157,11 @@ fn stop_workers(workers: &HashMap<usize, PeerWorkerHandle>) {
     }
 }
 
-fn record_downloaded_block(forwarder: &PeerEventForwarder<'_>, bytes: usize) {
-    let Ok(bytes) = u64::try_from(bytes) else {
-        return;
-    };
-    if let Ok(mut torrents) = forwarder.activity.lock() {
-        let activity = torrents.entry(forwarder.torrent_id).or_default();
-        activity.downloaded_bytes = activity.downloaded_bytes.saturating_add(bytes);
+fn record_downloaded_block(forwarder: &PeerEventForwarder, bytes: usize) {
+    if let Ok(bytes) = u64::try_from(bytes) {
+        forwarder
+            .downloaded_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -6082,7 +6184,7 @@ async fn fill_request_pipeline(
             let block_length = BLOCK_BYTES.min(queued.length - queued.next_begin);
             let begin = u32::try_from(queued.next_begin).map_err(|_| ActorError::Arithmetic)?;
             let wire_length = u32::try_from(block_length).map_err(|_| ActorError::Arithmetic)?;
-            peer.send(PeerMessage::Request(BlockRequest {
+            peer.send_unacked(PeerMessage::Request(BlockRequest {
                 piece: queued.piece,
                 begin,
                 length: wire_length,
@@ -6120,7 +6222,11 @@ async fn connect_outgoing_peer(
     limits: PeerCodecLimits,
     services: &Services,
 ) -> Result<PeerConnection, dendrite_net::peer::PeerSessionError> {
-    if services.encryption != EncryptionPolicy::Disabled {
+    let plaintext_first = matches!(
+        services.encryption,
+        EncryptionPolicy::Disabled | EncryptionPolicy::PlaintextPreferred
+    );
+    if !plaintext_first {
         match PeerConnection::connect_encrypted(address, handshake, limits).await {
             Ok(peer) => return Ok(peer),
             Err(error) if services.encryption == EncryptionPolicy::Required => return Err(error),
@@ -6129,17 +6235,21 @@ async fn connect_outgoing_peer(
             }
         }
     }
-    match PeerConnection::connect(address, handshake, limits).await {
-        Ok(peer) => Ok(peer),
-        Err(tcp_error) => {
-            let Some(utp) = &services.utp else {
-                return Err(tcp_error);
-            };
-            utp.connect_peer(address, handshake, limits)
-                .await
-                .map_err(|_| tcp_error)
-        }
+    let plain = match PeerConnection::connect(address, handshake, limits).await {
+        Ok(peer) => return Ok(peer),
+        Err(error) => error,
+    };
+    if services.encryption == EncryptionPolicy::PlaintextPreferred
+        && let Ok(peer) = PeerConnection::connect_encrypted(address, handshake, limits).await
+    {
+        return Ok(peer);
     }
+    let Some(utp) = &services.utp else {
+        return Err(plain);
+    };
+    utp.connect_peer(address, handshake, limits)
+        .await
+        .map_err(|_| plain)
 }
 
 async fn await_unchoke(
@@ -7442,6 +7552,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -7746,6 +7857,7 @@ mod tests {
                 download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
                 piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
                 transfer: TransferPolicy::default(),
+                piece_flush_interval: PIECE_FLUSH_INTERVAL,
             },
         );
         engine.serve_incoming(listener);
@@ -7862,6 +7974,7 @@ mod tests {
                 download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
                 piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
                 transfer: TransferPolicy::default(),
+                piece_flush_interval: PIECE_FLUSH_INTERVAL,
             },
         );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -8238,6 +8351,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -8339,14 +8453,20 @@ mod tests {
                 info_hash,
                 left: metainfo.total_length,
                 allow_dht: false,
+                dht_announce: false,
                 announce_event: AnnounceEvent::Started,
                 cancellation: CancellationToken::new(),
             },
         )?;
 
-        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await?
-            .ok_or("discovery channel closed before the healthy result")?;
+        let event = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await?
+                .ok_or("discovery channel closed before the healthy result")?;
+            if !matches!(event, DiscoveryEvent::TrackerInterval { .. }) {
+                break event;
+            }
+        };
         assert!(matches!(
             event,
             DiscoveryEvent::Peers(peers) if peers == vec![expected_peer]
@@ -8459,6 +8579,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -8544,6 +8665,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -8610,6 +8732,7 @@ mod tests {
                 download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
                 piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
                 transfer: TransferPolicy::default(),
+                piece_flush_interval: PIECE_FLUSH_INTERVAL,
             },
         );
         let mut events = engine.subscribe();
@@ -8986,6 +9109,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -9159,6 +9283,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -11180,6 +11305,7 @@ mod tests {
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
+            piece_flush_interval: PIECE_FLUSH_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),

@@ -276,7 +276,7 @@ async fn initialize_state(settings: &Settings) -> Result<AppState, ServerError> 
     let utp = UtpEndpoint::bind(settings.listen.peer)
         .await
         .map_err(|error| ServerError::Server(error.to_string()))?;
-    let dht = DhtClient::bind(settings.listen.dht, 128, 65_507, Duration::from_secs(2))
+    let dht = DhtClient::bind(settings.listen.dht, 512, 65_507, Duration::from_secs(2))
         .await
         .map_err(|error| ServerError::Server(error.to_string()))?;
     let engine = EngineHandle::start_configured(
@@ -292,12 +292,14 @@ async fn initialize_state(settings: &Settings) -> Result<AppState, ServerError> 
             encryption: match settings.listen.peer_encryption {
                 PeerEncryption::Disabled => EncryptionPolicy::Disabled,
                 PeerEncryption::Preferred => EncryptionPolicy::Preferred,
+                PeerEncryption::PlaintextPreferred => EncryptionPolicy::PlaintextPreferred,
                 PeerEncryption::Required => EncryptionPolicy::Required,
             },
             peer_connection_limit: settings.limits.peer_connections,
             allow_private_web_seeds: false,
             download_buffer_bytes: settings.limits.download_buffer_bytes,
             piece_cache_bytes: settings.limits.piece_cache_bytes,
+            piece_flush_interval: Duration::from_secs(settings.storage.flush_interval_seconds),
             transfer: TransferPolicy {
                 upload_slots: settings.transfer.upload_slots,
                 optimistic_upload_slots: settings.transfer.optimistic_upload_slots,

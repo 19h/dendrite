@@ -7,7 +7,7 @@ use thiserror::Error;
 
 mod service;
 
-pub use service::{DhtClient, DhtServiceError};
+pub use service::{DhtClient, DhtLookup, DhtServiceError};
 
 const MAX_PACKET_BYTES: usize = 65_507;
 const MAX_TRANSACTION_BYTES: usize = 16;
@@ -122,6 +122,29 @@ pub fn decode_message(input: &[u8]) -> Result<DhtMessage, DhtCodecError> {
         b"e" => decode_error(&root.value, transaction),
         _ => Err(DhtCodecError::Field("y")),
     }
+}
+
+#[must_use]
+pub fn encode_announce_peer_query(
+    transaction: &[u8],
+    id: NodeId,
+    info_hash: Sha1Hash,
+    port: u16,
+    token: &[u8],
+) -> Bytes {
+    let mut output = Vec::with_capacity(128 + token.len());
+    output.extend_from_slice(b"d1:ad2:id20:");
+    output.extend_from_slice(id.as_bytes());
+    output.extend_from_slice(b"9:info_hash20:");
+    output.extend_from_slice(info_hash.as_bytes());
+    output.extend_from_slice(format!("4:porti{port}e5:token{}:", token.len()).as_bytes());
+    output.extend_from_slice(token);
+    output.extend_from_slice(b"e1:q13:announce_peer1:t");
+    output.extend_from_slice(transaction.len().to_string().as_bytes());
+    output.push(b':');
+    output.extend_from_slice(transaction);
+    output.extend_from_slice(b"1:y1:qe");
+    Bytes::from(output)
 }
 
 #[must_use]

@@ -14,7 +14,27 @@ pub struct Settings {
     pub listen: ListenSettings,
     pub limits: Limits,
     pub transfer: Transfer,
+    pub storage: Storage,
     pub logging: Logging,
+}
+
+/// Payload durability cadence.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Storage {
+    /// Seconds between the group fsync barriers that commit completed
+    /// pieces. Longer intervals batch more pieces per fsync and, on ZFS with
+    /// a separate log device, keep most payload out of the log; the window of
+    /// verified pieces that a crash can force to re-download grows with it.
+    pub flush_interval_seconds: u64,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            flush_interval_seconds: 1,
+        }
+    }
 }
 
 /// Upload economics: how many peers are served, how much upload a peer earns
@@ -74,6 +94,8 @@ pub enum PeerEncryption {
     Disabled,
     #[default]
     Preferred,
+    /// Dial plaintext first and fall back to encryption; accept both inbound.
+    PlaintextPreferred,
     Required,
 }
 
@@ -130,6 +152,7 @@ impl Default for Settings {
             listen: ListenSettings::default(),
             limits: Limits::default(),
             transfer: Transfer::default(),
+            storage: Storage::default(),
             logging: Logging::default(),
         }
     }
@@ -250,6 +273,12 @@ impl Settings {
             self.limits.piece_cache_bytes,
             16 * 1024 * 1024,
             64 * 1024 * 1024 * 1024,
+        )?;
+        check_limit(
+            "flush_interval_seconds",
+            usize::try_from(self.storage.flush_interval_seconds).unwrap_or(usize::MAX),
+            1,
+            300,
         )?;
         check_limit("upload_slots", self.transfer.upload_slots, 1, 1_000)?;
         check_limit(

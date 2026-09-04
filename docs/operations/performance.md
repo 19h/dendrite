@@ -63,6 +63,15 @@ cargo test --locked -p dendrite-simulator \
   tests::extended_fault_soak -- --ignored --exact
 ```
 
+## DHT lookup probe
+
+```sh
+cargo run --locked -p dendrite-net --example dht_probe -- <hex info hash>
+```
+
+Runs two iterative lookups against the public bootstrap nodes and prints the
+peer count and wall time of each; the second run exercises the node cache.
+
 ## End-to-end measurement
 
 For real transfers, report at least:
@@ -114,11 +123,23 @@ info-hash lookups are served from an in-memory mirror; these invariants prevent
 metadata size, piece count, or peer block rate from amplifying state database
 work.
 
+Peer discovery runs an iterative DHT lookup (eight queries in flight,
+converging on the sixteen closest nodes, collecting peers from every
+responder, remembering responsive nodes for the next lookup) and announces the
+listening port every fifteen minutes. Trackers are re-announced only when the
+interval they returned has elapsed (clamped to one minute–four hours), while
+DHT, local discovery, and PEX refresh every minute. Announces ask for 200
+peers.
+
+Outgoing block requests and cancels are queued without waiting for the socket
+write, and the writer coalesces every queued message into one write; socket
+reads land directly in the frame buffer.
+
 Piece selection uses word-level candidate bitsets and a selectability
 generation: a peer that has nothing selectable costs one pass over
 `pieces / 64` words and is not asked again until the generation changes. Each
 peer keeps a rate-sized queue of assigned pieces and a request pipeline that
-spans piece boundaries (128–512 blocks, bounded by the remote `reqq`).
+spans piece boundaries (128–1024 blocks, bounded by the remote `reqq`).
 
 Outbound connection establishment is limited to 128 concurrent handshakes per
 torrent even when the ready-peer ceiling is higher. This avoids synchronized

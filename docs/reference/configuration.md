@@ -36,7 +36,7 @@ read, write, rename, and synchronization access.
 | `dht` | socket address | `0.0.0.0:16309` | DHT UDP endpoint |
 | `dht_bootstrap` | socket-address array | `[]` | literal bootstrap nodes for DHT lookup |
 | `nat_pmp_gateway` | socket address or absent | absent | explicit IPv4 NAT-PMP gateway |
-| `peer_encryption` | enum | `preferred` | `disabled`, `preferred`, or `required` MSE policy |
+| `peer_encryption` | enum | `preferred` | `disabled`, `preferred`, `plaintext_preferred`, or `required` MSE policy; `plaintext_preferred` dials plaintext first and falls back to encryption, accepting both inbound |
 | `tls_certificate` | path or absent | absent | PEM certificate chain for API TLS |
 | `tls_private_key` | path or absent | absent | PEM private key for API TLS |
 | `allowed_origins` | string array | `[]` | exact browser CORS origins |
@@ -73,6 +73,18 @@ remain operator responsibilities.
 These are ceilings, not allocations or recommended values for every host.
 Configured body sizes do not relax lower-level structural/message limits in the
 owning parsers.
+
+## `[storage]`
+
+| Setting | Type | Default | Meaning |
+|---|---|---:|---|
+| `flush_interval_seconds` | integer 1–300 | `1` | seconds between the group fsync barriers that commit verified pieces |
+
+Completion bits are committed only after the payload files are synchronized,
+so a longer interval means more verified pieces may need to be re-downloaded
+after a crash, never that unverified data is trusted. On ZFS with a separate
+log device, intervals longer than the transaction-group timeout keep most
+payload out of the log device.
 
 ## `[transfer]`
 
@@ -130,6 +142,9 @@ browser_sessions = 1024
 list_page_size = 200
 download_buffer_bytes = 2147483648
 piece_cache_bytes = 536870912
+
+[storage]
+flush_interval_seconds = 1
 
 [transfer]
 upload_slots = 16

@@ -14,6 +14,9 @@ pub enum EncryptionPolicy {
     #[default]
     Disabled,
     Preferred,
+    /// Dial plaintext first and fall back to an encrypted handshake; accepts
+    /// both inbound. Saves the RC4 cost for every peer that allows plaintext.
+    PlaintextPreferred,
     Required,
 }
 
@@ -325,13 +328,35 @@ fn decode_hash_message(
 }
 
 pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
-    let mut payload = BytesMut::new();
+    let mut payload = BytesMut::with_capacity(encoded_size_hint(message));
+    encode_message_into(&mut payload, message)?;
+    Ok(payload.freeze())
+}
+
+/// Upper bound on the encoded size, so batches can be sized without
+/// reallocating for payload-bearing messages.
+#[must_use]
+pub fn encoded_size_hint(message: &PeerMessage) -> usize {
+    match message {
+        PeerMessage::Piece { block, .. } => block.len().saturating_add(13),
+        PeerMessage::Bitfield(bits) => bits.len().saturating_add(5),
+        PeerMessage::Extended { payload, .. } => payload.len().saturating_add(6),
+        PeerMessage::Hashes { hashes, .. } => hashes.len().saturating_add(53),
+        _ => 17,
+    }
+}
+
+/// Appends the wire encoding of `message` to `payload`.
+pub fn encode_message_into(
+    payload: &mut BytesMut,
+    message: &PeerMessage,
+) -> Result<(), PeerCodecError> {
     match message {
         PeerMessage::KeepAlive => payload.put_u32(0),
-        PeerMessage::Choke => encode_empty(&mut payload, 0),
-        PeerMessage::Unchoke => encode_empty(&mut payload, 1),
-        PeerMessage::Interested => encode_empty(&mut payload, 2),
-        PeerMessage::NotInterested => encode_empty(&mut payload, 3),
+        PeerMessage::Choke => encode_empty(payload, 0),
+        PeerMessage::Unchoke => encode_empty(payload, 1),
+        PeerMessage::Interested => encode_empty(payload, 2),
+        PeerMessage::NotInterested => encode_empty(payload, 3),
         PeerMessage::Have(piece) => {
             payload.put_u32(5);
             payload.put_u8(4);
@@ -339,7 +364,7 @@ pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
         }
         PeerMessage::Bitfield(bits) => {
             put_length(
-                &mut payload,
+                payload,
                 1_usize
                     .checked_add(bits.len())
                     .ok_or(PeerCodecError::EncodedLength)?,
@@ -347,14 +372,14 @@ pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
             payload.put_u8(5);
             payload.extend_from_slice(bits);
         }
-        PeerMessage::Request(request) => encode_request(&mut payload, 6, *request),
+        PeerMessage::Request(request) => encode_request(payload, 6, *request),
         PeerMessage::Piece {
             piece,
             begin,
             block,
         } => {
             put_length(
-                &mut payload,
+                payload,
                 9_usize
                     .checked_add(block.len())
                     .ok_or(PeerCodecError::EncodedLength)?,
@@ -364,8 +389,8 @@ pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
             payload.put_u32(*begin);
             payload.extend_from_slice(block);
         }
-        PeerMessage::Cancel(request) => encode_request(&mut payload, 8, *request),
-        PeerMessage::Reject(request) => encode_request(&mut payload, 16, *request),
+        PeerMessage::Cancel(request) => encode_request(payload, 8, *request),
+        PeerMessage::Reject(request) => encode_request(payload, 16, *request),
         PeerMessage::Port(port) => {
             payload.put_u32(3);
             payload.put_u8(9);
@@ -376,7 +401,7 @@ pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
             payload: extension,
         } => {
             put_length(
-                &mut payload,
+                payload,
                 2_usize
                     .checked_add(extension.len())
                     .ok_or(PeerCodecError::EncodedLength)?,
@@ -385,7 +410,7 @@ pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
             payload.put_u8(*extension_id);
             payload.extend_from_slice(extension);
         }
-        PeerMessage::HashRequest(request) => encode_hash_request(&mut payload, 21, *request),
+        PeerMessage::HashRequest(request) => encode_hash_request(payload, 21, *request),
         PeerMessage::Hashes { request, hashes } => {
             if !hashes.len().is_multiple_of(32) {
                 return Err(PeerCodecError::InvalidLength {
@@ -394,18 +419,18 @@ pub fn encode_message(message: &PeerMessage) -> Result<Bytes, PeerCodecError> {
                 });
             }
             put_length(
-                &mut payload,
+                payload,
                 49_usize
                     .checked_add(hashes.len())
                     .ok_or(PeerCodecError::EncodedLength)?,
             )?;
             payload.put_u8(22);
-            encode_hash_fields(&mut payload, *request);
+            encode_hash_fields(payload, *request);
             payload.extend_from_slice(hashes);
         }
-        PeerMessage::HashReject(request) => encode_hash_request(&mut payload, 23, *request),
+        PeerMessage::HashReject(request) => encode_hash_request(payload, 23, *request),
     }
-    Ok(payload.freeze())
+    Ok(())
 }
 
 fn read_request(frame: &[u8]) -> Result<BlockRequest, PeerCodecError> {
