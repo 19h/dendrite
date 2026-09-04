@@ -152,6 +152,13 @@ LSD is LAN-local. NAT-PMP and an open incoming port can improve reachability but
 do not manufacture tracker/DHT results. A zero sampled peer count can also be
 transient; use logs over time.
 
+Current builds continuously drain the TCP/uTP listener even when connection or
+handshake admission is full. Stalled handshakes are bounded separately, and
+outbound workers leave reserved capacity for incoming sessions. A temporary
+connection flood can cause excess sockets to be rejected, but the listener must
+admit new peers automatically as soon as capacity returns; it must not require
+a daemon restart.
+
 ## Torrent has one peer and is extremely slow
 
 The sampled `peers` value counts connected sessions, not the tracker population.
@@ -225,11 +232,21 @@ over time. A large `peers` total with zero active downloaders usually means the
 connected population is choked or currently has no useful pieces. Do not infer
 corruption or completion from a single rate field.
 
-While downloading, an unknown peer can receive up to 4 MiB per daemon run through an optimistic
-slot. Further upload requires byte-for-byte credit from data received and
-piece-verified from that same peer. A full seed cannot be rewarded with payload
-because it already has every piece and will not request any; Dendrite instead
-retains full seeds preferentially and schedules them before partial sources.
+While downloading, a peer earns `reciprocal_bootstrap_bytes` of upload per
+connected hour plus `reciprocal_ratio` times the bytes it has delivered and
+that verified, and only peers holding pieces the torrent still needs occupy
+regular upload slots. If every peer is choking you, raise the bootstrap or
+ratio in `[transfer]` so remote tit-for-tat clients see you reciprocating; if
+`dendrite_uploaded_bytes_total` climbs faster than your egress budget allows,
+lower them or set `upload_rate_limit_bytes` / `torrent_max_upload_ratio`. A
+full seed cannot be rewarded with payload because it already has every piece
+and will not request any; Dendrite instead retains full seeds preferentially
+and schedules them before partial sources.
+
+If `peers` includes connections from the daemon's own public address, those
+are self-connections; the daemon rejects them by peer id and never dials
+addresses it has learned are its own, so a persistent count means a second
+daemon is running with the same state directory.
 
 ## Recheck ends in `stopped`
 

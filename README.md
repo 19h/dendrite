@@ -38,6 +38,7 @@ It creates `./dendrite-data`, `./downloads`, and an administrator token at
 target/release/dendritectl status
 target/release/dendritectl add ./example.torrent --start
 target/release/dendritectl add ./example.torrent --start --stop-on-complete
+target/release/dendritectl set <torrent-id> --stop-on-complete
 ```
 
 `example.torrent` is a metainfo file you already have; the repository does

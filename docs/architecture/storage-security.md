@@ -75,8 +75,14 @@ file modification.
 ## State storage
 
 `data_dir/state.redb` is a local transactional database. Its database schema is
-currently version 2; individual torrent records have their own current encoding
-version, currently 1. Hash indexes and record mutations commit together.
+currently version 5; individual torrent records have their own current encoding
+version, currently 2. The immutable record, the raw metainfo, the small mutable
+counters, and the completion bitfield live in separate tables keyed by torrent
+id, so progress commits never rewrite metainfo and upload accounting never
+rewrites the bitfield. Hash indexes and record mutations commit together.
+Upload-counter commits are not made durable on their own; they persist with
+the next durable commit, which bounds the loss on a crash to the last
+accounting interval. Opening an older schema migrates it in place.
 
 Records that cannot be decoded are moved to quarantine and counted in daemon
 status. They are not silently treated as valid. Quarantine is a signal to stop

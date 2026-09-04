@@ -83,6 +83,16 @@ created as `starting` and scheduled after the transaction commits. Add
 `--stop-on-complete` to persist a mode that stops the torrent once every piece
 verifies instead of keeping it active for seeding.
 
+Change the mode on an existing torrent without restarting an active transfer:
+
+```sh
+dendritectl set <TORRENT_ID> --stop-on-complete
+dendritectl set <TORRENT_ID> --no-stop-on-complete
+```
+
+Enabling it on an existing seed stops that torrent immediately. Disabling it
+leaves an already stopped torrent stopped; run `resume` if it should seed again.
+
 The CLI exposes no destination or sequential option because API v2.0 rejects
 both. All payloads use the daemon's global `download_dir`; scheduling remains
 rarest-first with an endgame mode.

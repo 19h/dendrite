@@ -6,8 +6,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc, Weak,
-        atomic::{AtomicU16, AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -19,10 +19,10 @@ use dendrite_net::{
     dht::DhtClient,
     extension::{
         HolePunchKind, HolePunchMessage, LOCAL_HOLEPUNCH_EXTENSION_ID, LOCAL_METADATA_EXTENSION_ID,
-        LOCAL_PEX_EXTENSION_ID, METADATA_BLOCK_BYTES, MetadataMessage, decode_extension_handshake,
-        decode_holepunch_message, decode_metadata_message, decode_pex_message,
-        encode_extension_handshake, encode_holepunch_message, encode_metadata_data,
-        encode_metadata_reject, encode_metadata_request,
+        LOCAL_PEX_EXTENSION_ID, METADATA_BLOCK_BYTES, MetadataMessage, REQUEST_QUEUE_LIMIT,
+        decode_extension_handshake, decode_holepunch_message, decode_metadata_message,
+        decode_pex_message, encode_extension_handshake, encode_holepunch_message,
+        encode_metadata_data, encode_metadata_reject, encode_metadata_request,
     },
     lsd::LsdService,
     peer::{
@@ -45,7 +45,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite},
     net::TcpListener,
-    sync::{Mutex, Semaphore, broadcast, mpsc, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, warn};
@@ -56,10 +56,19 @@ const EVENT_CAPACITY: usize = 4096;
 const PEER_LIMIT_PER_ANNOUNCE: u16 = 80;
 const BLOCK_BYTES: usize = 16 * 1024;
 const BLOCK_PIPELINE: usize = 128;
+const BLOCK_PIPELINE_MAX: usize = REQUEST_QUEUE_LIMIT;
+const PIPELINE_TARGET_SECONDS: u64 = 3;
+const ASSIGNMENT_TARGET_MIN: usize = 2 * 1024 * 1024;
+const ASSIGNMENT_TARGET_MAX: usize = 16 * 1024 * 1024;
+const ASSIGNMENT_TARGET_SECONDS: u64 = 1;
+const DEFAULT_DOWNLOAD_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_PIECE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const PEER_COMMAND_CAPACITY: usize = 64;
 const ACTIVE_PEER_LIMIT: usize = 256;
 const PEER_CONNECT_CONCURRENCY: usize = 128;
 const INCOMING_PEER_LIMIT: usize = 256;
+const INCOMING_HANDSHAKE_LIMIT: usize = 256;
 const TRACKER_ANNOUNCE_CONCURRENCY: usize = 128;
 const DISCOVERY_EVENT_CAPACITY: usize = 256;
 const METADATA_PEER_CONCURRENCY: usize = 32;
@@ -72,9 +81,12 @@ const PEER_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 const PREFERRED_SEED_PEERS: usize = 8;
 const UPLOAD_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const UPLOAD_CHOKE_INTERVAL: Duration = Duration::from_secs(10);
-const REGULAR_UPLOAD_SLOTS: usize = 8;
-const OPTIMISTIC_UPLOAD_SLOTS: usize = 2;
-const RECIPROCAL_BOOTSTRAP_BYTES: u64 = 4 * 1024 * 1024;
+const REGULAR_UPLOAD_SLOTS: usize = 16;
+const OPTIMISTIC_UPLOAD_SLOTS: usize = 4;
+const RECIPROCAL_BOOTSTRAP_BYTES: u64 = 8 * 1024 * 1024;
+const REPUTATION_RETENTION: Duration = Duration::from_secs(60 * 60);
+const KNOWN_CANDIDATE_LIMIT: usize = 8192;
+const QUEUED_CANDIDATE_LIMIT: usize = 4096;
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -82,6 +94,7 @@ const SWARM_RETRY_MAX: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
+#[allow(clippy::struct_excessive_bools)] // Independent flags mirrored from the wire and scheduler.
 struct PeerWorkerHandle {
     commands: mpsc::Sender<PeerWorkerCommand>,
     bitfield: Option<Vec<u8>>,
@@ -95,6 +108,21 @@ struct PeerWorkerHandle {
     connected_at: Instant,
     last_verified: Option<Instant>,
     cancellation: CancellationToken,
+    /// Bytes of pieces currently assigned to this worker.
+    assigned_bytes: usize,
+    /// Assignment target derived from the worker's verified rate.
+    target_bytes: usize,
+    /// The worker asked for more pieces and has not been granted any since.
+    wants_more: bool,
+    /// Picker generation at which `select` last returned `None` for this
+    /// worker; scheduling is skipped until the generation changes.
+    skip_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PieceAssignment {
+    piece: usize,
+    length: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -119,8 +147,10 @@ struct PeerWorkerContext {
 
 struct SwarmState {
     workers: HashMap<usize, PeerWorkerHandle>,
-    assignments: HashMap<usize, (usize, CancellationToken)>,
+    assignments: HashMap<usize, Vec<PieceAssignment>>,
     picker: PiecePicker,
+    budget: BudgetAccount,
+    schedule_dirty: bool,
     connecting: usize,
     last_error: Option<String>,
     writing: HashSet<usize>,
@@ -172,6 +202,7 @@ enum SwarmLoopEvent {
     Worker(PeerWorkerEvent),
     Incoming(IncomingDownloadPeer),
     Discovery(Option<DiscoveryEvent>),
+    Verified(PieceVerifyResult),
     Stored(PieceWriteResult),
     Flushed(PieceFlushResult),
     FlushTick,
@@ -185,6 +216,15 @@ struct PieceWriteResult {
     result: Result<HashSet<TorrentPath>, ActorError>,
 }
 
+struct PieceVerifyResult {
+    worker: usize,
+    piece: usize,
+    data: Bytes,
+    result: Result<bool, ActorError>,
+}
+
+type PieceVerifyFuture<'a> = Pin<Box<dyn Future<Output = PieceVerifyResult> + Send + 'a>>;
+
 struct PieceFlushResult {
     pieces: Vec<usize>,
     result: Result<(), ActorError>,
@@ -194,14 +234,9 @@ type PieceWriteFuture<'a> = Pin<Box<dyn Future<Output = PieceWriteResult> + Send
 type PieceFlushFuture<'a> = Pin<Box<dyn Future<Output = PieceFlushResult> + Send + 'a>>;
 
 enum PeerWorkerCommand {
-    Download {
-        piece: usize,
-        length: usize,
-        cancellation: CancellationToken,
-    },
-    Have {
-        piece: u32,
-    },
+    Download { piece: usize, length: usize },
+    Cancel { piece: usize },
+    Have { piece: u32 },
     Shutdown,
 }
 
@@ -237,6 +272,11 @@ enum PeerWorkerEvent {
         worker: usize,
         address: SocketAddr,
     },
+    /// The worker's request pipeline is about to run dry.
+    NeedPieces {
+        worker: usize,
+        rate_bytes_per_second: u64,
+    },
 }
 
 enum PeerWorkerInput {
@@ -245,12 +285,8 @@ enum PeerWorkerInput {
 }
 
 struct PeerEventForwarder<'a> {
-    services: &'a Services,
-    events: &'a mpsc::Sender<PeerWorkerEvent>,
     activity: &'a Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     torrent_id: TorrentId,
-    worker: usize,
-    allow_extensions: bool,
 }
 
 enum PieceResult {
@@ -281,6 +317,36 @@ pub struct EngineEvent {
     pub detail: Option<String>,
 }
 
+/// Upload economics; see the `[transfer]` configuration section.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferPolicy {
+    pub upload_slots: usize,
+    pub optimistic_upload_slots: usize,
+    /// Upload allowed per verified byte received while downloading; `0.0`
+    /// disables the reciprocal cap.
+    pub reciprocal_ratio: f64,
+    /// Allowance every peer earns per hour of connection.
+    pub reciprocal_bootstrap_bytes: u64,
+    /// Global upload ceiling in bytes per second; `0` is unlimited.
+    pub upload_rate_limit_bytes: u64,
+    /// Uploaded/downloaded ratio at which a torrent chokes everyone; `0.0`
+    /// is unlimited.
+    pub torrent_max_upload_ratio: f64,
+}
+
+impl Default for TransferPolicy {
+    fn default() -> Self {
+        Self {
+            upload_slots: REGULAR_UPLOAD_SLOTS,
+            optimistic_upload_slots: OPTIMISTIC_UPLOAD_SLOTS,
+            reciprocal_ratio: 1.0,
+            reciprocal_bootstrap_bytes: RECIPROCAL_BOOTSTRAP_BYTES,
+            upload_rate_limit_bytes: 0,
+            torrent_max_upload_ratio: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
     pub tracker_response_limit: usize,
@@ -292,6 +358,11 @@ pub struct EngineOptions {
     pub encryption: EncryptionPolicy,
     pub peer_connection_limit: usize,
     pub allow_private_web_seeds: bool,
+    /// Global bound on bytes of piece buffers assigned to downloading peers.
+    pub download_buffer_bytes: usize,
+    /// Global bound on verified pieces cached for uploads.
+    pub piece_cache_bytes: usize,
+    pub transfer: TransferPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -338,19 +409,193 @@ struct Services {
     peer_id: PeerId,
     events: broadcast::Sender<EngineEvent>,
     peer_slots: Arc<Semaphore>,
+    outbound_slots: Arc<Semaphore>,
+    incoming_handshake_slots: Arc<Semaphore>,
     metadata_slots: Arc<Semaphore>,
     per_torrent_peer_limit: usize,
     lsd_cookie: String,
     encryption: EncryptionPolicy,
     rendezvous: Arc<Mutex<HashMap<(Sha1Hash, SocketAddr), RendezvousPeer>>>,
-    incoming_content: Arc<Mutex<HashMap<TorrentId, Weak<IncomingContent>>>>,
+    incoming_content: Arc<Mutex<HashMap<TorrentId, Arc<IncomingContent>>>>,
     incoming_swarms: Arc<std::sync::Mutex<HashMap<TorrentId, mpsc::Sender<IncomingDownloadPeer>>>>,
     upload_policy: Arc<std::sync::Mutex<UploadPolicy>>,
     connected_peers: Arc<AtomicUsize>,
     torrent_activity: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     payload_claims: Arc<std::sync::Mutex<HashMap<TorrentId, Vec<TorrentPath>>>>,
+    download_budget: Arc<DownloadBudget>,
+    piece_cache_budget: Arc<CacheBudget>,
+    hash_slots: Arc<Semaphore>,
+    transfer: TransferPolicy,
+    /// Addresses this daemon is reachable at, learned from local interfaces
+    /// and from peers' `yourip`; candidates on our own peer port at these
+    /// addresses are never dialled.
+    self_addresses: Arc<std::sync::RwLock<HashSet<IpAddr>>>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
+}
+
+/// Process-wide bound on bytes held by upload piece caches.
+struct CacheBudget {
+    used: AtomicU64,
+    limit: u64,
+}
+
+impl CacheBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicU64::new(0),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn over_limit(&self) -> bool {
+        self.used.load(Ordering::Acquire) > self.limit
+    }
+
+    fn add(&self, bytes: usize) {
+        self.used
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::AcqRel);
+    }
+
+    fn release(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let _result_ignored = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
+
+/// Verified pieces shared by every upload session of one torrent, evicted
+/// oldest-first whenever the global cache budget is exceeded.
+struct PieceCache {
+    entries: HashMap<usize, Bytes>,
+    order: VecDeque<usize>,
+    bytes: usize,
+    budget: Arc<CacheBudget>,
+}
+
+impl PieceCache {
+    fn new(budget: Arc<CacheBudget>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, piece: usize) -> Option<Bytes> {
+        let data = self.entries.get(&piece)?.clone();
+        if let Some(position) = self.order.iter().position(|entry| *entry == piece) {
+            self.order.remove(position);
+            self.order.push_back(piece);
+        }
+        Some(data)
+    }
+
+    fn insert(&mut self, piece: usize, data: Bytes) {
+        if self.entries.contains_key(&piece) {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(data.len());
+        self.budget.add(data.len());
+        self.entries.insert(piece, data);
+        self.order.push_back(piece);
+        while self.budget.over_limit() && self.order.len() > 1 {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(evicted.len());
+                self.budget.release(evicted.len());
+            }
+        }
+    }
+}
+
+impl Drop for PieceCache {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// Process-wide bound on piece buffers reserved for downloads.
+struct DownloadBudget {
+    used: AtomicU64,
+    limit: u64,
+}
+
+impl DownloadBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicU64::new(0),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn try_reserve(&self, bytes: u64) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .is_ok()
+    }
+
+    fn force_reserve(&self, bytes: u64) {
+        self.used.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    fn release(&self, bytes: u64) {
+        let _result_ignored = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> u64 {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+/// One swarm's view of the shared download budget. A swarm holding nothing may
+/// always reserve one piece so a busy daemon cannot starve a torrent forever;
+/// dropping the account returns everything it still holds.
+struct BudgetAccount {
+    shared: Arc<DownloadBudget>,
+    held: u64,
+}
+
+impl BudgetAccount {
+    fn new(shared: Arc<DownloadBudget>) -> Self {
+        Self { shared, held: 0 }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> bool {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if self.held == 0 {
+            self.shared.force_reserve(bytes);
+        } else if !self.shared.try_reserve(bytes) {
+            return false;
+        }
+        self.held = self.held.saturating_add(bytes);
+        true
+    }
+
+    fn release(&mut self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX).min(self.held);
+        self.held -= bytes;
+        self.shared.release(bytes);
+    }
+}
+
+impl Drop for BudgetAccount {
+    fn drop(&mut self) {
+        self.shared.release(self.held);
+    }
 }
 
 #[derive(Clone)]
@@ -364,6 +609,7 @@ struct IncomingContent {
     metainfo: Metainfo,
     pieces: usize,
     info: Bytes,
+    cache: std::sync::Mutex<PieceCache>,
 }
 
 struct IncomingDownloadPeer {
@@ -387,25 +633,88 @@ struct UploadPolicy {
     sessions: HashMap<u64, UploadSession>,
     reputation: HashMap<(TorrentId, PeerKey), PeerReputation>,
     round: u64,
+    limiter: UploadLimiter,
 }
 
+/// Token bucket for the global upload ceiling; negative balances translate
+/// into a delay before the next block is sent.
+#[derive(Default)]
+struct UploadLimiter {
+    last_refill: Option<Instant>,
+    tokens: i128,
+}
+
+impl UploadLimiter {
+    /// Charges `bytes` against the bucket and returns how long the caller
+    /// must wait before sending them.
+    fn charge(&mut self, rate_bytes_per_second: u64, bytes: u64) -> Duration {
+        if rate_bytes_per_second == 0 {
+            return Duration::ZERO;
+        }
+        let now = Instant::now();
+        let rate = i128::from(rate_bytes_per_second);
+        if let Some(last) = self.last_refill {
+            let elapsed_nanos = i128::try_from(now.duration_since(last).as_nanos()).unwrap_or(0);
+            let refill = rate.saturating_mul(elapsed_nanos) / 1_000_000_000;
+            self.tokens = self.tokens.saturating_add(refill).min(rate);
+        } else {
+            self.tokens = rate;
+        }
+        self.last_refill = Some(now);
+        self.tokens = self.tokens.saturating_sub(i128::from(bytes));
+        if self.tokens >= 0 {
+            return Duration::ZERO;
+        }
+        let deficit = self.tokens.unsigned_abs();
+        let nanos = deficit
+            .saturating_mul(1_000_000_000)
+            .checked_div(rate.unsigned_abs())
+            .unwrap_or(0);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)] // Wire state (interested/unchoked) and policy inputs are independent flags.
 struct UploadSession {
     torrent_id: TorrentId,
     peer: PeerKey,
     sender: PeerSender,
     reciprocal: bool,
     interested: bool,
+    /// The peer holds pieces we still need, so upload to it can be repaid.
+    interesting: bool,
     unchoked: bool,
     uploaded: u64,
     sampled_uploaded: u64,
     recent_upload: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct PeerReputation {
     verified_from: u64,
     uploaded_to: u64,
     failures: u32,
+    /// Verified bytes since the last choke round, folded into `verified_rate`.
+    recent_verified: u64,
+    /// Bytes per second delivered by this peer over the last choke round.
+    verified_rate: u64,
+    first_seen: Instant,
+    last_seen: Instant,
+}
+
+impl Default for PeerReputation {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            verified_from: 0,
+            uploaded_to: 0,
+            failures: 0,
+            recent_verified: 0,
+            verified_rate: 0,
+            first_seen: now,
+            last_seen: now,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -611,6 +920,9 @@ impl EngineHandle {
                 encryption: EncryptionPolicy::Disabled,
                 peer_connection_limit: INCOMING_PEER_LIMIT,
                 allow_private_web_seeds: false,
+                download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
+                piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
+                transfer: TransferPolicy::default(),
             },
         )
     }
@@ -623,6 +935,7 @@ impl EngineHandle {
     ) -> Self {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let peer_connection_limit = options.peer_connection_limit.max(1);
         let services = Services {
             store,
             storage,
@@ -637,7 +950,13 @@ impl EngineHandle {
             advertised_peer_port: Arc::new(AtomicU16::new(options.peer_port)),
             peer_id: generate_peer_id(),
             events: events.clone(),
-            peer_slots: Arc::new(Semaphore::new(options.peer_connection_limit.max(1))),
+            peer_slots: Arc::new(Semaphore::new(peer_connection_limit)),
+            outbound_slots: Arc::new(Semaphore::new(outbound_connection_limit(
+                peer_connection_limit,
+            ))),
+            incoming_handshake_slots: Arc::new(Semaphore::new(
+                peer_connection_limit.min(INCOMING_HANDSHAKE_LIMIT),
+            )),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(options.peer_connection_limit),
             lsd_cookie: format!("dendrite-{:016x}", rand::random::<u64>()),
@@ -649,6 +968,11 @@ impl EngineHandle {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(options.download_buffer_bytes.max(1))),
+            piece_cache_budget: Arc::new(CacheBudget::new(options.piece_cache_bytes)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: options.transfer,
+            self_addresses: Arc::new(std::sync::RwLock::new(local_outbound_addresses())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -911,6 +1235,7 @@ fn register_upload_session(
                 sender,
                 reciprocal,
                 interested: false,
+                interesting: false,
                 unchoked: false,
                 uploaded: 0,
                 sampled_uploaded: 0,
@@ -931,13 +1256,14 @@ fn set_upload_interest(services: &Services, session: u64, interested: bool) -> b
     let Ok(mut policy) = services.upload_policy.lock() else {
         return false;
     };
-    let Some((torrent_id, peer, reciprocal, already_unchoked)) =
+    let Some((torrent_id, peer, reciprocal, already_unchoked, interesting)) =
         policy.sessions.get(&session).map(|entry| {
             (
                 entry.torrent_id,
                 entry.peer,
                 entry.reciprocal,
                 entry.unchoked,
+                entry.interesting,
             )
         })
     else {
@@ -948,8 +1274,11 @@ fn set_upload_interest(services: &Services, session: u64, interested: bool) -> b
         .get(&(torrent_id, peer))
         .copied()
         .unwrap_or_default();
-    let has_credit = !reciprocal || has_reciprocal_upload_credit(reputation);
-    let contributes = !reciprocal || reciprocal_contribution(reputation) > 0;
+    let transfer = services.transfer;
+    let has_credit = !reciprocal || has_reciprocal_upload_credit(&transfer, reputation);
+    let contributes = !reciprocal
+        || (interesting
+            && (reciprocal_contribution(reputation) > 0 || reputation.verified_rate > 0));
     let occupied = policy
         .sessions
         .values()
@@ -960,12 +1289,49 @@ fn set_upload_interest(services: &Services, session: u64, interested: bool) -> b
     };
     entry.interested = interested;
     let limit = if contributes {
-        REGULAR_UPLOAD_SLOTS + OPTIMISTIC_UPLOAD_SLOTS
+        transfer
+            .upload_slots
+            .saturating_add(transfer.optimistic_upload_slots)
     } else {
-        OPTIMISTIC_UPLOAD_SLOTS
+        transfer.optimistic_upload_slots
     };
     entry.unchoked = interested && has_credit && (already_unchoked || occupied < limit);
     entry.unchoked
+}
+
+/// Records whether a peer holds pieces we still need. Regular upload slots
+/// while downloading go only to such peers, because upload to anyone else
+/// cannot be repaid in kind.
+fn set_session_interesting(
+    services: &Services,
+    torrent_id: TorrentId,
+    peer: PeerKey,
+    interesting: bool,
+) {
+    if let Ok(mut policy) = services.upload_policy.lock() {
+        for entry in policy.sessions.values_mut() {
+            if entry.torrent_id == torrent_id && entry.peer == peer {
+                entry.interesting = interesting;
+            }
+        }
+    }
+}
+
+/// Delays the caller so global upload stays under the configured ceiling.
+async fn throttle_upload(services: &Services, bytes: u64) {
+    let rate = services.transfer.upload_rate_limit_bytes;
+    if rate == 0 {
+        return;
+    }
+    let wait = services
+        .upload_policy
+        .lock()
+        .map_or(Duration::ZERO, |mut policy| {
+            policy.limiter.charge(rate, bytes)
+        });
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
 }
 
 fn upload_allowed(services: &Services, session: u64) -> bool {
@@ -989,7 +1355,8 @@ fn upload_allowed(services: &Services, session: u64) -> bool {
         .get(&(torrent_id, peer))
         .copied()
         .unwrap_or_default();
-    let allowed = unchoked && (!reciprocal || has_reciprocal_upload_credit(reputation));
+    let allowed =
+        unchoked && (!reciprocal || has_reciprocal_upload_credit(&services.transfer, reputation));
     if !allowed && let Some(entry) = policy.sessions.get_mut(&session) {
         entry.unchoked = false;
     }
@@ -1003,17 +1370,31 @@ fn reciprocal_contribution(reputation: PeerReputation) -> u64 {
         .saturating_sub(u64::from(reputation.failures).saturating_mul(1024 * 1024))
 }
 
-fn has_reciprocal_upload_credit(reputation: PeerReputation) -> bool {
-    reputation.uploaded_to
-        < reputation
-            .verified_from
-            .saturating_add(RECIPROCAL_BOOTSTRAP_BYTES)
+/// Upload allowance while downloading: a per-hour bootstrap so a new peer can
+/// start reciprocating, plus `reciprocal_ratio` bytes per verified byte it has
+/// delivered. A ratio of zero disables the cap.
+fn has_reciprocal_upload_credit(transfer: &TransferPolicy, reputation: PeerReputation) -> bool {
+    if transfer.reciprocal_ratio <= 0.0 {
+        return true;
+    }
+    let hours = reputation.first_seen.elapsed().as_secs() / 3600 + 1;
+    let bootstrap = transfer.reciprocal_bootstrap_bytes.saturating_mul(hours);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let earned =
+        (reputation.verified_from as f64 * transfer.reciprocal_ratio).min(u64::MAX as f64) as u64;
+    reputation.uploaded_to < bootstrap.saturating_add(earned)
 }
 
 fn record_verified_download(services: &Services, torrent_id: TorrentId, peer: PeerKey, bytes: u64) {
     if let Ok(mut policy) = services.upload_policy.lock() {
         let reputation = policy.reputation.entry((torrent_id, peer)).or_default();
         reputation.verified_from = reputation.verified_from.saturating_add(bytes);
+        reputation.recent_verified = reputation.recent_verified.saturating_add(bytes);
+        reputation.last_seen = Instant::now();
     }
 }
 
@@ -1021,6 +1402,7 @@ fn record_peer_failure(services: &Services, torrent_id: TorrentId, peer: PeerKey
     if let Ok(mut policy) = services.upload_policy.lock() {
         let reputation = policy.reputation.entry((torrent_id, peer)).or_default();
         reputation.failures = reputation.failures.saturating_add(1);
+        reputation.last_seen = Instant::now();
     }
 }
 
@@ -1039,44 +1421,67 @@ fn record_peer_upload(
             .entry((torrent_id, upload.peer))
             .or_default();
         reputation.uploaded_to = reputation.uploaded_to.saturating_add(bytes);
+        reputation.last_seen = Instant::now();
     }
 }
 
 struct UploadCandidate {
     session: u64,
     contribution_score: u64,
+    verified_rate: u64,
     recent_upload: u64,
     eligible: bool,
+    interesting: bool,
 }
 
+/// Chooses the sessions to unchoke for one torrent. While downloading, regular
+/// slots go to interesting peers ordered by the rate at which they deliver
+/// verified data (classic tit-for-tat), then by net contribution; optimistic
+/// slots rotate through the remaining interesting peers with credit. While
+/// seeding, recent upload rate orders the slots.
 fn select_upload_sessions(
     state: TorrentState,
     candidates: &mut [UploadCandidate],
     round: u64,
+    transfer: &TransferPolicy,
 ) -> HashSet<u64> {
-    match state {
-        TorrentState::Downloading | TorrentState::Starting => candidates
-            .sort_by_key(|peer| std::cmp::Reverse((peer.contribution_score, peer.recent_upload))),
+    let downloading = match state {
+        TorrentState::Downloading | TorrentState::Starting => {
+            candidates.sort_by_key(|peer| {
+                std::cmp::Reverse((
+                    peer.verified_rate,
+                    peer.contribution_score,
+                    peer.recent_upload,
+                ))
+            });
+            true
+        }
         TorrentState::Seeding => {
             candidates.sort_by_key(|peer| std::cmp::Reverse(peer.recent_upload));
+            false
         }
         _ => return HashSet::new(),
-    }
+    };
     let mut desired = candidates
         .iter()
         .filter(|peer| {
-            peer.eligible && (state == TorrentState::Seeding || peer.contribution_score > 0)
+            peer.eligible
+                && (!downloading
+                    || (peer.interesting
+                        && (peer.contribution_score > 0 || peer.verified_rate > 0)))
         })
-        .take(REGULAR_UPLOAD_SLOTS)
+        .take(transfer.upload_slots)
         .map(|peer| peer.session)
         .collect::<HashSet<_>>();
     let optimistic = candidates
         .iter()
-        .filter(|peer| peer.eligible && !desired.contains(&peer.session))
+        .filter(|peer| {
+            peer.eligible && (!downloading || peer.interesting) && !desired.contains(&peer.session)
+        })
         .collect::<Vec<_>>();
     if !optimistic.is_empty() {
         let start = usize::try_from(round).unwrap_or(0) % optimistic.len();
-        for offset in 0..OPTIMISTIC_UPLOAD_SLOTS.min(optimistic.len()) {
+        for offset in 0..transfer.optimistic_upload_slots.min(optimistic.len()) {
             desired.insert(optimistic[(start + offset) % optimistic.len()].session);
         }
     }
@@ -1096,22 +1501,43 @@ async fn run_upload_choker(services: Services) {
 }
 
 async fn rebalance_upload_slots(services: &Services) {
-    let states = services
-        .store
-        .list_torrents()
-        .await
-        .unwrap_or_default()
-        .into_iter()
+    let transfer = services.transfer;
+    let summaries = services.store.list_summaries().await.unwrap_or_default();
+    let states = summaries
+        .iter()
         .map(|record| (record.id, record.state))
         .collect::<HashMap<_, _>>();
+    #[allow(clippy::cast_precision_loss)]
+    let capped = summaries
+        .iter()
+        .filter(|record| {
+            transfer.torrent_max_upload_ratio > 0.0
+                && record.uploaded as f64
+                    >= transfer.torrent_max_upload_ratio * record.downloaded.max(1) as f64
+        })
+        .map(|record| record.id)
+        .collect::<HashSet<_>>();
     let actions = {
         let Ok(mut policy) = services.upload_policy.lock() else {
             return;
         };
+        let round_seconds = UPLOAD_CHOKE_INTERVAL.as_secs().max(1);
+        for reputation in policy.reputation.values_mut() {
+            reputation.verified_rate = reputation.recent_verified / round_seconds;
+            reputation.recent_verified = 0;
+        }
+        let active: HashSet<(TorrentId, PeerKey)> = policy
+            .sessions
+            .values()
+            .map(|entry| (entry.torrent_id, entry.peer))
+            .collect();
+        policy.reputation.retain(|key, reputation| {
+            active.contains(key) || reputation.last_seen.elapsed() < REPUTATION_RETENTION
+        });
         let mut by_torrent = HashMap::<TorrentId, Vec<UploadCandidate>>::new();
         let reputation = &policy.reputation;
         for (session, entry) in &policy.sessions {
-            if !entry.interested {
+            if !entry.interested || capped.contains(&entry.torrent_id) {
                 continue;
             }
             let peer = reputation.get(&(entry.torrent_id, entry.peer));
@@ -1127,8 +1553,10 @@ async fn rebalance_upload_slots(services: &Services) {
                 .push(UploadCandidate {
                     session: *session,
                     contribution_score,
+                    verified_rate: reputation.verified_rate,
                     recent_upload: entry.uploaded.saturating_sub(entry.sampled_uploaded),
-                    eligible: !reciprocal || has_reciprocal_upload_credit(reputation),
+                    eligible: !reciprocal || has_reciprocal_upload_credit(&transfer, reputation),
+                    interesting: entry.interesting,
                 });
         }
         let mut desired = HashSet::new();
@@ -1137,9 +1565,16 @@ async fn rebalance_upload_slots(services: &Services) {
                 .get(torrent_id)
                 .copied()
                 .unwrap_or(TorrentState::Stopped);
-            desired.extend(select_upload_sessions(state, candidates, policy.round));
+            desired.extend(select_upload_sessions(
+                state,
+                candidates,
+                policy.round,
+                &transfer,
+            ));
         }
-        policy.round = policy.round.wrapping_add(OPTIMISTIC_UPLOAD_SLOTS as u64);
+        policy.round = policy
+            .round
+            .wrapping_add(u64::try_from(transfer.optimistic_upload_slots.max(1)).unwrap_or(1));
         let mut actions = Vec::new();
         for (session, entry) in &mut policy.sessions {
             entry.reciprocal = matches!(
@@ -1208,32 +1643,41 @@ async fn run_lsd_announcer(services: Services) {
 }
 
 async fn active_lsd_hashes(services: &Services) -> Vec<Sha1Hash> {
-    let Ok(records) = services.store.list_torrents().await else {
+    let Ok(records) = services.store.list_summaries().await else {
         return Vec::new();
     };
-    records
-        .into_iter()
-        .filter(|record| {
-            matches!(
-                record.state,
-                TorrentState::Downloading | TorrentState::Seeding
-            ) && !record.raw_metainfo.is_empty()
-        })
-        .filter_map(|record| {
-            let metainfo = Metainfo::parse(
-                &record.raw_metainfo,
-                BencodeLimits {
-                    input_bytes: services.metainfo_limit,
-                    byte_string_bytes: services.metainfo_limit,
-                    ..BencodeLimits::default()
-                },
-            )
-            .ok()?;
-            (!metainfo.private)
-                .then(|| wire_info_hash(&metainfo).ok())
-                .flatten()
-        })
-        .collect()
+    let mut hashes = Vec::new();
+    for record in records {
+        if !matches!(
+            record.state,
+            TorrentState::Downloading | TorrentState::Seeding
+        ) {
+            continue;
+        }
+        let Some(hash) = stored_wire_info_hash(&record) else {
+            continue;
+        };
+        // Local discovery must not announce private torrents; the content
+        // cache answers that without re-parsing the metainfo.
+        let private = if let Some(content) = services
+            .incoming_content
+            .lock()
+            .await
+            .get(&record.id)
+            .cloned()
+        {
+            content.metainfo.private
+        } else {
+            match find_incoming_torrent(hash, services).await {
+                Ok((_, content)) => content.metainfo.private,
+                Err(_) => continue,
+            }
+        };
+        if !private {
+            hashes.push(hash);
+        }
+    }
+    hashes
 }
 
 async fn discover_lsd_peer(info_hash: Sha1Hash, services: &Services) -> Vec<SocketAddr> {
@@ -1264,13 +1708,6 @@ async fn discover_lsd_peer(info_hash: Sha1Hash, services: &Services) -> Vec<Sock
 async fn accept_tcp_peers(listener: TcpListener, services: Services) {
     let mut error_backoff = ACCEPT_ERROR_BACKOFF_MIN;
     loop {
-        let permit = tokio::select! {
-            () = services.shutdown.cancelled() => return,
-            permit = services.peer_slots.clone().acquire_owned() => permit,
-        };
-        let Ok(permit) = permit else {
-            return;
-        };
         let accepted = tokio::select! {
             () = services.shutdown.cancelled() => return,
             accepted = listener.accept() => accepted,
@@ -1278,18 +1715,25 @@ async fn accept_tcp_peers(listener: TcpListener, services: Services) {
         match accepted {
             Ok((stream, address)) => {
                 error_backoff = ACCEPT_ERROR_BACKOFF_MIN;
+                let Ok(handshake_permit) = services
+                    .incoming_handshake_slots
+                    .clone()
+                    .try_acquire_owned()
+                else {
+                    continue;
+                };
                 let services = services.clone();
                 let tasks = services.tasks.clone();
                 tasks.spawn(async move {
-                    if let Err(error) = serve_incoming_stream(stream, address, &services).await {
+                    if let Err(error) =
+                        admit_incoming_stream(stream, address, &services, handshake_permit).await
+                    {
                         debug!(%address, %error, "incoming TCP peer stopped");
                     }
-                    drop(permit);
                 });
             }
             Err(error) => {
                 warn!(%error, "incoming TCP accept failed");
-                drop(permit);
                 tokio::select! {
                     () = services.shutdown.cancelled() => return,
                     () = tokio::time::sleep(error_backoff) => {}
@@ -1303,13 +1747,6 @@ async fn accept_tcp_peers(listener: TcpListener, services: Services) {
 async fn accept_utp_peers(endpoint: UtpEndpoint, services: Services) {
     let mut error_backoff = ACCEPT_ERROR_BACKOFF_MIN;
     loop {
-        let permit = tokio::select! {
-            () = services.shutdown.cancelled() => return,
-            permit = services.peer_slots.clone().acquire_owned() => permit,
-        };
-        let Ok(permit) = permit else {
-            return;
-        };
         let accepted = tokio::select! {
             () = services.shutdown.cancelled() => return,
             accepted = endpoint.accept_stream() => accepted,
@@ -1317,19 +1754,26 @@ async fn accept_utp_peers(endpoint: UtpEndpoint, services: Services) {
         match accepted {
             Ok(stream) => {
                 error_backoff = ACCEPT_ERROR_BACKOFF_MIN;
+                let Ok(handshake_permit) = services
+                    .incoming_handshake_slots
+                    .clone()
+                    .try_acquire_owned()
+                else {
+                    continue;
+                };
                 let address = stream.remote_addr();
                 let services = services.clone();
                 let tasks = services.tasks.clone();
                 tasks.spawn(async move {
-                    if let Err(error) = serve_incoming_stream(stream, address, &services).await {
+                    if let Err(error) =
+                        admit_incoming_stream(stream, address, &services, handshake_permit).await
+                    {
                         debug!(%address, %error, "incoming uTP peer stopped");
                     }
-                    drop(permit);
                 });
             }
             Err(error) => {
                 warn!(%error, "incoming uTP accept failed");
-                drop(permit);
                 tokio::select! {
                     () = services.shutdown.cancelled() => return,
                     () = tokio::time::sleep(error_backoff) => {}
@@ -1344,10 +1788,30 @@ fn next_accept_error_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(ACCEPT_ERROR_BACKOFF_MAX)
 }
 
+async fn admit_incoming_stream<S>(
+    stream: S,
+    address: SocketAddr,
+    services: &Services,
+    handshake_permit: OwnedSemaphorePermit,
+) -> Result<(), ActorError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let permit = tokio::select! {
+        () = services.shutdown.cancelled() => return Err(ActorError::Cancelled),
+        permit = services.peer_slots.clone().acquire_owned() => permit,
+    }
+    .map_err(|_| ActorError::Cancelled)?;
+    let result = serve_incoming_stream(stream, address, services, handshake_permit).await;
+    drop(permit);
+    result
+}
+
 async fn serve_incoming_stream<S>(
     mut stream: S,
     address: SocketAddr,
     services: &Services,
+    handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ActorError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1382,6 +1846,7 @@ where
         }
         let remote =
             Handshake::decode(&encoded).map_err(|error| ActorError::Peer(error.to_string()))?;
+        drop(handshake_permit);
         return finish_incoming_stream(stream, address, remote, services).await;
     }
     if services.encryption == EncryptionPolicy::Disabled {
@@ -1405,11 +1870,12 @@ where
             "encrypted peer handshake changed its info hash".to_owned(),
         ));
     }
+    drop(handshake_permit);
     finish_incoming_stream(encrypted, address, remote, services).await
 }
 
 async fn incoming_wire_hashes(services: &Services) -> Result<Vec<Sha1Hash>, ActorError> {
-    let records = services.store.list_torrents().await?;
+    let records = services.store.list_summaries().await?;
     Ok(records
         .into_iter()
         .filter(|record| {
@@ -1418,15 +1884,7 @@ async fn incoming_wire_hashes(services: &Services) -> Result<Vec<Sha1Hash>, Acto
                 TorrentState::Downloading | TorrentState::Seeding
             )
         })
-        .filter_map(|record| {
-            record.v1_info_hash.or_else(|| {
-                record.v2_info_hash.map(|hash| {
-                    let mut truncated = [0_u8; 20];
-                    truncated.copy_from_slice(&hash.as_bytes()[..20]);
-                    Sha1Hash::from_bytes(truncated)
-                })
-            })
-        })
+        .filter_map(|record| stored_wire_info_hash(&record))
         .collect())
 }
 
@@ -1439,6 +1897,12 @@ async fn finish_incoming_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    if remote.peer_id == services.peer_id {
+        learn_self_address(services, address.ip());
+        return Err(ActorError::Peer(
+            "rejected a connection from this daemon to itself".to_owned(),
+        ));
+    }
     let (record, content) = find_incoming_torrent(remote.info_hash, services).await?;
     if record.completed_pieces.len() != content.pieces.div_ceil(8) {
         return Err(ActorError::Peer(
@@ -1480,7 +1944,7 @@ where
         interested: false,
         remote_metadata_id: None,
         remote_holepunch_id: None,
-        cached_piece: None,
+        remote_request_queue: None,
     };
     if record.state == TorrentState::Downloading
         && let Some(route) = services
@@ -1529,7 +1993,8 @@ struct IncomingSeed {
     interested: bool,
     remote_metadata_id: Option<u8>,
     remote_holepunch_id: Option<u8>,
-    cached_piece: Option<(usize, Bytes)>,
+    /// Outstanding requests the remote will queue for us (`reqq`).
+    remote_request_queue: Option<usize>,
 }
 
 struct PeerUploadContext {
@@ -1540,6 +2005,7 @@ struct PeerUploadContext {
     _guard: UploadSessionGuard,
 }
 
+#[allow(clippy::too_many_lines)] // One arm per inbound wire message keeps the upload protocol adjacent.
 async fn run_incoming_peer(
     peer: &mut PeerConnection,
     address: SocketAddr,
@@ -1595,6 +2061,10 @@ async fn run_incoming_peer(
                     .map_err(|error| ActorError::Peer(error.to_string()))?;
                 seed.remote_metadata_id = handshake.metadata_extension_id;
                 seed.remote_holepunch_id = handshake.holepunch_extension_id;
+                seed.remote_request_queue = handshake.request_queue;
+                if let Some(ip) = handshake.your_ip {
+                    learn_self_address(services, ip);
+                }
                 if let Some(extension_id) = handshake.holepunch_extension_id {
                     services.rendezvous.lock().await.insert(
                         (remote.info_hash, address),
@@ -1715,6 +2185,10 @@ async fn handle_peer_upload_event(
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
             upload.seed.remote_metadata_id = handshake.metadata_extension_id;
             upload.seed.remote_holepunch_id = handshake.holepunch_extension_id;
+            upload.seed.remote_request_queue = handshake.request_queue;
+            if let Some(ip) = handshake.your_ip {
+                learn_self_address(services, ip);
+            }
             peer.send(PeerMessage::Extended {
                 extension_id: 0,
                 payload: encode_extension_handshake(Some(upload.seed.content.info.len())),
@@ -1780,7 +2254,7 @@ async fn handle_seed_holepunch(
                 interested: false,
                 remote_metadata_id: None,
                 remote_holepunch_id: None,
-                cached_piece: None,
+                remote_request_queue: None,
             };
             let services = services.clone();
             let tasks = services.tasks.clone();
@@ -1847,12 +2321,16 @@ async fn serve_hole_punched_seed(
     seed: IncomingSeed,
     services: &Services,
 ) -> Result<(), ActorError> {
-    let _permit = services
-        .peer_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| ActorError::Cancelled)?;
+    let _outbound_permit = tokio::select! {
+        () = services.shutdown.cancelled() => return Err(ActorError::Cancelled),
+        permit = services.outbound_slots.clone().acquire_owned() => permit,
+    }
+    .map_err(|_| ActorError::Cancelled)?;
+    let _permit = tokio::select! {
+        () = services.shutdown.cancelled() => return Err(ActorError::Cancelled),
+        permit = services.peer_slots.clone().acquire_owned() => permit,
+    }
+    .map_err(|_| ActorError::Cancelled)?;
     let endpoint = services
         .utp
         .as_ref()
@@ -1952,102 +2430,100 @@ async fn serve_piece_request(
     {
         return reject_request(peer, remote, request).await;
     }
-    if seed
-        .cached_piece
-        .as_ref()
-        .is_none_or(|(piece, _)| *piece != index)
-    {
+    let cached = seed
+        .content
+        .cache
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.get(index));
+    let data = if let Some(data) = cached {
+        data
+    } else {
         let Some(data) = read_piece(&seed.content.metainfo, index, &services.storage).await? else {
             return reject_request(peer, remote, request).await;
         };
-        if !verify_piece(&seed.content.metainfo, index, &data)? {
+        let verification = prepare_verification(&seed.content.metainfo, index, data.len())?;
+        if !verify_piece_offloaded(services, verification, data.clone()).await? {
             return Err(ActorError::Peer(
                 "refusing to upload a corrupt completed piece".to_owned(),
             ));
         }
-        seed.cached_piece = Some((index, data));
-    }
+        if let Ok(mut cache) = seed.content.cache.lock() {
+            cache.insert(index, data.clone());
+        }
+        data
+    };
     let begin = usize::try_from(request.begin).map_err(|_| ActorError::Arithmetic)?;
     let end = begin.checked_add(length).ok_or(ActorError::Arithmetic)?;
-    let Some(block) = seed
-        .cached_piece
-        .as_ref()
-        .and_then(|(_, piece)| piece.get(begin..end))
-    else {
+    if end > data.len() {
         return reject_request(peer, remote, request).await;
-    };
+    }
+    let block = data.slice(begin..end);
+    let uploaded = u64::try_from(block.len()).map_err(|_| ActorError::Arithmetic)?;
+    throttle_upload(services, uploaded).await;
     peer.send(PeerMessage::Piece {
         piece: request.piece,
         begin: request.begin,
-        block: Bytes::copy_from_slice(block),
+        block,
     })
     .await
     .map_err(|error| ActorError::Peer(error.to_string()))?;
-    let uploaded = u64::try_from(block.len()).map_err(|_| ActorError::Arithmetic)?;
     record_uploaded_block(services, seed.torrent_id, uploaded);
     record_peer_upload(services, seed.torrent_id, upload, uploaded);
     Ok(())
 }
 
+/// Resolves an incoming info hash to its active torrent and parsed content
+/// through the store's in-memory index, parsing the metainfo at most once per
+/// torrent activation.
 async fn find_incoming_torrent(
     info_hash: Sha1Hash,
     services: &Services,
 ) -> Result<(TorrentRecord, Arc<IncomingContent>), ActorError> {
-    for record in services.store.list_torrents().await? {
-        if !matches!(
-            record.state,
-            TorrentState::Downloading | TorrentState::Seeding
-        ) || record.raw_metainfo.is_empty()
-            || stored_wire_info_hash(&record) != Some(info_hash)
-        {
-            continue;
-        }
-        if let Some(content) = services
-            .incoming_content
-            .lock()
-            .await
-            .get(&record.id)
-            .and_then(Weak::upgrade)
-        {
-            return Ok((record, content));
-        }
-        let metainfo = Metainfo::parse(
-            &record.raw_metainfo,
-            BencodeLimits {
-                input_bytes: services.metainfo_limit,
-                byte_string_bytes: services.metainfo_limit,
-                ..BencodeLimits::default()
-            },
-        )
-        .map_err(|error| ActorError::Metainfo(error.to_string()))?;
-        let content = Arc::new(IncomingContent {
-            pieces: piece_count(&metainfo)?,
-            info: raw_info_dictionary(&record.raw_metainfo, services.metainfo_limit)?,
-            metainfo,
-        });
-        let mut cache = services.incoming_content.lock().await;
-        let content = cache
-            .get(&record.id)
-            .and_then(Weak::upgrade)
-            .unwrap_or_else(|| {
-                cache.insert(record.id, Arc::downgrade(&content));
-                content
-            });
+    let inactive = || ActorError::Peer("incoming info hash is not active".to_owned());
+    let id = services
+        .store
+        .find_by_wire_hash(info_hash)
+        .await?
+        .ok_or_else(inactive)?;
+    let record = services.store.get_summary(id).await?.ok_or_else(inactive)?;
+    if !matches!(
+        record.state,
+        TorrentState::Downloading | TorrentState::Seeding
+    ) {
+        return Err(inactive());
+    }
+    if let Some(content) = services.incoming_content.lock().await.get(&id).cloned() {
         return Ok((record, content));
     }
-    Err(ActorError::Peer(
-        "incoming info hash is not active".to_owned(),
-    ))
+    let raw = services
+        .store
+        .get_metainfo(id)
+        .await?
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(inactive)?;
+    let metainfo = Metainfo::parse(
+        &raw,
+        BencodeLimits {
+            input_bytes: services.metainfo_limit,
+            byte_string_bytes: services.metainfo_limit,
+            ..BencodeLimits::default()
+        },
+    )
+    .map_err(|error| ActorError::Metainfo(error.to_string()))?;
+    let content = Arc::new(IncomingContent {
+        pieces: piece_count(&metainfo)?,
+        info: raw_info_dictionary(&raw, services.metainfo_limit)?,
+        metainfo,
+        cache: std::sync::Mutex::new(PieceCache::new(services.piece_cache_budget.clone())),
+    });
+    let mut cache = services.incoming_content.lock().await;
+    let content = cache.entry(id).or_insert(content).clone();
+    Ok((record, content))
 }
 
 fn stored_wire_info_hash(record: &TorrentRecord) -> Option<Sha1Hash> {
-    record.v1_info_hash.or_else(|| {
-        record.v2_info_hash.map(|hash| {
-            let mut truncated = [0_u8; 20];
-            truncated.copy_from_slice(&hash.as_bytes()[..20]);
-            Sha1Hash::from_bytes(truncated)
-        })
-    })
+    dendrite_persistence::wire_info_hash(record)
 }
 
 fn raw_info_dictionary(raw: &[u8], limit: usize) -> Result<Bytes, ActorError> {
@@ -2248,6 +2724,7 @@ async fn supervisor(
             }
             EngineCommand::Forget { id, reply } => {
                 stop_actor(&mut active, id).await;
+                services.incoming_content.lock().await.remove(&id);
                 let _result_ignored = reply.send(());
             }
             EngineCommand::Shutdown { reply } => {
@@ -2716,7 +3193,7 @@ async fn fetch_metadata(
     (
         Vec<u8>,
         PeerConnection,
-        tokio::sync::OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
         ConnectionGuard,
     ),
     ActorError,
@@ -2802,7 +3279,7 @@ async fn fetch_metadata(
 async fn acquire_metadata_slot(
     services: &Services,
     cancellation: &CancellationToken,
-) -> Result<tokio::sync::OwnedSemaphorePermit, ActorError> {
+) -> Result<OwnedSemaphorePermit, ActorError> {
     tokio::select! {
         () = cancellation.cancelled() => Err(ActorError::Cancelled),
         permit = services.metadata_slots.clone().acquire_owned() => {
@@ -3061,15 +3538,24 @@ async fn download(
         }
         download_from_web_seeds(metainfo, record, services, cancellation).await?;
     }
-    let state = completion_state(record);
+    let state = completion_state(record, services).await?;
     update_record_state(record, state, services).await
 }
 
-const fn completion_state(record: &TorrentRecord) -> TorrentState {
+async fn completion_state(
+    record: &mut TorrentRecord,
+    services: &Services,
+) -> Result<TorrentState, ActorError> {
+    record.stop_on_complete = services
+        .store
+        .get_torrent(record.id)
+        .await?
+        .ok_or(ActorError::Missing)?
+        .stop_on_complete;
     if record.stop_on_complete {
-        TorrentState::Stopped
+        Ok(TorrentState::Stopped)
     } else {
-        TorrentState::Seeding
+        Ok(TorrentState::Seeding)
     }
 }
 
@@ -3478,9 +3964,9 @@ async fn run_peer_swarm_with_discovery(
     let (incoming_sender, mut incoming_peers) =
         mpsc::channel(services.per_torrent_peer_limit.max(1));
     let _incoming_guard = register_incoming_swarm(record.id, incoming_sender, services);
-    let pieces = swarm.piece_count;
     let mut discovery_error = None;
     let mut writes = FuturesUnordered::<PieceWriteFuture<'_>>::new();
+    let mut verifications = FuturesUnordered::<PieceVerifyFuture<'_>>::new();
     let mut flush_tasks = FuturesUnordered::<PieceFlushFuture<'_>>::new();
     let mut pending_pieces = Vec::new();
     let mut pending_paths = HashSet::new();
@@ -3496,20 +3982,19 @@ async fn run_peer_swarm_with_discovery(
             shutdown_swarm(&swarm);
             return Err(ActorError::Cancelled);
         }
-        let pending_io =
-            !writes.is_empty() || !flush_tasks.is_empty() || !pending_pieces.is_empty();
-        if all_complete(&record.completed_pieces, pieces) && !pending_io {
-            stop_workers(&swarm.workers, &swarm.assignments);
+        let pending_io = !writes.is_empty()
+            || !verifications.is_empty()
+            || !flush_tasks.is_empty()
+            || !pending_pieces.is_empty();
+        if swarm.picker.remaining() == 0 && !pending_io {
+            stop_workers(&swarm.workers);
             return Ok(());
         }
         fill_peer_slots(&mut swarm);
-        let scheduled = schedule_pieces(
-            &mut swarm.workers,
-            &mut swarm.assignments,
-            &mut swarm.picker,
-            metainfo,
-        )?;
-        if scheduled == 0 && swarm_is_exhausted(&swarm, discovery.is_none(), pending_io) {
+        if std::mem::take(&mut swarm.schedule_dirty) {
+            schedule_pieces(&mut swarm, metainfo)?;
+        }
+        if swarm_is_exhausted(&swarm, discovery.is_none(), pending_io) {
             shutdown_swarm(&swarm);
             if let Some(error) = discovery_error {
                 return Err(error);
@@ -3532,6 +4017,9 @@ async fn run_peer_swarm_with_discovery(
             event = receive_discovery_event(&mut discovery), if discovery.is_some() => {
                 SwarmLoopEvent::Discovery(event)
             },
+            verified = verifications.next(), if !verifications.is_empty() => {
+                SwarmLoopEvent::Verified(verified.ok_or(ActorError::Arithmetic)?)
+            },
             stored = writes.next(), if !writes.is_empty() => {
                 SwarmLoopEvent::Stored(stored.ok_or(ActorError::Arithmetic)?)
             },
@@ -3550,10 +4038,22 @@ async fn run_peer_swarm_with_discovery(
                 piece,
                 result,
             }) => {
-                if let Some(data) =
-                    prepare_piece_result(&mut swarm, worker, piece, result, metainfo, record)?
+                if let Some(data) = prepare_piece_result(&mut swarm, worker, piece, result, record)?
                 {
-                    queue_piece_write(&mut writes, worker, piece, data, metainfo, services);
+                    queue_piece_verification(
+                        &mut verifications,
+                        worker,
+                        piece,
+                        data,
+                        metainfo,
+                        services,
+                    )?;
+                }
+            }
+            SwarmLoopEvent::Verified(verified) => {
+                if let Some(data) = accept_verified_piece(&mut swarm, verified)? {
+                    let (worker, piece) = (data.0, data.1);
+                    queue_piece_write(&mut writes, worker, piece, data.2, metainfo, services);
                 }
             }
             SwarmLoopEvent::Worker(event) => {
@@ -3636,6 +4136,86 @@ fn register_incoming_swarm(
     }
 }
 
+fn queue_piece_verification<'a>(
+    verifications: &mut FuturesUnordered<PieceVerifyFuture<'a>>,
+    worker: usize,
+    piece: usize,
+    data: Bytes,
+    metainfo: &Metainfo,
+    services: &'a Services,
+) -> Result<(), ActorError> {
+    let verification = prepare_verification(metainfo, piece, data.len())?;
+    verifications.push(Box::pin(async move {
+        let result = verify_piece_offloaded(services, verification, data.clone()).await;
+        PieceVerifyResult {
+            worker,
+            piece,
+            data,
+            result,
+        }
+    }));
+    Ok(())
+}
+
+/// Applies a verification outcome: a corrupt piece penalises and drops the
+/// peer, a duplicate of a piece already being written is discarded, and a
+/// fresh valid piece is claimed for writing while duplicate requests on other
+/// workers are cancelled.
+fn accept_verified_piece(
+    swarm: &mut SwarmState,
+    verified: PieceVerifyResult,
+) -> Result<Option<(usize, usize, Bytes)>, ActorError> {
+    let PieceVerifyResult {
+        worker,
+        piece,
+        data,
+        result,
+    } = verified;
+    let reserved = data.len();
+    swarm.schedule_dirty = true;
+    if !result? {
+        if let Some(peer) = swarm
+            .workers
+            .get(&worker)
+            .and_then(|handle| handle.peer_key)
+        {
+            record_peer_failure(&swarm.services, swarm.torrent_id, peer);
+        }
+        swarm
+            .picker
+            .mark_request_failed(piece)
+            .map_err(|error| ActorError::Peer(error.to_string()))?;
+        swarm.last_error = Some(format!("piece {piece} failed its integrity check"));
+        swarm.budget.release(reserved);
+        remove_worker(swarm, worker)?;
+        return Ok(None);
+    }
+    if !swarm.writing.insert(piece) {
+        swarm
+            .picker
+            .mark_request_failed(piece)
+            .map_err(|error| ActorError::Peer(error.to_string()))?;
+        swarm.budget.release(reserved);
+        return Ok(None);
+    }
+    swarm
+        .picker
+        .set_enabled(piece, piece.saturating_add(1), false)
+        .map_err(|error| ActorError::Peer(error.to_string()))?;
+    for (other, assignments) in &swarm.assignments {
+        if assignments
+            .iter()
+            .any(|assignment| assignment.piece == piece)
+            && let Some(handle) = swarm.workers.get(other)
+        {
+            let _result_ignored = handle
+                .commands
+                .try_send(PeerWorkerCommand::Cancel { piece });
+        }
+    }
+    Ok(Some((worker, piece, data)))
+}
+
 fn queue_piece_write<'a>(
     writes: &mut FuturesUnordered<PieceWriteFuture<'a>>,
     worker: usize,
@@ -3707,6 +4287,8 @@ fn initialize_swarm(
         workers: HashMap::with_capacity(services.per_torrent_peer_limit),
         assignments: HashMap::new(),
         picker,
+        budget: BudgetAccount::new(services.download_budget.clone()),
+        schedule_dirty: true,
         connecting: 0,
         last_error: None,
         writing: HashSet::new(),
@@ -3739,7 +4321,7 @@ async fn receive_discovery_event(
 
 fn shutdown_swarm(swarm: &SwarmState) {
     swarm.cancellation.cancel();
-    stop_workers(&swarm.workers, &swarm.assignments);
+    stop_workers(&swarm.workers);
 }
 
 fn enqueue_peer_candidates(
@@ -3748,8 +4330,19 @@ fn enqueue_peer_candidates(
     force_utp: bool,
 ) {
     for address in peers {
+        if is_self_candidate(&swarm.services, address) {
+            continue;
+        }
         let candidate = PeerCandidate { address, force_utp };
+        if swarm.known_candidates.len() >= KNOWN_CANDIDATE_LIMIT {
+            // Reset the deduplication window rather than grow without bound;
+            // a returning address is simply retried later.
+            swarm.known_candidates.clear();
+        }
         if swarm.known_candidates.insert(candidate) {
+            if swarm.candidates.len() >= QUEUED_CANDIDATE_LIMIT {
+                swarm.candidates.pop_front();
+            }
             swarm.candidates.push_back(candidate);
         }
     }
@@ -3786,6 +4379,10 @@ fn spawn_swarm_worker(swarm: &mut SwarmState, candidate: PeerCandidate) {
             connected_at: Instant::now(),
             last_verified: None,
             cancellation: cancellation.clone(),
+            assigned_bytes: 0,
+            target_bytes: ASSIGNMENT_TARGET_MIN,
+            wants_more: false,
+            skip_generation: None,
         },
     );
     swarm.connecting = swarm.connecting.saturating_add(1);
@@ -3827,6 +4424,10 @@ fn spawn_incoming_swarm_worker(swarm: &mut SwarmState, incoming: IncomingDownloa
             connected_at: Instant::now(),
             last_verified: None,
             cancellation: cancellation.clone(),
+            assigned_bytes: 0,
+            target_bytes: ASSIGNMENT_TARGET_MIN,
+            wants_more: false,
+            skip_generation: None,
         },
     );
     swarm.connecting = swarm.connecting.saturating_add(1);
@@ -3853,10 +4454,28 @@ fn per_torrent_peer_limit(global_limit: usize) -> usize {
     global_limit.div_ceil(4).clamp(1, ACTIVE_PEER_LIMIT)
 }
 
+fn outbound_connection_limit(global_limit: usize) -> usize {
+    if global_limit == 1 {
+        return 1;
+    }
+    let inbound_reserve = global_limit.div_ceil(4).clamp(1, INCOMING_PEER_LIMIT);
+    global_limit.saturating_sub(inbound_reserve).max(1)
+}
+
 fn useful_piece_count(remote: &[u8], local: &[u8], pieces: usize) -> usize {
-    (0..pieces)
-        .filter(|piece| bit_is_set(remote, *piece) && !bit_is_set(local, *piece))
-        .count()
+    let bytes = pieces.div_ceil(8);
+    let spare = bytes.saturating_mul(8).saturating_sub(pieces);
+    let mut useful = 0_usize;
+    for index in 0..bytes {
+        let remote_byte = remote.get(index).copied().unwrap_or(0);
+        let local_byte = local.get(index).copied().unwrap_or(0);
+        let mut word = remote_byte & !local_byte;
+        if index + 1 == bytes && spare > 0 {
+            word &= 0xff_u8 << spare;
+        }
+        useful += word.count_ones() as usize;
+    }
+    useful
 }
 
 fn peer_retention_score(handle: &PeerWorkerHandle, reputation: Option<PeerReputation>) -> u128 {
@@ -3908,7 +4527,7 @@ fn enforce_peer_limit(swarm: &mut SwarmState) -> Result<(), ActorError> {
         let Some(worker) = lowest_idle_worker(swarm, true) else {
             break;
         };
-        remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
+        remove_worker(swarm, worker)?;
     }
     Ok(())
 }
@@ -3928,11 +4547,12 @@ fn retain_productive_peers(swarm: &mut SwarmState) -> Result<(), ActorError> {
                 .is_none_or(|verified| verified.elapsed() >= Duration::from_secs(60))
     });
     if seeds < PREFERRED_SEED_PEERS || audition_candidate {
-        remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
+        remove_worker(swarm, worker)?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // One match arm per worker event keeps the state transitions adjacent.
 fn handle_worker_event(
     swarm: &mut SwarmState,
     event: PeerWorkerEvent,
@@ -3964,7 +4584,18 @@ fn handle_worker_event(
                 handle.seed = seed;
                 handle.useful_pieces = useful_pieces;
                 handle.connected_at = Instant::now();
+                handle.skip_generation = None;
+                set_session_interesting(
+                    &swarm.services,
+                    swarm.torrent_id,
+                    PeerKey {
+                        ip: handle.address.ip(),
+                        peer_id,
+                    },
+                    useful_pieces > 0,
+                );
             }
+            swarm.schedule_dirty = true;
             enqueue_peer_candidates(swarm, peers, false);
             enforce_peer_limit(swarm)?;
         }
@@ -3980,13 +4611,7 @@ fn handle_worker_event(
                     .get(&worker)
                     .is_some_and(|handle| handle.bitfield.is_none()),
             ));
-            if let Some((piece, _)) = swarm.assignments.remove(&worker) {
-                swarm
-                    .picker
-                    .mark_request_failed(piece)
-                    .map_err(|failure| ActorError::Peer(failure.to_string()))?;
-            }
-            remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
+            remove_worker(swarm, worker)?;
             swarm.last_error = Some(error);
         }
         PeerWorkerEvent::Peers { worker, peers } => {
@@ -4013,6 +4638,16 @@ fn handle_worker_event(
                     .picker
                     .add_peer_piece(piece)
                     .map_err(|error| ActorError::Peer(error.to_string()))?;
+                if !bit_is_set(&record.completed_pieces, piece) {
+                    handle.useful_pieces = handle.useful_pieces.saturating_add(1);
+                    if handle.useful_pieces == 1
+                        && let Some(peer) = handle.peer_key
+                    {
+                        set_session_interesting(&swarm.services, swarm.torrent_id, peer, true);
+                    }
+                }
+                handle.skip_generation = None;
+                swarm.schedule_dirty = true;
             }
             if bit_is_set(&record.completed_pieces, piece) {
                 let _result_ignored = handle.commands.try_send(PeerWorkerCommand::Have {
@@ -4024,6 +4659,19 @@ fn handle_worker_event(
             if let Some(handle) = swarm.workers.get_mut(&worker) {
                 handle.choked = choked;
             }
+            if !choked {
+                swarm.schedule_dirty = true;
+            }
+        }
+        PeerWorkerEvent::NeedPieces {
+            worker,
+            rate_bytes_per_second,
+        } => {
+            if let Some(handle) = swarm.workers.get_mut(&worker) {
+                handle.wants_more = true;
+                handle.target_bytes = assignment_target(rate_bytes_per_second);
+            }
+            swarm.schedule_dirty = true;
         }
         PeerWorkerEvent::HolePunch { worker, address } => {
             if swarm.workers.contains_key(&worker) {
@@ -4326,7 +4974,18 @@ async fn discover_tracker_peers(
 }
 
 async fn peer_worker(context: PeerWorkerContext, commands: mpsc::Receiver<PeerWorkerCommand>) {
-    let Ok(_permit) = context.services.peer_slots.clone().acquire_owned().await else {
+    let outbound_permit = tokio::select! {
+        () = context.cancellation.cancelled() => return,
+        permit = context.services.outbound_slots.clone().acquire_owned() => permit,
+    };
+    let Ok(_outbound_permit) = outbound_permit else {
+        return;
+    };
+    let permit = tokio::select! {
+        () = context.cancellation.cancelled() => return,
+        permit = context.services.peer_slots.clone().acquire_owned() => permit,
+    };
+    let Ok(_permit) = permit else {
         return;
     };
     let Some((peer, seed, upload)) = establish_peer_worker(&context).await else {
@@ -4341,74 +5000,179 @@ async fn peer_worker(context: PeerWorkerContext, commands: mpsc::Receiver<PeerWo
     run_ready_peer_worker(&context, commands, peer, upload).await;
 }
 
+/// A piece queued on a worker: blocks are requested from `next_begin`, the
+/// buffer is allocated lazily on the first block, and the piece is reported
+/// complete when every byte has arrived.
+struct QueuedPiece {
+    piece: u32,
+    length: usize,
+    next_begin: usize,
+    received: usize,
+    buffer: Option<Vec<u8>>,
+}
+
+/// Per-peer request pipeline spanning piece boundaries.
+struct DownloadPipeline {
+    queue: VecDeque<QueuedPiece>,
+    pending: HashMap<(u32, u32), u32>,
+    limit_blocks: usize,
+    /// Outstanding requests the remote advertised it will queue (`reqq`).
+    remote_limit: usize,
+    rate: RateEstimator,
+    want_sent: bool,
+    active: Option<ActiveDownloadGuard>,
+}
+
+impl DownloadPipeline {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            pending: HashMap::new(),
+            limit_blocks: BLOCK_PIPELINE,
+            remote_limit: usize::MAX,
+            rate: RateEstimator::new(),
+            want_sent: false,
+            active: None,
+        }
+    }
+
+    fn unrequested_bytes(&self) -> usize {
+        self.queue
+            .iter()
+            .map(|queued| queued.length.saturating_sub(queued.next_begin))
+            .sum()
+    }
+}
+
+/// Exponentially weighted bytes-per-second estimate sampled every
+/// `RATE_SAMPLE_INTERVAL`.
+struct RateEstimator {
+    window_start: Instant,
+    window_bytes: u64,
+    rate: u64,
+}
+
+impl RateEstimator {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            window_bytes: 0,
+            rate: 0,
+        }
+    }
+
+    fn observe(&mut self, bytes: usize) {
+        self.window_bytes = self
+            .window_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= RATE_SAMPLE_INTERVAL {
+            let millis = u64::try_from(elapsed.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let sample = self.window_bytes.saturating_mul(1000) / millis;
+            self.rate = if self.rate == 0 {
+                sample
+            } else {
+                (self.rate.saturating_mul(3).saturating_add(sample)) / 4
+            };
+            self.window_bytes = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    const fn bytes_per_second(&self) -> u64 {
+        self.rate
+    }
+}
+
+fn pipeline_limit(rate_bytes_per_second: u64) -> usize {
+    let wanted = rate_bytes_per_second.saturating_mul(PIPELINE_TARGET_SECONDS)
+        / u64::try_from(BLOCK_BYTES).unwrap_or(u64::MAX);
+    usize::try_from(wanted)
+        .unwrap_or(usize::MAX)
+        .clamp(BLOCK_PIPELINE, BLOCK_PIPELINE_MAX)
+}
+
+#[allow(clippy::too_many_lines)] // The select loop owns every command and wire transition of a peer.
 async fn run_ready_peer_worker(
     context: &PeerWorkerContext,
     mut commands: mpsc::Receiver<PeerWorkerCommand>,
     mut peer: PeerConnection,
     mut upload: Option<PeerUploadContext>,
 ) {
+    let mut pipeline = DownloadPipeline::new();
+    let forwarder = peer_event_forwarder(context);
     loop {
+        if let Some(limit) = upload
+            .as_ref()
+            .and_then(|upload| upload.seed.remote_request_queue)
+        {
+            pipeline.remote_limit = limit.max(1);
+            pipeline.limit_blocks = pipeline.limit_blocks.min(pipeline.remote_limit);
+        }
+        if let Err(error) = fill_request_pipeline(&peer, &mut pipeline, context).await {
+            report_worker_failure(context, &mut pipeline, error).await;
+            break;
+        }
+        let timeout = if pipeline.pending.is_empty() {
+            context.services.peer_message_timeout.saturating_mul(4)
+        } else {
+            context.services.peer_message_timeout
+        };
         let input = tokio::select! {
             () = context.cancellation.cancelled() => break,
             command = commands.recv() => match command {
                 Some(command) => PeerWorkerInput::Command(command),
                 None => break,
             },
-            event = next_peer_event_with_timeout(
-                &mut peer,
-                context.services.peer_message_timeout.saturating_mul(4),
-            ) => match event {
+            event = next_peer_event_with_timeout(&mut peer, timeout) => match event {
                 Ok(event) => PeerWorkerInput::Event(event),
                 Err(error) => {
-                    let _result_ignored = context.events.send(PeerWorkerEvent::Gone {
-                        worker: context.worker,
-                        error: error.to_string(),
-                    }).await;
+                    report_worker_failure(context, &mut pipeline, error).await;
                     break;
                 }
             },
         };
         match input {
-            PeerWorkerInput::Command(PeerWorkerCommand::Download {
-                piece,
-                length,
-                cancellation: piece_cancellation,
-            }) => {
-                let _active = track_active_download(&context.services, context.torrent_id);
-                let result = match download_piece_blocks(
-                    &mut peer,
+            PeerWorkerInput::Command(PeerWorkerCommand::Download { piece, length }) => {
+                let Ok(piece) = u32::try_from(piece) else {
+                    report_worker_failure(context, &mut pipeline, ActorError::Arithmetic).await;
+                    break;
+                };
+                pipeline.queue.push_back(QueuedPiece {
                     piece,
                     length,
-                    &piece_cancellation,
-                    context.services.peer_message_timeout,
-                    peer_event_forwarder(context),
-                    upload.as_mut(),
-                )
-                .await
-                {
-                    Ok(data) => PieceResult::Data(data),
-                    Err(ActorError::Cancelled) => PieceResult::Cancelled,
-                    Err(error) => {
-                        debug!(
-                            address = %context.address,
-                            piece,
-                            %error,
-                            "piece download failed"
-                        );
-                        PieceResult::Failed(error.to_string())
-                    }
+                    next_begin: 0,
+                    received: 0,
+                    buffer: None,
+                });
+                pipeline.want_sent = false;
+                if pipeline.active.is_none() {
+                    pipeline.active =
+                        Some(track_active_download(&context.services, context.torrent_id));
+                }
+            }
+            PeerWorkerInput::Command(PeerWorkerCommand::Cancel { piece }) => {
+                pipeline.want_sent = false;
+                let Ok(wire_piece) = u32::try_from(piece) else {
+                    continue;
                 };
-                let failed = matches!(result, PieceResult::Failed(_));
+                if !cancel_queued_piece(&peer, &mut pipeline, wire_piece).await {
+                    continue;
+                }
+                if pipeline.queue.is_empty() {
+                    pipeline.active = None;
+                }
                 if context
                     .events
                     .send(PeerWorkerEvent::Complete {
                         worker: context.worker,
                         piece,
-                        result,
+                        result: PieceResult::Cancelled,
                     })
                     .await
                     .is_err()
-                    || failed
                 {
                     break;
                 }
@@ -4432,6 +5196,101 @@ async fn run_ready_peer_worker(
                 }
             }
             PeerWorkerInput::Command(PeerWorkerCommand::Shutdown) => break,
+            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Piece {
+                piece,
+                begin,
+                block,
+            })) => match receive_block(&mut pipeline, piece, begin, &block, &forwarder) {
+                Ok(Some((piece, data))) => {
+                    if pipeline.queue.is_empty() {
+                        pipeline.active = None;
+                    }
+                    if context
+                        .events
+                        .send(PeerWorkerEvent::Complete {
+                            worker: context.worker,
+                            piece,
+                            result: PieceResult::Data(data),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    report_worker_failure(context, &mut pipeline, error).await;
+                    break;
+                }
+            },
+            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Choke)) => {
+                // BEP 3: a choke discards every outstanding request. Return the
+                // queued pieces to the picker and keep the connection so an
+                // unchoke can resume without a reconnect.
+                pipeline.pending.clear();
+                pipeline.want_sent = false;
+                pipeline.active = None;
+                let mut lost = false;
+                for queued in pipeline.queue.drain(..) {
+                    if context
+                        .events
+                        .send(PeerWorkerEvent::Complete {
+                            worker: context.worker,
+                            piece: queued.piece as usize,
+                            result: PieceResult::Cancelled,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        lost = true;
+                        break;
+                    }
+                }
+                if lost
+                    || context
+                        .events
+                        .send(PeerWorkerEvent::ChokeState {
+                            worker: context.worker,
+                            choked: true,
+                        })
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            PeerWorkerInput::Event(PeerEvent::Message(PeerMessage::Unchoke)) => {
+                if context
+                    .events
+                    .send(PeerWorkerEvent::ChokeState {
+                        worker: context.worker,
+                        choked: false,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            PeerWorkerInput::Event(PeerEvent::Disconnected) => {
+                let error = if pipeline.queue.is_empty() {
+                    "peer disconnected".to_owned()
+                } else {
+                    "peer disconnected during piece transfer".to_owned()
+                };
+                report_worker_failure(context, &mut pipeline, ActorError::Peer(error)).await;
+                break;
+            }
+            PeerWorkerInput::Event(PeerEvent::Failed(error)) => {
+                let error = if pipeline.queue.is_empty() {
+                    error
+                } else {
+                    format!("peer session failed during piece transfer: {error}")
+                };
+                report_worker_failure(context, &mut pipeline, ActorError::Peer(error)).await;
+                break;
+            }
             PeerWorkerInput::Event(event) => {
                 if !forward_idle_peer_event(context, &peer, upload.as_mut(), event).await {
                     break;
@@ -4440,6 +5299,129 @@ async fn run_ready_peer_worker(
         }
     }
     peer.shutdown();
+}
+
+/// Reports a fatal worker error: as a failed piece when pieces were queued (the
+/// actor then drops the worker and returns the rest), otherwise as `Gone`.
+async fn report_worker_failure(
+    context: &PeerWorkerContext,
+    pipeline: &mut DownloadPipeline,
+    error: ActorError,
+) {
+    pipeline.pending.clear();
+    pipeline.active = None;
+    let event = if let Some(queued) = pipeline.queue.pop_front() {
+        debug!(
+            address = %context.address,
+            piece = queued.piece,
+            %error,
+            "piece download failed"
+        );
+        PeerWorkerEvent::Complete {
+            worker: context.worker,
+            piece: queued.piece as usize,
+            result: PieceResult::Failed(error.to_string()),
+        }
+    } else {
+        PeerWorkerEvent::Gone {
+            worker: context.worker,
+            error: error.to_string(),
+        }
+    };
+    let _result_ignored = context.events.send(event).await;
+}
+
+/// Drops a queued piece and cancels its outstanding requests on the wire.
+/// Returns `false` when the piece was not queued (already completed).
+async fn cancel_queued_piece(
+    peer: &PeerConnection,
+    pipeline: &mut DownloadPipeline,
+    piece: u32,
+) -> bool {
+    let Some(position) = pipeline
+        .queue
+        .iter()
+        .position(|queued| queued.piece == piece)
+    else {
+        return false;
+    };
+    pipeline.queue.remove(position);
+    let mut cancelled = Vec::new();
+    pipeline.pending.retain(|(pending_piece, begin), length| {
+        if *pending_piece == piece {
+            cancelled.push((*begin, *length));
+            false
+        } else {
+            true
+        }
+    });
+    cancelled.sort_unstable();
+    for (begin, length) in cancelled {
+        let _result_ignored = peer
+            .send(PeerMessage::Cancel(BlockRequest {
+                piece,
+                begin,
+                length,
+            }))
+            .await;
+    }
+    true
+}
+
+fn receive_block(
+    pipeline: &mut DownloadPipeline,
+    piece: u32,
+    begin: u32,
+    block: &Bytes,
+    forwarder: &PeerEventForwarder<'_>,
+) -> Result<Option<(usize, Bytes)>, ActorError> {
+    let expected = pipeline
+        .pending
+        .remove(&(piece, begin))
+        .ok_or_else(|| ActorError::Peer("peer returned an unsolicited block".to_owned()))?;
+    if usize::try_from(expected).ok() != Some(block.len()) {
+        return Err(ActorError::Peer(
+            "peer returned a block with the wrong length".to_owned(),
+        ));
+    }
+    let position = pipeline
+        .queue
+        .iter()
+        .position(|queued| queued.piece == piece)
+        .ok_or_else(|| ActorError::Peer("peer returned a block for another piece".to_owned()))?;
+    let queued = pipeline
+        .queue
+        .get_mut(position)
+        .ok_or(ActorError::Arithmetic)?;
+    let start = usize::try_from(begin).map_err(|_| ActorError::Arithmetic)?;
+    let end = start
+        .checked_add(block.len())
+        .filter(|end| *end <= queued.length)
+        .ok_or(ActorError::Arithmetic)?;
+    let length = queued.length;
+    let buffer = queued.buffer.get_or_insert_with(|| vec![0_u8; length]);
+    buffer
+        .get_mut(start..end)
+        .ok_or(ActorError::Arithmetic)?
+        .copy_from_slice(block);
+    queued.received = queued
+        .received
+        .checked_add(block.len())
+        .ok_or(ActorError::Arithmetic)?;
+    pipeline.rate.observe(block.len());
+    pipeline.limit_blocks = pipeline_limit(pipeline.rate.bytes_per_second())
+        .min(pipeline.remote_limit)
+        .max(1);
+    record_downloaded_block(forwarder, block.len());
+    if queued.received < queued.length {
+        return Ok(None);
+    }
+    let done = pipeline
+        .queue
+        .remove(position)
+        .ok_or(ActorError::Arithmetic)?;
+    let data = Bytes::from(done.buffer.unwrap_or_default());
+    Ok(Some((done.piece as usize, data)))
 }
 
 async fn promoted_incoming_peer_worker(
@@ -4522,12 +5504,8 @@ async fn promoted_incoming_peer_worker(
 
 fn peer_event_forwarder(context: &PeerWorkerContext) -> PeerEventForwarder<'_> {
     PeerEventForwarder {
-        services: &context.services,
-        events: &context.events,
         activity: &context.services.torrent_activity,
         torrent_id: context.torrent_id,
-        worker: context.worker,
-        allow_extensions: context.allow_pex,
     }
 }
 
@@ -4682,6 +5660,12 @@ async fn connect_peer_worker(
             .await
             .map_err(|error| ActorError::Peer(error.to_string()))?
     };
+    if peer.remote_peer_id() == services.peer_id {
+        learn_self_address(services, address.ip());
+        return Err(ActorError::Peer(
+            "candidate address belongs to this daemon".to_owned(),
+        ));
+    }
     let mut upload = outgoing_peer_upload_context(
         services,
         torrent_id,
@@ -4757,112 +5741,195 @@ async fn outgoing_peer_upload_context(
             interested: false,
             remote_metadata_id: None,
             remote_holepunch_id: None,
-            cached_piece: None,
+            remote_request_queue: None,
         },
         session,
         _guard: guard,
     })
 }
 
-fn schedule_pieces(
-    workers: &mut HashMap<usize, PeerWorkerHandle>,
-    assignments: &mut HashMap<usize, (usize, CancellationToken)>,
-    picker: &mut PiecePicker,
-    metainfo: &Metainfo,
-) -> Result<usize, ActorError> {
-    let mut idle: Vec<_> = workers
+/// Hands pieces to workers whose assigned bytes are below their target, one
+/// extra piece to workers that reported an emptying pipeline, and skips
+/// workers that had nothing selectable at the current picker generation.
+fn schedule_pieces(swarm: &mut SwarmState, metainfo: &Metainfo) -> Result<usize, ActorError> {
+    let generation = swarm.picker.generation();
+    let mut eligible: Vec<_> = swarm
+        .workers
         .iter()
-        .filter_map(|(worker, handle)| (handle.idle && !handle.choked).then_some(*worker))
-        .collect();
-    idle.sort_unstable_by_key(|worker| {
-        std::cmp::Reverse(workers.get(worker).map_or((false, false, 0), |handle| {
+        .filter(|(_, handle)| {
+            handle.bitfield.is_some()
+                && !handle.choked
+                && handle.useful_pieces > 0
+                && handle.skip_generation != Some(generation)
+                && (handle.wants_more || handle.assigned_bytes < handle.target_bytes)
+        })
+        .map(|(worker, handle)| {
             (
-                handle.seed,
-                handle.last_verified.is_some(),
-                handle.verified_bytes,
+                std::cmp::Reverse((
+                    handle.seed,
+                    handle.last_verified.is_some(),
+                    handle.verified_bytes,
+                )),
+                *worker,
             )
-        }))
-    });
+        })
+        .collect();
+    eligible.sort_unstable();
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+    let max_piece = piece_length(metainfo, 0)?;
     let mut scheduled = 0_usize;
-    for worker in idle {
-        let Some(handle) = workers.get_mut(&worker) else {
+    'workers: for (_, worker) in eligible {
+        let mut granted = 0_usize;
+        let mut channel_full = false;
+        loop {
+            let Some(handle) = swarm.workers.get_mut(&worker) else {
+                break;
+            };
+            let need =
+                (handle.wants_more && granted == 0) || handle.assigned_bytes < handle.target_bytes;
+            if !need {
+                break;
+            }
+            let Some(bitfield) = handle.bitfield.as_deref() else {
+                break;
+            };
+            if !swarm.budget.reserve(max_piece) {
+                break 'workers;
+            }
+            let held = swarm.assignments.get(&worker);
+            let selected = swarm
+                .picker
+                .select_where(bitfield, SelectionMode::RarestFirst, |piece| {
+                    held.is_none_or(|assignments| {
+                        !assignments
+                            .iter()
+                            .any(|assignment| assignment.piece == piece)
+                    })
+                })
+                .map_err(|error| ActorError::Peer(error.to_string()))?;
+            let Some(piece) = selected else {
+                swarm.budget.release(max_piece);
+                handle.skip_generation = Some(generation);
+                break;
+            };
+            let length = piece_length(metainfo, piece)?;
+            swarm.budget.release(max_piece.saturating_sub(length));
+            if handle
+                .commands
+                .try_send(PeerWorkerCommand::Download { piece, length })
+                .is_err()
+            {
+                swarm
+                    .picker
+                    .mark_request_failed(piece)
+                    .map_err(|error| ActorError::Peer(error.to_string()))?;
+                swarm.budget.release(length);
+                channel_full = true;
+                break;
+            }
+            swarm
+                .assignments
+                .entry(worker)
+                .or_default()
+                .push(PieceAssignment { piece, length });
+            handle.assigned_bytes = handle.assigned_bytes.saturating_add(length);
+            handle.idle = false;
+            granted += 1;
+            scheduled += 1;
+        }
+        if channel_full {
+            remove_worker(swarm, worker)?;
             continue;
-        };
-        let Some(bitfield) = handle.bitfield.as_deref() else {
-            continue;
-        };
-        let Some(piece) = picker
-            .select(bitfield, SelectionMode::RarestFirst)
-            .map_err(|error| ActorError::Peer(error.to_string()))?
-        else {
-            continue;
-        };
-        let cancellation = CancellationToken::new();
-        handle
-            .commands
-            .try_send(PeerWorkerCommand::Download {
-                piece,
-                length: piece_length(metainfo, piece)?,
-                cancellation: cancellation.clone(),
-            })
-            .map_err(|error| ActorError::Peer(error.to_string()))?;
-        handle.idle = false;
-        assignments.insert(worker, (piece, cancellation));
-        scheduled += 1;
+        }
+        if granted > 0
+            && let Some(handle) = swarm.workers.get_mut(&worker)
+        {
+            handle.wants_more = false;
+        }
     }
     Ok(scheduled)
 }
 
+fn assignment_target(rate_bytes_per_second: u64) -> usize {
+    let target = rate_bytes_per_second.saturating_mul(ASSIGNMENT_TARGET_SECONDS);
+    usize::try_from(target)
+        .unwrap_or(usize::MAX)
+        .clamp(ASSIGNMENT_TARGET_MIN, ASSIGNMENT_TARGET_MAX)
+}
+
+fn take_assignment(swarm: &mut SwarmState, worker: usize, piece: usize) -> Option<PieceAssignment> {
+    let (taken, drained) = {
+        let assignments = swarm.assignments.get_mut(&worker)?;
+        let position = assignments
+            .iter()
+            .position(|assignment| assignment.piece == piece)?;
+        let taken = assignments.remove(position);
+        (taken, assignments.is_empty())
+    };
+    if drained {
+        swarm.assignments.remove(&worker);
+    }
+    if let Some(handle) = swarm.workers.get_mut(&worker) {
+        handle.assigned_bytes = handle.assigned_bytes.saturating_sub(taken.length);
+    }
+    sync_worker_idle(swarm, worker);
+    Some(taken)
+}
+
+fn release_worker_assignments(swarm: &mut SwarmState, worker: usize) -> Result<(), ActorError> {
+    if let Some(assignments) = swarm.assignments.remove(&worker) {
+        for assignment in assignments {
+            swarm
+                .picker
+                .mark_request_failed(assignment.piece)
+                .map_err(|error| ActorError::Peer(error.to_string()))?;
+            swarm.budget.release(assignment.length);
+        }
+    }
+    if let Some(handle) = swarm.workers.get_mut(&worker) {
+        handle.assigned_bytes = 0;
+    }
+    sync_worker_idle(swarm, worker);
+    swarm.schedule_dirty = true;
+    Ok(())
+}
+
+fn sync_worker_idle(swarm: &mut SwarmState, worker: usize) {
+    let busy = swarm.assignments.contains_key(&worker);
+    if let Some(handle) = swarm.workers.get_mut(&worker) {
+        handle.idle = handle.bitfield.is_some() && !busy;
+    }
+}
+
+/// Bookkeeping for a worker's piece outcome. Valid-looking data is returned
+/// for verification; every other outcome releases the budget immediately.
 fn prepare_piece_result(
     swarm: &mut SwarmState,
     worker: usize,
     piece: usize,
     result: PieceResult,
-    metainfo: &Metainfo,
     record: &TorrentRecord,
 ) -> Result<Option<Bytes>, ActorError> {
-    swarm.assignments.remove(&worker);
+    let reserved = take_assignment(swarm, worker, piece).map_or(0, |assignment| assignment.length);
+    swarm.schedule_dirty = true;
     match result {
         PieceResult::Data(_data) if bit_is_set(&record.completed_pieces, piece) => {
             swarm
                 .picker
                 .mark_complete(piece)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
-            set_worker_idle(swarm, worker);
+            swarm.budget.release(reserved);
         }
         PieceResult::Data(data) => {
-            if !verify_piece(metainfo, piece, &data)? {
-                if let Some(peer) = swarm
-                    .workers
-                    .get(&worker)
-                    .and_then(|handle| handle.peer_key)
-                {
-                    record_peer_failure(&swarm.services, swarm.torrent_id, peer);
-                }
+            if swarm.writing.contains(&piece) {
                 swarm
                     .picker
                     .mark_request_failed(piece)
                     .map_err(|error| ActorError::Peer(error.to_string()))?;
-                swarm.last_error = Some(format!("piece {piece} failed its integrity check"));
-                remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
+                swarm.budget.release(reserved);
                 return Ok(None);
-            }
-            if !swarm.writing.insert(piece) {
-                swarm
-                    .picker
-                    .mark_request_failed(piece)
-                    .map_err(|error| ActorError::Peer(error.to_string()))?;
-                set_worker_idle(swarm, worker);
-                return Ok(None);
-            }
-            swarm
-                .picker
-                .set_enabled(piece, piece.saturating_add(1), false)
-                .map_err(|error| ActorError::Peer(error.to_string()))?;
-            for (assigned_piece, token) in swarm.assignments.values() {
-                if *assigned_piece == piece {
-                    token.cancel();
-                }
             }
             return Ok(Some(data));
         }
@@ -4871,7 +5938,7 @@ fn prepare_piece_result(
                 .picker
                 .mark_request_failed(piece)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
-            set_worker_idle(swarm, worker);
+            swarm.budget.release(reserved);
         }
         PieceResult::Failed(error) => {
             if let Some(peer) = swarm
@@ -4886,7 +5953,8 @@ fn prepare_piece_result(
                 .mark_request_failed(piece)
                 .map_err(|failure| ActorError::Peer(failure.to_string()))?;
             swarm.last_error = Some(error);
-            remove_worker(worker, &mut swarm.workers, &mut swarm.picker)?;
+            swarm.budget.release(reserved);
+            remove_worker(swarm, worker)?;
         }
     }
     Ok(None)
@@ -4914,7 +5982,10 @@ fn stage_stored_piece(
     if let Some(peer) = contributing_peer {
         record_verified_download(&swarm.services, swarm.torrent_id, peer, stored.bytes);
     }
-    set_worker_idle(swarm, stored.worker);
+    swarm
+        .budget
+        .release(usize::try_from(stored.bytes).unwrap_or(usize::MAX));
+    swarm.schedule_dirty = true;
     let wire_piece = u32::try_from(stored.piece).map_err(|_| ActorError::Arithmetic)?;
     for handle in swarm.workers.values() {
         let _result_ignored = handle
@@ -4943,6 +6014,11 @@ async fn commit_flushed_pieces(
                 .is_some_and(|bitfield| bit_is_set(bitfield, piece))
             {
                 handle.useful_pieces = handle.useful_pieces.saturating_sub(1);
+                if handle.useful_pieces == 0
+                    && let Some(peer) = handle.peer_key
+                {
+                    set_session_interesting(&swarm.services, swarm.torrent_id, peer, false);
+                }
             }
         }
         record.downloaded = record
@@ -4954,117 +6030,27 @@ async fn commit_flushed_pieces(
     Ok(())
 }
 
-fn set_worker_idle(swarm: &mut SwarmState, worker: usize) {
-    if let Some(handle) = swarm.workers.get_mut(&worker) {
-        handle.idle = true;
-    }
-}
-
-fn remove_worker(
-    worker: usize,
-    workers: &mut HashMap<usize, PeerWorkerHandle>,
-    picker: &mut PiecePicker,
-) -> Result<(), ActorError> {
-    if let Some(handle) = workers.remove(&worker) {
+fn remove_worker(swarm: &mut SwarmState, worker: usize) -> Result<(), ActorError> {
+    release_worker_assignments(swarm, worker)?;
+    if let Some(handle) = swarm.workers.remove(&worker) {
         handle.cancellation.cancel();
         let _result_ignored = handle.commands.try_send(PeerWorkerCommand::Shutdown);
         if let Some(bitfield) = handle.bitfield {
-            picker
+            swarm
+                .picker
                 .remove_peer_bitfield(&bitfield)
                 .map_err(|error| ActorError::Peer(error.to_string()))?;
         }
     }
+    swarm.schedule_dirty = true;
     Ok(())
 }
 
-fn stop_workers(
-    workers: &HashMap<usize, PeerWorkerHandle>,
-    assignments: &HashMap<usize, (usize, CancellationToken)>,
-) {
-    for (_, token) in assignments.values() {
-        token.cancel();
-    }
+fn stop_workers(workers: &HashMap<usize, PeerWorkerHandle>) {
     for handle in workers.values() {
         handle.cancellation.cancel();
         let _result_ignored = handle.commands.try_send(PeerWorkerCommand::Shutdown);
     }
-}
-
-async fn download_piece_blocks(
-    peer: &mut PeerConnection,
-    piece: usize,
-    length: usize,
-    cancellation: &CancellationToken,
-    message_timeout: Duration,
-    forwarder: PeerEventForwarder<'_>,
-    mut upload: Option<&mut PeerUploadContext>,
-) -> Result<Bytes, ActorError> {
-    let piece = u32::try_from(piece).map_err(|_| ActorError::Arithmetic)?;
-    let mut output = vec![0_u8; length];
-    let mut pending = HashMap::<u32, u32>::new();
-    let mut next_begin = 0_usize;
-    let mut received = 0_usize;
-    fill_request_pipeline(peer, piece, length, &mut next_begin, &mut pending).await?;
-    while received < length {
-        let event = tokio::select! {
-            () = cancellation.cancelled() => {
-                cancel_pending(peer, piece, &pending).await;
-                return Err(ActorError::Cancelled);
-            }
-            event = next_peer_event_with_timeout(peer, message_timeout) => event?,
-        };
-        match event {
-            PeerEvent::Message(PeerMessage::Piece {
-                piece: response_piece,
-                begin,
-                block,
-            }) if response_piece == piece => {
-                let expected = pending.remove(&begin).ok_or_else(|| {
-                    ActorError::Peer("peer returned an unsolicited block".to_owned())
-                })?;
-                if usize::try_from(expected).ok() != Some(block.len()) {
-                    return Err(ActorError::Peer(
-                        "peer returned a block with the wrong length".to_owned(),
-                    ));
-                }
-                let start = usize::try_from(begin).map_err(|_| ActorError::Arithmetic)?;
-                let end = start
-                    .checked_add(block.len())
-                    .filter(|end| *end <= output.len())
-                    .ok_or(ActorError::Arithmetic)?;
-                output[start..end].copy_from_slice(&block);
-                received = received
-                    .checked_add(block.len())
-                    .ok_or(ActorError::Arithmetic)?;
-                record_downloaded_block(&forwarder, block.len());
-                fill_request_pipeline(peer, piece, length, &mut next_begin, &mut pending).await?;
-            }
-            PeerEvent::Message(PeerMessage::Choke) => {
-                return Err(ActorError::Peer(
-                    "peer choked outstanding requests".to_owned(),
-                ));
-            }
-            PeerEvent::Disconnected => {
-                return Err(ActorError::Peer(
-                    "peer disconnected during piece transfer".to_owned(),
-                ));
-            }
-            PeerEvent::Failed(error) => {
-                return Err(ActorError::Peer(format!(
-                    "peer session failed during piece transfer: {error}"
-                )));
-            }
-            PeerEvent::Message(PeerMessage::Piece { .. }) => {
-                return Err(ActorError::Peer(
-                    "peer returned a block for another piece".to_owned(),
-                ));
-            }
-            event => {
-                forward_transfer_peer_event(event, &forwarder, peer, upload.as_deref_mut()).await?;
-            }
-        }
-    }
-    Ok(Bytes::from(output))
 }
 
 fn record_downloaded_block(forwarder: &PeerEventForwarder<'_>, bytes: usize) {
@@ -5077,91 +6063,55 @@ fn record_downloaded_block(forwarder: &PeerEventForwarder<'_>, bytes: usize) {
     }
 }
 
-async fn forward_transfer_peer_event(
-    event: PeerEvent,
-    forwarder: &PeerEventForwarder<'_>,
-    peer: &PeerConnection,
-    upload: Option<&mut PeerUploadContext>,
-) -> Result<(), ActorError> {
-    let event = if let Some(upload) = upload {
-        match handle_peer_upload_event(peer, upload, forwarder.services, event).await? {
-            Some(event) => event,
-            None => return Ok(()),
-        }
-    } else {
-        event
-    };
-    let worker_event = match event {
-        PeerEvent::Message(PeerMessage::Have(piece)) => Some(PeerWorkerEvent::Have {
-            worker: forwarder.worker,
-            piece,
-        }),
-        PeerEvent::Message(PeerMessage::Extended {
-            extension_id: LOCAL_PEX_EXTENSION_ID,
-            payload,
-        }) if forwarder.allow_extensions => Some(PeerWorkerEvent::Peers {
-            worker: forwarder.worker,
-            peers: pex_addresses(&payload)?,
-        }),
-        PeerEvent::Message(PeerMessage::Extended {
-            extension_id: LOCAL_HOLEPUNCH_EXTENSION_ID,
-            payload,
-        }) if forwarder.allow_extensions => {
-            let message = decode_holepunch_message(&payload)
-                .map_err(|error| ActorError::Peer(error.to_string()))?;
-            (message.kind == HolePunchKind::Connect).then_some(PeerWorkerEvent::HolePunch {
-                worker: forwarder.worker,
-                address: message.address,
-            })
-        }
-        _ => None,
-    };
-    if let Some(event) = worker_event {
-        forwarder
-            .events
-            .send(event)
-            .await
-            .map_err(|_| ActorError::Cancelled)?;
-    }
-    Ok(())
-}
-
+/// Keeps up to `limit_blocks` requests outstanding across the queued pieces
+/// and asks the actor for more pieces once fewer than one pipeline's worth of
+/// blocks remain unrequested.
 async fn fill_request_pipeline(
     peer: &PeerConnection,
-    piece: u32,
-    length: usize,
-    next_begin: &mut usize,
-    pending: &mut HashMap<u32, u32>,
+    pipeline: &mut DownloadPipeline,
+    context: &PeerWorkerContext,
 ) -> Result<(), ActorError> {
-    while pending.len() < BLOCK_PIPELINE && *next_begin < length {
-        let block_length = BLOCK_BYTES.min(length - *next_begin);
-        let begin = u32::try_from(*next_begin).map_err(|_| ActorError::Arithmetic)?;
-        let wire_length = u32::try_from(block_length).map_err(|_| ActorError::Arithmetic)?;
-        peer.send(PeerMessage::Request(BlockRequest {
-            piece,
-            begin,
-            length: wire_length,
-        }))
-        .await
-        .map_err(|error| ActorError::Peer(error.to_string()))?;
-        pending.insert(begin, wire_length);
-        *next_begin = next_begin
-            .checked_add(block_length)
-            .ok_or(ActorError::Arithmetic)?;
+    let DownloadPipeline {
+        queue,
+        pending,
+        limit_blocks,
+        ..
+    } = pipeline;
+    for queued in queue.iter_mut() {
+        while pending.len() < *limit_blocks && queued.next_begin < queued.length {
+            let block_length = BLOCK_BYTES.min(queued.length - queued.next_begin);
+            let begin = u32::try_from(queued.next_begin).map_err(|_| ActorError::Arithmetic)?;
+            let wire_length = u32::try_from(block_length).map_err(|_| ActorError::Arithmetic)?;
+            peer.send(PeerMessage::Request(BlockRequest {
+                piece: queued.piece,
+                begin,
+                length: wire_length,
+            }))
+            .await
+            .map_err(|error| ActorError::Peer(error.to_string()))?;
+            pending.insert((queued.piece, begin), wire_length);
+            queued.next_begin = queued
+                .next_begin
+                .checked_add(block_length)
+                .ok_or(ActorError::Arithmetic)?;
+        }
+        if pending.len() >= *limit_blocks {
+            break;
+        }
+    }
+    let low_water = pipeline.limit_blocks.saturating_mul(BLOCK_BYTES);
+    if !pipeline.want_sent && pipeline.unrequested_bytes() < low_water {
+        context
+            .events
+            .send(PeerWorkerEvent::NeedPieces {
+                worker: context.worker,
+                rate_bytes_per_second: pipeline.rate.bytes_per_second(),
+            })
+            .await
+            .map_err(|_| ActorError::Cancelled)?;
+        pipeline.want_sent = true;
     }
     Ok(())
-}
-
-async fn cancel_pending(peer: &PeerConnection, piece: u32, pending: &HashMap<u32, u32>) {
-    for (begin, length) in pending {
-        let _result_ignored = peer
-            .send(PeerMessage::Cancel(BlockRequest {
-                piece,
-                begin: *begin,
-                length: *length,
-            }))
-            .await;
-    }
 }
 
 async fn connect_outgoing_peer(
@@ -5370,7 +6320,7 @@ async fn recheck(
         }
     }
     let state = if all_complete(&record.completed_pieces, pieces) {
-        completion_state(record)
+        completion_state(record, services).await?
     } else {
         TorrentState::Stopped
     };
@@ -5621,36 +6571,140 @@ fn wire_info_hash(metainfo: &Metainfo) -> Result<Sha1Hash, ActorError> {
 }
 
 fn verify_piece(metainfo: &Metainfo, index: usize, piece: &[u8]) -> Result<bool, ActorError> {
-    if let Some(expected) = metainfo.v1_piece_hashes.get(index) {
-        let actual: [u8; 20] = Sha1::digest(piece).into();
-        if Sha1Hash::from_bytes(actual) != *expected {
-            return Ok(false);
+    Ok(prepare_verification(metainfo, index, piece.len())?.verify(piece))
+}
+
+/// Everything needed to check one piece without the metainfo, so the hashing
+/// itself can run on a blocking thread.
+struct PieceVerification {
+    v1: Option<Sha1Hash>,
+    v2: Option<V2Check>,
+}
+
+struct V2Check {
+    expected: dendrite_core::Sha256Hash,
+    range: std::ops::Range<usize>,
+    piece_length: u32,
+}
+
+impl PieceVerification {
+    fn verify(&self, piece: &[u8]) -> bool {
+        if let Some(expected) = self.v1 {
+            let actual: [u8; 20] = Sha1::digest(piece).into();
+            if Sha1Hash::from_bytes(actual) != expected {
+                return false;
+            }
+        }
+        if let Some(check) = &self.v2 {
+            let Some(data) = piece.get(check.range.clone()) else {
+                return false;
+            };
+            if v2_piece_root(data, check.piece_length) != check.expected {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn prepare_verification(
+    metainfo: &Metainfo,
+    index: usize,
+    piece_len: usize,
+) -> Result<PieceVerification, ActorError> {
+    let v1 = metainfo.v1_piece_hashes.get(index).copied();
+    let v2 = if metainfo.v2_info_hash.is_some() {
+        let placeholder = vec![0_u8; piece_len];
+        match v2_verification_target(metainfo, index, &placeholder)? {
+            Some(target) => {
+                let file = target.file;
+                let local_index = target.local_index;
+                let root = file.pieces_root.ok_or_else(|| {
+                    ActorError::Metainfo("non-empty v2 file has no pieces root".to_owned())
+                })?;
+                let expected = if file.length > u64::from(metainfo.piece_length.get()) {
+                    metainfo
+                        .piece_layers
+                        .get(&root)
+                        .and_then(|layer| layer.get(local_index))
+                        .copied()
+                        .ok_or_else(|| {
+                            ActorError::Metainfo("v2 piece layer is incomplete".to_owned())
+                        })?
+                } else {
+                    root
+                };
+                let start = target.data.as_ptr() as usize - placeholder.as_ptr() as usize;
+                Some(V2Check {
+                    expected,
+                    range: start..start + target.data.len(),
+                    piece_length: metainfo.piece_length.get(),
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(PieceVerification { v1, v2 })
+}
+
+/// Runs a prepared verification on the blocking pool, bounded by the hash
+/// concurrency limit so verification never occupies runtime workers.
+async fn verify_piece_offloaded(
+    services: &Services,
+    verification: PieceVerification,
+    data: Bytes,
+) -> Result<bool, ActorError> {
+    let _permit = services
+        .hash_slots
+        .acquire()
+        .await
+        .map_err(|_| ActorError::Cancelled)?;
+    tokio::task::spawn_blocking(move || verification.verify(&data))
+        .await
+        .map_err(|error| ActorError::Peer(format!("piece verification task failed: {error}")))
+}
+
+fn hash_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(2, |cores| (cores.get() / 2).max(1))
+}
+
+/// The source addresses the kernel would use for public IPv4 and IPv6
+/// traffic. Connecting a UDP socket sends nothing; it only resolves a route.
+fn local_outbound_addresses() -> HashSet<IpAddr> {
+    let mut addresses = HashSet::new();
+    for (bind, probe) in [("0.0.0.0:0", "192.0.2.1:9"), ("[::]:0", "[2001:db8::1]:9")] {
+        if let Ok(socket) = std::net::UdpSocket::bind(bind)
+            && socket.connect(probe).is_ok()
+            && let Ok(local) = socket.local_addr()
+            && !local.ip().is_unspecified()
+        {
+            addresses.insert(local.ip());
         }
     }
-    if metainfo.v2_info_hash.is_some() {
-        let Some(target) = v2_verification_target(metainfo, index, piece)? else {
-            return Ok(true);
-        };
-        let file = target.file;
-        let local_index = target.local_index;
-        let root = file.pieces_root.ok_or_else(|| {
-            ActorError::Metainfo("non-empty v2 file has no pieces root".to_owned())
-        })?;
-        let expected = if file.length > u64::from(metainfo.piece_length.get()) {
-            metainfo
-                .piece_layers
-                .get(&root)
-                .and_then(|layer| layer.get(local_index))
-                .copied()
-                .ok_or_else(|| ActorError::Metainfo("v2 piece layer is incomplete".to_owned()))?
-        } else {
-            root
-        };
-        if v2_piece_root(target.data, metainfo.piece_length.get()) != expected {
-            return Ok(false);
-        }
+    addresses
+}
+
+fn learn_self_address(services: &Services, address: IpAddr) {
+    if address.is_unspecified() {
+        return;
     }
-    Ok(true)
+    if let Ok(mut addresses) = services.self_addresses.write() {
+        addresses.insert(address);
+    }
+}
+
+/// A candidate that would reach this daemon's own peer port at one of its
+/// own addresses.
+fn is_self_candidate(services: &Services, address: SocketAddr) -> bool {
+    let own_port = address.port() == services.peer_port
+        || address.port() == services.advertised_peer_port.load(Ordering::Relaxed);
+    own_port
+        && services
+            .self_addresses
+            .read()
+            .is_ok_and(|addresses| addresses.contains(&address.ip()))
 }
 
 struct V2VerificationTarget<'a, 'b> {
@@ -5787,6 +6841,9 @@ async fn update_record_state(
 ) -> Result<(), ActorError> {
     record.state = state;
     persist_download_progress(services, record).await?;
+    if !matches!(state, TorrentState::Downloading | TorrentState::Seeding) {
+        services.incoming_content.lock().await.remove(&record.id);
+    }
     let _subscriber_count = services.events.send(EngineEvent {
         torrent_id: record.id,
         state,
@@ -5934,22 +6991,31 @@ mod tests {
 
     #[test]
     fn downloading_upload_slots_prefer_contributors_and_rotate_optimistic_peers() {
+        let transfer = TransferPolicy {
+            upload_slots: 8,
+            optimistic_upload_slots: 2,
+            ..TransferPolicy::default()
+        };
         let mut candidates = (0_u64..12)
             .map(|session| UploadCandidate {
                 session,
                 contribution_score: 12 - session,
+                verified_rate: 12 - session,
                 recent_upload: session,
                 eligible: true,
+                interesting: true,
             })
             .collect::<Vec<_>>();
-        let first = select_upload_sessions(TorrentState::Downloading, &mut candidates, 0);
-        for contributor in 0..REGULAR_UPLOAD_SLOTS as u64 {
+        let first =
+            select_upload_sessions(TorrentState::Downloading, &mut candidates, 0, &transfer);
+        for contributor in 0..8_u64 {
             assert!(first.contains(&contributor));
         }
         assert!(first.contains(&8));
         assert!(first.contains(&9));
 
-        let second = select_upload_sessions(TorrentState::Downloading, &mut candidates, 2);
+        let second =
+            select_upload_sessions(TorrentState::Downloading, &mut candidates, 2, &transfer);
         assert!(second.contains(&10));
         assert!(second.contains(&11));
         assert!(!second.contains(&8));
@@ -5957,20 +7023,75 @@ mod tests {
     }
 
     #[test]
+    fn downloading_upload_slots_skip_peers_that_cannot_repay() {
+        let transfer = TransferPolicy {
+            upload_slots: 4,
+            optimistic_upload_slots: 2,
+            ..TransferPolicy::default()
+        };
+        let mut candidates = vec![
+            UploadCandidate {
+                session: 1,
+                contribution_score: 1 << 30,
+                verified_rate: 1 << 20,
+                recent_upload: 0,
+                eligible: true,
+                interesting: false,
+            },
+            UploadCandidate {
+                session: 2,
+                contribution_score: 0,
+                verified_rate: 4096,
+                recent_upload: 0,
+                eligible: true,
+                interesting: true,
+            },
+            UploadCandidate {
+                session: 3,
+                contribution_score: 0,
+                verified_rate: 0,
+                recent_upload: 0,
+                eligible: true,
+                interesting: true,
+            },
+        ];
+        let selected =
+            select_upload_sessions(TorrentState::Downloading, &mut candidates, 0, &transfer);
+        assert!(
+            !selected.contains(&1),
+            "a peer with nothing we need never earns a slot while downloading"
+        );
+        assert!(
+            selected.contains(&2),
+            "a delivering peer holds a regular slot"
+        );
+        assert!(
+            selected.contains(&3),
+            "an interesting newcomer gets an optimistic slot"
+        );
+        let seeding = select_upload_sessions(TorrentState::Seeding, &mut candidates, 0, &transfer);
+        assert!(seeding.contains(&1), "seeding ignores interest");
+    }
+
+    #[test]
     fn seeding_upload_slots_prefer_recent_rate_and_keep_optimistic_slots() {
+        let transfer = TransferPolicy {
+            upload_slots: 8,
+            optimistic_upload_slots: 2,
+            ..TransferPolicy::default()
+        };
         let mut candidates = (0_u64..12)
             .map(|session| UploadCandidate {
                 session,
                 contribution_score: 0,
+                verified_rate: 0,
                 recent_upload: session * 1024,
                 eligible: true,
+                interesting: false,
             })
             .collect::<Vec<_>>();
-        let selected = select_upload_sessions(TorrentState::Seeding, &mut candidates, 0);
-        assert_eq!(
-            selected.len(),
-            REGULAR_UPLOAD_SLOTS + OPTIMISTIC_UPLOAD_SLOTS
-        );
+        let selected = select_upload_sessions(TorrentState::Seeding, &mut candidates, 0, &transfer);
+        assert_eq!(selected.len(), 10);
         for fast in 4_u64..12 {
             assert!(selected.contains(&fast));
         }
@@ -5978,12 +7099,13 @@ mod tests {
 
     #[test]
     fn downloading_upload_credit_is_strictly_reciprocal_after_bootstrap() {
+        let transfer = TransferPolicy::default();
         let balanced = PeerReputation {
             verified_from: 32 * 1024 * 1024,
             uploaded_to: 32 * 1024 * 1024,
-            failures: 0,
+            ..PeerReputation::default()
         };
-        assert!(has_reciprocal_upload_credit(balanced));
+        assert!(has_reciprocal_upload_credit(&transfer, balanced));
         assert_eq!(reciprocal_contribution(balanced), 0);
 
         let exhausted = PeerReputation {
@@ -5992,14 +7114,40 @@ mod tests {
                 .saturating_add(RECIPROCAL_BOOTSTRAP_BYTES),
             ..balanced
         };
-        assert!(!has_reciprocal_upload_credit(exhausted));
+        assert!(!has_reciprocal_upload_credit(&transfer, exhausted));
+        let half = TransferPolicy {
+            reciprocal_ratio: 0.5,
+            ..transfer
+        };
+        assert!(
+            !has_reciprocal_upload_credit(&half, balanced),
+            "half ratio halves the credit"
+        );
+        let unlimited = TransferPolicy {
+            reciprocal_ratio: 0.0,
+            ..transfer
+        };
+        assert!(has_reciprocal_upload_credit(&unlimited, exhausted));
 
         let contributor = PeerReputation {
             verified_from: 64 * 1024 * 1024,
             uploaded_to: 16 * 1024 * 1024,
-            failures: 0,
+            ..PeerReputation::default()
         };
         assert_eq!(reciprocal_contribution(contributor), 48 * 1024 * 1024);
+    }
+
+    #[test]
+    fn upload_limiter_delays_once_the_bucket_is_empty() {
+        let mut limiter = UploadLimiter::default();
+        assert_eq!(limiter.charge(0, 1 << 30), Duration::ZERO, "unlimited");
+        assert_eq!(limiter.charge(1_000_000, 500_000), Duration::ZERO);
+        assert_eq!(limiter.charge(1_000_000, 500_000), Duration::ZERO);
+        let wait = limiter.charge(1_000_000, 250_000);
+        assert!(
+            wait >= Duration::from_millis(200) && wait <= Duration::from_millis(260),
+            "{wait:?}"
+        );
     }
 
     #[test]
@@ -6009,22 +7157,34 @@ mod tests {
                 session: 1,
                 contribution_score: u64::MAX,
                 recent_upload: u64::MAX,
+                verified_rate: 0,
                 eligible: false,
+                interesting: true,
             },
             UploadCandidate {
                 session: 2,
                 contribution_score: 1024,
                 recent_upload: 0,
+                verified_rate: 0,
                 eligible: true,
+                interesting: true,
             },
             UploadCandidate {
                 session: 3,
                 contribution_score: 0,
                 recent_upload: 0,
+                verified_rate: 0,
                 eligible: true,
+                interesting: true,
             },
         ];
-        let selected = select_upload_sessions(TorrentState::Downloading, &mut candidates, 0);
+        let transfer = TransferPolicy {
+            upload_slots: 8,
+            optimistic_upload_slots: 2,
+            ..TransferPolicy::default()
+        };
+        let selected =
+            select_upload_sessions(TorrentState::Downloading, &mut candidates, 0, &transfer);
         assert!(!selected.contains(&1));
         assert!(selected.contains(&2));
         assert!(selected.contains(&3));
@@ -6172,6 +7332,10 @@ mod tests {
             delay = next;
         }
         assert_eq!(delay, ACCEPT_ERROR_BACKOFF_MAX);
+        assert_eq!(outbound_connection_limit(1), 1);
+        assert_eq!(outbound_connection_limit(2), 1);
+        assert_eq!(outbound_connection_limit(1_000), 750);
+        assert_eq!(outbound_connection_limit(10_000), 9_744);
     }
 
     #[test]
@@ -6261,6 +7425,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "pex-test".to_owned(),
@@ -6272,6 +7438,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -6528,7 +7699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incoming_peer_limit_backpressures_connection_flood_and_shutdown_releases_it()
+    async fn incoming_admission_drains_stalled_flood_and_recovers_without_restart()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = Bytes::from_static(b"bounded incoming seed");
         let digest: [u8; 20] = Sha1::digest(&payload).into();
@@ -6572,9 +7743,14 @@ mod tests {
                 encryption: EncryptionPolicy::Disabled,
                 peer_connection_limit: 2,
                 allow_private_web_seeds: false,
+                download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
+                piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
+                transfer: TransferPolicy::default(),
             },
         );
         engine.serve_incoming(listener);
+        saturate_and_release_incoming_handshakes(&engine, address, info_hash).await?;
+
         let mut clients = Vec::new();
         for peer in 0..16_u8 {
             clients.push(tokio::spawn(PeerConnection::connect(
@@ -6683,6 +7859,9 @@ mod tests {
                 encryption: EncryptionPolicy::Required,
                 peer_connection_limit: INCOMING_PEER_LIMIT,
                 allow_private_web_seeds: false,
+                download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
+                piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
+                transfer: TransferPolicy::default(),
             },
         );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -7042,6 +8221,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "swarm-test".to_owned(),
@@ -7053,6 +8234,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -7256,6 +8442,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "lsd-downloader-test".to_owned(),
@@ -7267,6 +8455,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -7334,6 +8527,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "mse-out-test".to_owned(),
@@ -7345,6 +8540,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -7407,6 +8607,9 @@ mod tests {
                 encryption: EncryptionPolicy::Disabled,
                 peer_connection_limit: INCOMING_PEER_LIMIT,
                 allow_private_web_seeds: true,
+                download_buffer_bytes: DEFAULT_DOWNLOAD_BUFFER_BYTES,
+                piece_cache_bytes: DEFAULT_PIECE_CACHE_BYTES,
+                transfer: TransferPolicy::default(),
             },
         );
         let mut events = engine.subscribe();
@@ -7508,6 +8711,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_requests_across_piece_boundaries_without_draining()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const PIECES: usize = 6;
+        const BLOCKS_PER_PIECE: usize = 4;
+        let pieces: Vec<Bytes> = (0..PIECES)
+            .map(|index| {
+                Bytes::from(vec![
+                    0x40 + u8::try_from(index).unwrap_or(0);
+                    BLOCK_BYTES * BLOCKS_PER_PIECE
+                ])
+            })
+            .collect();
+        let raw = multi_piece_v1_metainfo_with_piece_length(
+            "spanning.bin",
+            &pieces,
+            BLOCK_BYTES * BLOCKS_PER_PIECE,
+        );
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let payload: Vec<Bytes> = pieces.clone();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut peer = test_peer_connection(stream, info_hash).await?;
+            wait_for_interest(&mut peer).await?;
+            peer.send(PeerMessage::Bitfield(Bytes::from_static(&[0b1111_1100])))
+                .await?;
+            peer.send(PeerMessage::Unchoke).await?;
+            // Every block of every piece must be requested before a single
+            // block is served: the pipeline spans piece boundaries.
+            let mut requests = Vec::new();
+            while requests.len() < PIECES * BLOCKS_PER_PIECE {
+                match peer.next_event().await {
+                    Some(PeerEvent::Message(PeerMessage::Request(request))) => {
+                        requests.push(request);
+                    }
+                    Some(PeerEvent::Failed(error)) => return Err(error.into()),
+                    Some(PeerEvent::Disconnected) | None => {
+                        return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                            "client disconnected before filling the pipeline".into(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let distinct: HashSet<u32> = requests
+                .iter()
+                .take(BLOCKS_PER_PIECE + 1)
+                .map(|request| request.piece)
+                .collect();
+            assert!(
+                distinct.len() >= 2,
+                "requests did not cross a piece boundary: {distinct:?}"
+            );
+            for request in requests {
+                let piece = usize::try_from(request.piece)?;
+                let start = usize::try_from(request.begin)?;
+                let end = start + usize::try_from(request.length)?;
+                let block = payload
+                    .get(piece)
+                    .and_then(|data| data.get(start..end))
+                    .ok_or("invalid block request")?;
+                peer.send(PeerMessage::Piece {
+                    piece: request.piece,
+                    begin: request.begin,
+                    block: Bytes::copy_from_slice(block),
+                })
+                .await?;
+            }
+            Ok(())
+        });
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
+        let storage = StorageHandle::start(&downloads, 32)?;
+        let services = test_services(store.clone(), storage, "spanning-test");
+        let mut record = test_record(&metainfo, raw);
+        normalize_completion(&mut record, piece_count(&metainfo)?);
+        store.put_torrent(record.clone()).await?;
+        run_peer_swarm(
+            vec![address],
+            info_hash,
+            &metainfo,
+            &mut record,
+            &services,
+            &CancellationToken::new(),
+        )
+        .await?;
+        let written = tokio::fs::read(downloads.join("spanning.bin")).await?;
+        let expected: Vec<u8> = pieces.iter().flat_map(|piece| piece.to_vec()).collect();
+        assert_eq!(written, expected);
+        peer.await.map_err(|error| error.to_string())??;
+        assert_eq!(services.download_budget.used(), 0, "budget leaked");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Two scheduler scenarios share one swarm fixture.
+    async fn schedule_pieces_honours_budget_targets_and_generation_skips()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const PIECES: usize = 8;
+        let pieces: Vec<Bytes> = (0..PIECES)
+            .map(|index| Bytes::from(vec![u8::try_from(index).unwrap_or(0); BLOCK_BYTES]))
+            .collect();
+        let raw = multi_piece_v1_metainfo_with_piece_length("budget.bin", &pieces, BLOCK_BYTES);
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let directory = tempfile::tempdir()?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
+        let storage = StorageHandle::start(directory.path(), 32)?;
+        let mut record = test_record(&metainfo, raw);
+        normalize_completion(&mut record, PIECES);
+        let cancellation = CancellationToken::new();
+        let add_worker = |swarm: &mut SwarmState,
+                          worker: usize,
+                          bitfield: Vec<u8>,
+                          target_bytes: usize|
+         -> Result<
+            mpsc::Receiver<PeerWorkerCommand>,
+            dendrite_core::BitfieldError,
+        > {
+            let (commands, receiver) = mpsc::channel(PEER_COMMAND_CAPACITY);
+            swarm.workers.insert(
+                worker,
+                PeerWorkerHandle {
+                    commands,
+                    bitfield: Some(bitfield.clone()),
+                    idle: true,
+                    choked: false,
+                    address: SocketAddr::from((Ipv4Addr::LOCALHOST, 6881)),
+                    peer_key: None,
+                    seed: false,
+                    useful_pieces: useful_piece_count(&bitfield, &record.completed_pieces, PIECES),
+                    verified_bytes: 0,
+                    connected_at: Instant::now(),
+                    last_verified: None,
+                    cancellation: cancellation.child_token(),
+                    assigned_bytes: 0,
+                    target_bytes,
+                    wants_more: false,
+                    skip_generation: None,
+                },
+            );
+            swarm.picker.add_peer_bitfield(&bitfield)?;
+            Ok(receiver)
+        };
+        let drain = |receiver: &mut mpsc::Receiver<PeerWorkerCommand>| {
+            let mut granted = Vec::new();
+            while let Ok(PeerWorkerCommand::Download { piece, .. }) = receiver.try_recv() {
+                granted.push(piece);
+            }
+            granted
+        };
+
+        // Global budget of three pieces: one worker holding everything is cut
+        // off after three assignments and the budget is returned on release.
+        let mut services = test_services(store.clone(), storage.clone(), "budget-test");
+        services.download_budget = Arc::new(DownloadBudget::new(3 * BLOCK_BYTES));
+        let (mut swarm, _events) = initialize_swarm(
+            Vec::new(),
+            info_hash,
+            &metainfo,
+            &record,
+            &services,
+            &cancellation,
+        )?;
+        let mut all = add_worker(&mut swarm, 0, vec![0b1111_1111], ASSIGNMENT_TARGET_MIN)?;
+        assert_eq!(schedule_pieces(&mut swarm, &metainfo)?, 3);
+        assert_eq!(drain(&mut all), vec![0, 1, 2]);
+        assert_eq!(services.download_budget.used(), 3 * BLOCK_BYTES as u64);
+        assert_eq!(swarm.workers[&0].assigned_bytes, 3 * BLOCK_BYTES);
+        assert!(!swarm.workers[&0].idle);
+        assert_eq!(
+            schedule_pieces(&mut swarm, &metainfo)?,
+            0,
+            "budget exhausted"
+        );
+        release_worker_assignments(&mut swarm, 0)?;
+        assert_eq!(services.download_budget.used(), 0);
+        assert!(swarm.workers[&0].idle);
+        assert!(swarm.schedule_dirty);
+        drop(swarm);
+
+        // Two workers sharing a single piece: the second has nothing
+        // selectable and is skipped until the generation changes, which
+        // happens when the first worker leaves and returns the piece.
+        let services = test_services(store, storage, "skip-test");
+        let (mut swarm, _events) = initialize_swarm(
+            Vec::new(),
+            info_hash,
+            &metainfo,
+            &record,
+            &services,
+            &cancellation,
+        )?;
+        let mut first = add_worker(&mut swarm, 0, vec![0b1000_0000], ASSIGNMENT_TARGET_MIN)?;
+        let mut second = add_worker(&mut swarm, 1, vec![0b1000_0000], ASSIGNMENT_TARGET_MIN)?;
+        assert_eq!(schedule_pieces(&mut swarm, &metainfo)?, 1);
+        assert_eq!(drain(&mut first), vec![0]);
+        assert!(drain(&mut second).is_empty());
+        let generation = swarm.picker.generation();
+        assert_eq!(swarm.workers[&1].skip_generation, Some(generation));
+        assert_eq!(schedule_pieces(&mut swarm, &metainfo)?, 0);
+        assert!(drain(&mut second).is_empty());
+        remove_worker(&mut swarm, 0)?;
+        assert_ne!(swarm.picker.generation(), generation);
+        assert_eq!(schedule_pieces(&mut swarm, &metainfo)?, 1);
+        assert_eq!(drain(&mut second), vec![0]);
+        assert_eq!(services.download_budget.used(), BLOCK_BYTES as u64);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn swarm_schedules_distinct_peers_and_reassembles_reverse_order_blocks()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let first = Bytes::from(vec![0x11; BLOCK_BYTES * BLOCK_PIPELINE]);
@@ -7551,6 +8969,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "endgame-test".to_owned(),
@@ -7562,6 +8982,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -7717,6 +9142,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "scheduler-test".to_owned(),
@@ -7728,6 +9155,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
@@ -7883,7 +9315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervised_actor_stops_after_completing_stop_on_complete_torrent()
+    async fn supervised_actor_honors_stop_on_complete_enabled_during_download()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = Bytes::from_static(b"a rigorously verified local torrent payload");
         let piece_digest: [u8; 20] = Sha1::digest(&payload).into();
@@ -7898,10 +9330,11 @@ mod tests {
         let info_hash = metainfo.v1_info_hash.ok_or("missing v1 info hash")?;
 
         let tracker_task = tokio::spawn(fake_tracker(tracker_listener, peer_address));
-        let peer_task = tokio::spawn(fake_superseed_peer(
+        let peer_task = tokio::spawn(fake_superseed_peer_with_delay(
             peer_listener,
             info_hash,
             payload.clone(),
+            Duration::from_millis(250),
         ));
 
         let directory = tempfile::tempdir()?;
@@ -7921,7 +9354,7 @@ mod tests {
                 total_length: metainfo.total_length,
                 raw_metainfo: metainfo_bytes,
                 magnet_uri: None,
-                stop_on_complete: true,
+                stop_on_complete: false,
                 completed_pieces: Vec::new(),
                 downloaded: 0,
                 uploaded: 0,
@@ -7948,6 +9381,25 @@ mod tests {
                         .detail
                         .unwrap_or_else(|| "unknown actor error".to_owned()));
                 }
+                if event.state == TorrentState::Downloading {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| "torrent actor did not start downloading")??;
+        let mut live_record = store.get_torrent(id).await?.ok_or("record disappeared")?;
+        live_record.stop_on_complete = true;
+        assert!(store.replace_torrent(live_record).await?);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.map_err(|error| error.to_string())?;
+                if event.state == TorrentState::Error {
+                    return Err(event
+                        .detail
+                        .unwrap_or_else(|| "unknown actor error".to_owned()));
+                }
                 if event.state == TorrentState::Stopped {
                     return Ok(());
                 }
@@ -7960,6 +9412,7 @@ mod tests {
         assert_eq!(written, payload);
         let record = store.get_torrent(id).await?.ok_or("record disappeared")?;
         assert_eq!(record.state, TorrentState::Stopped);
+        assert!(record.stop_on_complete);
         assert_eq!(record.downloaded, payload.len() as u64);
         tracker_task.await.map_err(|error| error.to_string())??;
         peer_task.await.map_err(|error| error.to_string())??;
@@ -9595,11 +11048,19 @@ mod tests {
     }
 
     fn multi_piece_v1_metainfo(name: &str, pieces: &[Bytes]) -> Vec<u8> {
+        multi_piece_v1_metainfo_with_piece_length(name, pieces, BLOCK_BYTES * BLOCK_PIPELINE)
+    }
+
+    fn multi_piece_v1_metainfo_with_piece_length(
+        name: &str,
+        pieces: &[Bytes],
+        piece_length: usize,
+    ) -> Vec<u8> {
         let length: usize = pieces.iter().map(Bytes::len).sum();
         let mut info = format!(
             "d6:lengthi{length}e4:name{}:{name}12:piece lengthi{}e6:pieces{}:",
             name.len(),
-            BLOCK_BYTES * BLOCK_PIPELINE,
+            piece_length,
             pieces.len() * 20
         )
         .into_bytes();
@@ -9702,6 +11163,8 @@ mod tests {
             peer_id: generate_peer_id(),
             events,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: cookie.to_owned(),
@@ -9713,6 +11176,11 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
+            piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
+            hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
+            transfer: TransferPolicy::default(),
+            self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
         }
@@ -9828,6 +11296,42 @@ mod tests {
         digest.update(first.as_bytes());
         digest.update(second.as_bytes());
         dendrite_core::Sha256Hash::from_bytes(digest.finalize().into())
+    }
+
+    #[test]
+    fn download_budget_bounds_reservations_but_never_starves_an_empty_account() {
+        let shared = Arc::new(DownloadBudget::new(100));
+        let mut first = BudgetAccount::new(shared.clone());
+        let mut second = BudgetAccount::new(shared.clone());
+        assert!(first.reserve(80));
+        assert!(!first.reserve(30), "second reservation exceeds the limit");
+        assert!(
+            second.reserve(30),
+            "an empty account may always take one piece"
+        );
+        assert_eq!(shared.used(), 110);
+        assert!(!second.reserve(1));
+        first.release(80);
+        assert_eq!(shared.used(), 30);
+        assert!(second.reserve(60));
+        assert_eq!(shared.used(), 90);
+        drop(second);
+        assert_eq!(shared.used(), 0, "dropping an account returns what it held");
+        drop(first);
+        assert_eq!(shared.used(), 0);
+    }
+
+    #[test]
+    fn assignment_target_and_pipeline_scale_with_rate() {
+        assert_eq!(assignment_target(0), ASSIGNMENT_TARGET_MIN);
+        assert_eq!(assignment_target(8 * 1024 * 1024), 8 * 1024 * 1024);
+        assert_eq!(assignment_target(u64::MAX), ASSIGNMENT_TARGET_MAX);
+        assert_eq!(pipeline_limit(0), BLOCK_PIPELINE);
+        assert_eq!(
+            pipeline_limit(2 * 1024 * 1024),
+            2 * 1024 * 1024 * 3 / BLOCK_BYTES
+        );
+        assert_eq!(pipeline_limit(u64::MAX), BLOCK_PIPELINE_MAX);
     }
 
     async fn fake_tracker(
@@ -10359,10 +11863,53 @@ mod tests {
         serve_payload_peer(stream, info_hash, payload).await
     }
 
-    async fn fake_superseed_peer(
+    async fn saturate_and_release_incoming_handshakes(
+        engine: &EngineHandle,
+        address: SocketAddr,
+        info_hash: Sha1Hash,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let stalled = vec![
+            tokio::net::TcpStream::connect(address).await?,
+            tokio::net::TcpStream::connect(address).await?,
+        ];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.services.incoming_handshake_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "stalled handshakes did not fill bounded admission")?;
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(2),
+            PeerConnection::connect(
+                address,
+                Handshake {
+                    reserved: [0; 8],
+                    info_hash,
+                    peer_id: PeerId::from_bytes([u8::MAX; 20]),
+                },
+                PeerCodecLimits::default(),
+            ),
+        )
+        .await
+        .map_err(|_| "overflow connection was left queued instead of drained")?;
+        assert!(rejected.is_err());
+        drop(stalled);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.services.incoming_handshake_slots.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "handshake admission did not recover after stalled peers left")?;
+        Ok(())
+    }
+
+    async fn fake_superseed_peer_with_delay(
         listener: TcpListener,
         info_hash: Sha1Hash,
         payload: Bytes,
+        delay: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (stream, _) = listener.accept().await?;
         let mut peer = test_peer_connection(stream, info_hash).await?;
@@ -10377,6 +11924,7 @@ mod tests {
                 _ => {}
             }
         }
+        tokio::time::sleep(delay).await;
         peer.send(PeerMessage::Unchoke).await?;
         tokio::task::yield_now().await;
         peer.send(PeerMessage::Have(0)).await?;

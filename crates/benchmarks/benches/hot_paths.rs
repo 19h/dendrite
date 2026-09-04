@@ -45,6 +45,58 @@ fn rarest_first(criterion: &mut Criterion) {
             BatchSize::LargeInput,
         );
     });
+
+    // A peer whose only piece is already complete: the scan must visit every
+    // candidate word and return `None`. This was the O(pieces) case that
+    // dominated live profiles.
+    let mut sparse = vec![0_u8; PIECES.div_ceil(8)];
+    sparse[0] = 0x80;
+    let mut seeded = PiecePicker::new(PIECES, 16);
+    for _ in 0..8 {
+        let _ = seeded.add_peer_bitfield(&bitfield);
+    }
+    let _ = seeded.add_peer_bitfield(&sparse);
+    let _ = seeded.mark_complete(0);
+    criterion.bench_function("rarest_first_1m_pieces_sparse_miss", |bencher| {
+        bencher.iter_batched(
+            || seeded.clone(),
+            |mut picker| picker.select(black_box(&sparse), SelectionMode::RarestFirst),
+            BatchSize::LargeInput,
+        );
+    });
+
+    // Endgame with a handful of pieces left, most of them already requested.
+    let mut endgame = PiecePicker::new(PIECES, 16);
+    let _ = endgame.add_peer_bitfield(&bitfield);
+    for piece in 8..PIECES {
+        let _ = endgame.mark_complete(piece);
+    }
+    for _ in 0..4 {
+        let _ = endgame.select(&bitfield, SelectionMode::RarestFirst);
+    }
+    criterion.bench_function("rarest_first_1m_pieces_endgame", |bencher| {
+        bencher.iter_batched(
+            || endgame.clone(),
+            |mut picker| picker.select(black_box(&bitfield), SelectionMode::RarestFirst),
+            BatchSize::LargeInput,
+        );
+    });
+
+    let empty = PiecePicker::new(PIECES, 16);
+    criterion.bench_function("add_peer_bitfield_1m_seed", |bencher| {
+        bencher.iter_batched(
+            || empty.clone(),
+            |mut picker| picker.add_peer_bitfield(black_box(&bitfield)),
+            BatchSize::LargeInput,
+        );
+    });
+    criterion.bench_function("add_peer_bitfield_1m_sparse", |bencher| {
+        bencher.iter_batched(
+            || empty.clone(),
+            |mut picker| picker.add_peer_bitfield(black_box(&sparse)),
+            BatchSize::LargeInput,
+        );
+    });
 }
 
 criterion_group!(hot_paths, bencode_decode, peer_codec, rarest_first);

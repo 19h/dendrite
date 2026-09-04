@@ -139,6 +139,18 @@ it, the new record remains `stopped`. `--stop-on-complete` persists a completion
 mode that transitions the torrent to `stopped`, rather than `seeding`, after all
 pieces verify. It can be supplied with or without `--start`.
 
+### `set`
+
+```sh
+dendritectl set <ID> --stop-on-complete
+dendritectl set <ID> --no-stop-on-complete
+```
+
+`set` changes the persistent completion mode of an existing torrent. Enabling
+the mode stops a torrent that is already seeding immediately. Active downloads
+and rechecks read the latest setting when they complete, without restarting the
+transfer. Disabling the mode does not automatically resume a stopped torrent.
+
 ### `pause`, `resume`, and `recheck`
 
 ```sh

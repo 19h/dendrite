@@ -94,10 +94,15 @@ journalctl -u dendrite.service --follow
 | `dendrite_browser_sessions_created_total` | counter | sessions created since process start |
 | `dendrite_torrents` | gauge | currently readable records |
 | `dendrite_active_torrents` | gauge | records not in `stopped` or `error` |
+| `dendrite_state_commits_total` | counter | successful state database commits since start |
+| `dendrite_state_queue_depth` | gauge | commands waiting for the state thread |
+| `dendrite_downloaded_bytes_total` | counter | sum of the durable downloaded counters of every record |
+| `dendrite_uploaded_bytes_total` | counter | sum of the durable uploaded counters of every record; the number an egress budget is spent against |
 
-Counters are process-local and reset on restart. There are no per-torrent labels,
-byte totals, latency histograms, tracker metrics, or persistent metric state in
-the current endpoint.
+API counters are process-local and reset on restart; the byte totals are
+durable sums over records and survive restarts. There are no per-torrent
+labels, latency histograms, tracker metrics, or persistent metric state in the
+current endpoint.
 
 ## WebSocket events
 

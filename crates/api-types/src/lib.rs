@@ -91,6 +91,11 @@ pub struct TorrentActionRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TorrentSettingsUpdate {
+    pub stop_on_complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FilePriorityUpdate {
     pub file_index: u32,
     pub priority: FilePriority,

@@ -9,7 +9,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use dendrite_api_types::{
     AddTorrentOptions, AddTorrentRequest, ListResponse, StatusResponse, TokenRotationResponse,
-    TorrentAction, TorrentActionRequest, TorrentSummary,
+    TorrentAction, TorrentActionRequest, TorrentSettingsUpdate, TorrentSummary,
 };
 use dendrite_core::TorrentState;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -56,6 +56,16 @@ enum Command {
         /// Stop instead of seeding after every piece has been verified.
         #[arg(long)]
         stop_on_complete: bool,
+    },
+    /// Change persistent settings on an existing torrent.
+    Set {
+        id: String,
+        /// Stop instead of seeding after every piece has been verified.
+        #[arg(long, required_unless_present = "no_stop_on_complete")]
+        stop_on_complete: bool,
+        /// Keep seeding after every piece has been verified.
+        #[arg(long, conflicts_with = "stop_on_complete")]
+        no_stop_on_complete: bool,
     },
     Pause {
         id: String,
@@ -147,6 +157,20 @@ async fn run(arguments: Arguments) -> Result<(), CliError> {
             )
             .await?;
         }
+        Command::Set {
+            id,
+            stop_on_complete,
+            ..
+        } => {
+            print_settings_update(
+                &client,
+                &arguments.api,
+                &authorization,
+                &id,
+                stop_on_complete,
+            )
+            .await?;
+        }
         command @ (Command::Pause { .. } | Command::Resume { .. } | Command::Recheck { .. }) => {
             let (id, action) = match command {
                 Command::Pause { id } => (id, TorrentAction::Pause),
@@ -170,23 +194,36 @@ async fn run(arguments: Arguments) -> Result<(), CliError> {
             .await?;
         }
         Command::RotateToken => {
-            let response = checked(
-                client
-                    .post(format!(
-                        "{}/auth/token/rotate",
-                        arguments.api.trim_end_matches('/')
-                    ))
-                    .header(AUTHORIZATION, &authorization)
-                    .send()
-                    .await?,
+            rotate_token(
+                &client,
+                &arguments.api,
+                &authorization,
+                &arguments.token_file,
             )
-            .await?
-            .json::<TokenRotationResponse>()
             .await?;
-            persist_token(&arguments.token_file, &response.token).map_err(CliError::Token)?;
-            println!("administrator token rotated");
         }
     }
+    Ok(())
+}
+
+async fn rotate_token(
+    client: &reqwest::Client,
+    base: &str,
+    authorization: &HeaderValue,
+    token_file: &std::path::Path,
+) -> Result<(), CliError> {
+    let response = checked(
+        client
+            .post(format!("{}/auth/token/rotate", base.trim_end_matches('/')))
+            .header(AUTHORIZATION, authorization)
+            .send()
+            .await?,
+    )
+    .await?
+    .json::<TokenRotationResponse>()
+    .await?;
+    persist_token(token_file, &response.token).map_err(CliError::Token)?;
+    println!("administrator token rotated");
     Ok(())
 }
 
@@ -619,6 +656,28 @@ async fn print_action(
     Ok(())
 }
 
+async fn print_settings_update(
+    client: &reqwest::Client,
+    base: &str,
+    authorization: &HeaderValue,
+    id: &str,
+    stop_on_complete: bool,
+) -> Result<(), CliError> {
+    let torrent = checked(
+        client
+            .patch(format!("{}/torrents/{id}", base.trim_end_matches('/')))
+            .header(AUTHORIZATION, authorization)
+            .json(&TorrentSettingsUpdate { stop_on_complete })
+            .send()
+            .await?,
+    )
+    .await?
+    .json::<TorrentSummary>()
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&torrent)?);
+    Ok(())
+}
+
 async fn print_add(
     client: &reqwest::Client,
     base: &str,
@@ -761,6 +820,51 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn set_requires_exactly_one_completion_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let enable = Arguments::try_parse_from([
+            "dendritectl",
+            "set",
+            "01a05054-eb7e-7da3-9978-a673389fad22",
+            "--stop-on-complete",
+        ])?;
+        assert!(matches!(
+            enable.command,
+            Command::Set {
+                stop_on_complete: true,
+                no_stop_on_complete: false,
+                ..
+            }
+        ));
+
+        let disable = Arguments::try_parse_from([
+            "dendritectl",
+            "set",
+            "01a05054-eb7e-7da3-9978-a673389fad22",
+            "--no-stop-on-complete",
+        ])?;
+        assert!(matches!(
+            disable.command,
+            Command::Set {
+                stop_on_complete: false,
+                no_stop_on_complete: true,
+                ..
+            }
+        ));
+        assert!(Arguments::try_parse_from(["dendritectl", "set", "id"]).is_err());
+        assert!(
+            Arguments::try_parse_from([
+                "dendritectl",
+                "set",
+                "id",
+                "--stop-on-complete",
+                "--no-stop-on-complete"
+            ])
+            .is_err()
+        );
         Ok(())
     }
 

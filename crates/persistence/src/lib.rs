@@ -1,17 +1,35 @@
 //! Transactional redb-backed daemon state.
+//!
+//! Layout (schema 5): the immutable record lives in `torrents`, the raw
+//! metainfo in `metainfo`, the small mutable counters in `progress`, and the
+//! completion bitfield in `bitfield`, all keyed by torrent id. Hot updates
+//! therefore never rewrite the metainfo, and upload accounting never rewrites
+//! the bitfield. The state thread also keeps an in-memory mirror of every
+//! record without its metainfo so listing, summaries, and info-hash lookups
+//! never touch the database.
 
-use std::{io, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io,
+    path::Path,
+    sync::Arc,
+};
 
 use dendrite_core::{Sha1Hash, Sha256Hash, TorrentId, TorrentState};
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-const CURRENT_SCHEMA: u32 = 4;
+const CURRENT_SCHEMA: u32 = 5;
+const SPLIT_LAYOUT_SCHEMA: u32 = 5;
 const META: TableDefinition<'static, &str, u64> = TableDefinition::new("meta");
 const TORRENTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("torrents");
+const METAINFO: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("metainfo");
 const PROGRESS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("progress");
+const BITFIELD: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("bitfield");
 const HASH_INDEX: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("hash_index");
 const QUARANTINE: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("quarantine");
 
@@ -24,9 +42,11 @@ pub struct TorrentRecord {
     pub v1_info_hash: Option<Sha1Hash>,
     pub v2_info_hash: Option<Sha256Hash>,
     pub total_length: u64,
+    #[serde(with = "serde_bytes")]
     pub raw_metainfo: Vec<u8>,
     pub magnet_uri: Option<String>,
     pub stop_on_complete: bool,
+    #[serde(with = "serde_bytes")]
     pub completed_pieces: Vec<u8>,
     pub downloaded: u64,
     pub uploaded: u64,
@@ -35,6 +55,29 @@ pub struct TorrentRecord {
 
 impl TorrentRecord {
     pub const RECORD_VERSION: u16 = 2;
+
+    /// The record without its metainfo and completion bitfield, which are
+    /// stored in their own tables.
+    fn base(&self) -> Self {
+        Self {
+            raw_metainfo: Vec::new(),
+            completed_pieces: Vec::new(),
+            ..self.clone()
+        }
+    }
+}
+
+/// The info hash a peer presents on the wire for this record: the v1 hash, or
+/// the truncated v2 hash for v2-only torrents.
+#[must_use]
+pub fn wire_info_hash(record: &TorrentRecord) -> Option<Sha1Hash> {
+    record.v1_info_hash.or_else(|| {
+        record.v2_info_hash.map(|hash| {
+            let mut truncated = [0_u8; 20];
+            truncated.copy_from_slice(&hash.as_bytes()[..20]);
+            Sha1Hash::from_bytes(truncated)
+        })
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,8 +89,10 @@ struct TorrentRecordV1 {
     v1_info_hash: Option<Sha1Hash>,
     v2_info_hash: Option<Sha256Hash>,
     total_length: u64,
+    #[serde(with = "serde_bytes")]
     raw_metainfo: Vec<u8>,
     magnet_uri: Option<String>,
+    #[serde(with = "serde_bytes")]
     completed_pieces: Vec<u8>,
     downloaded: u64,
     uploaded: u64,
@@ -75,30 +120,32 @@ impl From<TorrentRecordV1> for TorrentRecord {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct TorrentProgress {
+/// Small mutable counters rewritten on every progress or upload commit.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct TorrentCounters {
     state: TorrentState,
-    completed_pieces: Vec<u8>,
     downloaded: u64,
     uploaded: u64,
 }
 
-impl TorrentProgress {
-    fn from_record(record: &TorrentRecord) -> Self {
+impl TorrentCounters {
+    const fn from_record(record: &TorrentRecord) -> Self {
         Self {
             state: record.state,
-            completed_pieces: record.completed_pieces.clone(),
             downloaded: record.downloaded,
             uploaded: record.uploaded,
         }
     }
+}
 
-    fn apply_to(self, record: &mut TorrentRecord) {
-        record.state = self.state;
-        record.completed_pieces = self.completed_pieces;
-        record.downloaded = self.downloaded;
-        record.uploaded = self.uploaded;
-    }
+/// `progress` value layout before schema 5, which carried the bitfield.
+#[derive(Serialize, Deserialize)]
+struct LegacyProgress {
+    state: TorrentState,
+    #[serde(with = "serde_bytes")]
+    completed_pieces: Vec<u8>,
+    downloaded: u64,
+    uploaded: u64,
 }
 
 struct DownloadProgress {
@@ -111,6 +158,7 @@ struct DownloadProgress {
 #[derive(Clone)]
 pub struct StateStore {
     database: Arc<Database>,
+    commits: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(feature = "fault-injection")]
     commit_fault: CommitFaultHandle,
 }
@@ -118,6 +166,7 @@ pub struct StateStore {
 #[derive(Clone, Debug)]
 pub struct StateStoreHandle {
     sender: mpsc::Sender<StoreCommand>,
+    commits: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -140,7 +189,14 @@ enum StoreCommand {
         TorrentId,
         oneshot::Sender<Result<Option<TorrentRecord>, StoreError>>,
     ),
+    GetSummary(TorrentId, oneshot::Sender<Option<TorrentRecord>>),
+    GetMetainfo(
+        TorrentId,
+        oneshot::Sender<Result<Option<Vec<u8>>, StoreError>>,
+    ),
+    FindByWireHash(Sha1Hash, oneshot::Sender<Option<TorrentId>>),
     List(oneshot::Sender<Result<Vec<TorrentRecord>, StoreError>>),
+    ListSummaries(oneshot::Sender<Vec<TorrentRecord>>),
     QuarantinedCount(oneshot::Sender<Result<usize, StoreError>>),
     Remove(TorrentId, oneshot::Sender<Result<bool, StoreError>>),
     IncrementUploaded(TorrentId, u64, oneshot::Sender<Result<bool, StoreError>>),
@@ -171,6 +227,54 @@ pub enum StoreError {
     CommitIo(#[source] io::Error),
 }
 
+/// Read-side view of the tables needed to assemble a record.
+struct RecordTables<'a> {
+    torrents: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+    progress: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+    bitfield: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+    metainfo: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
+    _transaction: &'a redb::ReadTransaction,
+}
+
+impl<'a> RecordTables<'a> {
+    fn open(
+        transaction: &'a redb::ReadTransaction,
+        with_metainfo: bool,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            torrents: transaction.open_table(TORRENTS).map_err(database_error)?,
+            progress: transaction.open_table(PROGRESS).map_err(database_error)?,
+            bitfield: transaction.open_table(BITFIELD).map_err(database_error)?,
+            metainfo: with_metainfo
+                .then(|| transaction.open_table(METAINFO).map_err(database_error))
+                .transpose()?,
+            _transaction: transaction,
+        })
+    }
+
+    /// Assembles the record stored under `key` from its base bytes. Returns the
+    /// decoding error so callers can quarantine the base record.
+    fn assemble(&self, key: &[u8], base: &[u8]) -> Result<TorrentRecord, StoreError> {
+        let mut record = decode_record(base)?;
+        if let Some(value) = self.progress.get(key).map_err(database_error)?
+            && let Ok(counters) = postcard::from_bytes::<TorrentCounters>(value.value())
+        {
+            record.state = counters.state;
+            record.downloaded = counters.downloaded;
+            record.uploaded = counters.uploaded;
+        }
+        if let Some(value) = self.bitfield.get(key).map_err(database_error)? {
+            record.completed_pieces = value.value().to_vec();
+        }
+        if let Some(metainfo) = &self.metainfo
+            && let Some(value) = metainfo.get(key).map_err(database_error)?
+        {
+            record.raw_metainfo = value.value().to_vec();
+        }
+        Ok(record)
+    }
+}
+
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
@@ -179,6 +283,7 @@ impl StateStore {
         let database = Database::create(path).map_err(database_error)?;
         let store = Self {
             database: Arc::new(database),
+            commits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "fault-injection")]
             commit_fault: CommitFaultHandle {
                 state: Arc::new(std::sync::Mutex::new(None)),
@@ -196,7 +301,9 @@ impl StateStore {
         let transaction = self.database.begin_write().map_err(database_error)?;
         {
             let mut torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
+            let mut metainfo = transaction.open_table(METAINFO).map_err(database_error)?;
             let mut progress = transaction.open_table(PROGRESS).map_err(database_error)?;
+            let mut bitfield = transaction.open_table(BITFIELD).map_err(database_error)?;
             let mut hashes = transaction.open_table(HASH_INDEX).map_err(database_error)?;
             let id = record.id.as_uuid();
             let id_bytes = id.as_bytes();
@@ -223,52 +330,82 @@ impl StateStore {
                     }
                 }
             }
-            let encoded = postcard::to_allocvec(record)?;
+            let encoded = postcard::to_allocvec(&record.base())?;
             torrents
                 .insert(id_bytes.as_slice(), encoded.as_slice())
                 .map_err(database_error)?;
-            let encoded_progress = postcard::to_allocvec(&TorrentProgress::from_record(record))?;
+            if record.raw_metainfo.is_empty() {
+                metainfo
+                    .remove(id_bytes.as_slice())
+                    .map_err(database_error)?;
+            } else {
+                metainfo
+                    .insert(id_bytes.as_slice(), record.raw_metainfo.as_slice())
+                    .map_err(database_error)?;
+            }
+            let counters = postcard::to_allocvec(&TorrentCounters::from_record(record))?;
             progress
-                .insert(id_bytes.as_slice(), encoded_progress.as_slice())
+                .insert(id_bytes.as_slice(), counters.as_slice())
+                .map_err(database_error)?;
+            bitfield
+                .insert(id_bytes.as_slice(), record.completed_pieces.as_slice())
                 .map_err(database_error)?;
         }
         self.commit(transaction)
     }
 
     pub fn get_torrent(&self, id: TorrentId) -> Result<Option<TorrentRecord>, StoreError> {
+        self.read_record(id, true)
+    }
+
+    /// The record without its metainfo; `raw_metainfo` is always empty.
+    pub fn get_summary(&self, id: TorrentId) -> Result<Option<TorrentRecord>, StoreError> {
+        self.read_record(id, false)
+    }
+
+    pub fn get_metainfo(&self, id: TorrentId) -> Result<Option<Vec<u8>>, StoreError> {
+        let transaction = self.database.begin_read().map_err(database_error)?;
+        let metainfo = transaction.open_table(METAINFO).map_err(database_error)?;
         let uuid = id.as_uuid();
-        let (raw, progress) = {
+        Ok(metainfo
+            .get(uuid.as_bytes().as_slice())
+            .map_err(database_error)?
+            .map(|value| value.value().to_vec()))
+    }
+
+    fn read_record(
+        &self,
+        id: TorrentId,
+        with_metainfo: bool,
+    ) -> Result<Option<TorrentRecord>, StoreError> {
+        let uuid = id.as_uuid();
+        let key = uuid.as_bytes();
+        let assembled = {
             let transaction = self.database.begin_read().map_err(database_error)?;
-            let torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
-            let progress = transaction.open_table(PROGRESS).map_err(database_error)?;
-            let raw = torrents
-                .get(uuid.as_bytes().as_slice())
+            let tables = RecordTables::open(&transaction, with_metainfo)?;
+            let Some(base) = tables
+                .torrents
+                .get(key.as_slice())
                 .map_err(database_error)?
-                .map(|value| value.value().to_vec());
-            let progress = progress
-                .get(uuid.as_bytes().as_slice())
-                .map_err(database_error)?
-                .map(|value| value.value().to_vec());
-            (raw, progress)
+            else {
+                return Ok(None);
+            };
+            let base = base.value().to_vec();
+            tables.assemble(key, &base).map_err(|_| base)
         };
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        if let Ok(mut record) = decode_record(&raw) {
-            if let Some(progress) = progress {
-                postcard::from_bytes::<TorrentProgress>(&progress)?.apply_to(&mut record);
+        match assembled {
+            Ok(record) => Ok(Some(record)),
+            Err(base) => {
+                self.move_to_quarantine(&[(key.to_vec(), base)])?;
+                Ok(None)
             }
-            Ok(Some(record))
-        } else {
-            self.move_to_quarantine(&[(uuid.as_bytes().to_vec(), raw)])?;
-            Ok(None)
         }
     }
 
     /// Replace an existing record without recreating a concurrently removed
     /// torrent. The writer thread serializes the existence check and update.
     pub fn replace_torrent(&self, record: &TorrentRecord) -> Result<bool, StoreError> {
-        if self.get_torrent(record.id)?.is_none() {
+        if self.get_summary(record.id)?.is_none() {
             return Ok(false);
         }
         self.put_torrent(record)?;
@@ -276,22 +413,24 @@ impl StateStore {
     }
 
     pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StoreError> {
+        self.list_records(true)
+    }
+
+    /// Every record without its metainfo, sorted by id.
+    pub fn list_summaries(&self) -> Result<Vec<TorrentRecord>, StoreError> {
+        self.list_records(false)
+    }
+
+    fn list_records(&self, with_metainfo: bool) -> Result<Vec<TorrentRecord>, StoreError> {
         let mut records = Vec::new();
         let mut corrupt = Vec::new();
         {
             let transaction = self.database.begin_read().map_err(database_error)?;
-            let torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
-            let progress = transaction.open_table(PROGRESS).map_err(database_error)?;
-            for entry in torrents.iter().map_err(database_error)? {
+            let tables = RecordTables::open(&transaction, with_metainfo)?;
+            for entry in tables.torrents.iter().map_err(database_error)? {
                 let (key, value) = entry.map_err(database_error)?;
-                match decode_record(value.value()) {
-                    Ok(mut record) => {
-                        if let Some(value) = progress.get(key.value()).map_err(database_error)? {
-                            postcard::from_bytes::<TorrentProgress>(value.value())?
-                                .apply_to(&mut record);
-                        }
-                        records.push(record);
-                    }
+                match tables.assemble(key.value(), value.value()) {
+                    Ok(record) => records.push(record),
                     Err(_) => corrupt.push((key.value().to_vec(), value.value().to_vec())),
                 }
             }
@@ -311,22 +450,23 @@ impl StateStore {
     }
 
     pub fn remove_torrent(&self, id: TorrentId) -> Result<bool, StoreError> {
-        let current = self.get_torrent(id)?;
+        let current = self.get_summary(id)?;
         let Some(record) = current else {
             return Ok(false);
         };
         let transaction = self.database.begin_write().map_err(database_error)?;
         {
             let mut torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
+            let mut metainfo = transaction.open_table(METAINFO).map_err(database_error)?;
             let mut progress = transaction.open_table(PROGRESS).map_err(database_error)?;
+            let mut bitfield = transaction.open_table(BITFIELD).map_err(database_error)?;
             let mut hashes = transaction.open_table(HASH_INDEX).map_err(database_error)?;
             let uuid = id.as_uuid();
-            torrents
-                .remove(uuid.as_bytes().as_slice())
-                .map_err(database_error)?;
-            progress
-                .remove(uuid.as_bytes().as_slice())
-                .map_err(database_error)?;
+            let key = uuid.as_bytes().as_slice();
+            torrents.remove(key).map_err(database_error)?;
+            metainfo.remove(key).map_err(database_error)?;
+            progress.remove(key).map_err(database_error)?;
+            bitfield.remove(key).map_err(database_error)?;
             for key in hash_keys(&record) {
                 hashes.remove(key.as_slice()).map_err(database_error)?;
             }
@@ -335,8 +475,16 @@ impl StateStore {
         Ok(true)
     }
 
+    /// Adds to the upload counter. The commit is not made durable on its own:
+    /// it becomes persistent with the next durable commit (piece progress,
+    /// state changes, adds and removes), which bounds the loss on a crash to
+    /// the last upload-accounting interval while avoiding one fsync per
+    /// torrent per second.
     pub fn increment_uploaded(&self, id: TorrentId, bytes: u64) -> Result<bool, StoreError> {
-        let transaction = self.database.begin_write().map_err(database_error)?;
+        let mut transaction = self.database.begin_write().map_err(database_error)?;
+        transaction
+            .set_durability(Durability::None)
+            .map_err(database_error)?;
         let updated = {
             let torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
             let mut progress_table = transaction.open_table(PROGRESS).map_err(database_error)?;
@@ -345,18 +493,13 @@ impl StateStore {
             let Some(encoded) = torrents.get(key.as_slice()).map_err(database_error)? else {
                 return Ok(false);
             };
-            let mut progress =
-                if let Some(value) = progress_table.get(key.as_slice()).map_err(database_error)? {
-                    postcard::from_bytes::<TorrentProgress>(value.value())?
-                } else {
-                    TorrentProgress::from_record(&decode_record(encoded.value())?)
-                };
+            let mut counters = read_counters(&progress_table, key.as_slice(), encoded.value())?;
             drop(encoded);
-            progress.uploaded = progress
+            counters.uploaded = counters
                 .uploaded
                 .checked_add(bytes)
                 .ok_or(StoreError::CounterOverflow)?;
-            let encoded = postcard::to_allocvec(&progress)?;
+            let encoded = postcard::to_allocvec(&counters)?;
             progress_table
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(database_error)?;
@@ -366,29 +509,27 @@ impl StateStore {
         Ok(updated)
     }
 
-    fn update_download_progress(&self, update: DownloadProgress) -> Result<bool, StoreError> {
+    fn update_download_progress(&self, update: &DownloadProgress) -> Result<bool, StoreError> {
         let transaction = self.database.begin_write().map_err(database_error)?;
         let updated = {
             let torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
             let mut progress_table = transaction.open_table(PROGRESS).map_err(database_error)?;
+            let mut bitfield = transaction.open_table(BITFIELD).map_err(database_error)?;
             let uuid = update.id.as_uuid();
             let key = uuid.as_bytes();
             let Some(encoded) = torrents.get(key.as_slice()).map_err(database_error)? else {
                 return Ok(false);
             };
-            let mut progress =
-                if let Some(value) = progress_table.get(key.as_slice()).map_err(database_error)? {
-                    postcard::from_bytes::<TorrentProgress>(value.value())?
-                } else {
-                    TorrentProgress::from_record(&decode_record(encoded.value())?)
-                };
+            let mut counters = read_counters(&progress_table, key.as_slice(), encoded.value())?;
             drop(encoded);
-            progress.state = update.state;
-            progress.completed_pieces = update.completed_pieces;
-            progress.downloaded = update.downloaded;
-            let encoded = postcard::to_allocvec(&progress)?;
+            counters.state = update.state;
+            counters.downloaded = update.downloaded;
+            let encoded = postcard::to_allocvec(&counters)?;
             progress_table
                 .insert(key.as_slice(), encoded.as_slice())
+                .map_err(database_error)?;
+            bitfield
+                .insert(key.as_slice(), update.completed_pieces.as_slice())
                 .map_err(database_error)?;
             true
         };
@@ -398,33 +539,39 @@ impl StateStore {
 
     fn initialize_schema(&self) -> Result<(), StoreError> {
         let transaction = self.database.begin_write().map_err(database_error)?;
-        {
-            let mut meta = transaction.open_table(META).map_err(database_error)?;
-            let _quarantine = transaction.open_table(QUARANTINE).map_err(database_error)?;
-            let _torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
-            let _progress = transaction.open_table(PROGRESS).map_err(database_error)?;
-            let _hashes = transaction.open_table(HASH_INDEX).map_err(database_error)?;
-            let found = meta
-                .get("schema_version")
+        let found = {
+            let meta = transaction.open_table(META).map_err(database_error)?;
+            drop(transaction.open_table(QUARANTINE).map_err(database_error)?);
+            drop(transaction.open_table(TORRENTS).map_err(database_error)?);
+            drop(transaction.open_table(METAINFO).map_err(database_error)?);
+            drop(transaction.open_table(PROGRESS).map_err(database_error)?);
+            drop(transaction.open_table(BITFIELD).map_err(database_error)?);
+            drop(transaction.open_table(HASH_INDEX).map_err(database_error)?);
+            meta.get("schema_version")
                 .map_err(database_error)?
-                .map(|version| version.value());
-            match found {
-                Some(found) if found > u64::from(CURRENT_SCHEMA) => {
-                    return Err(StoreError::NewerSchema {
-                        found,
-                        supported: CURRENT_SCHEMA,
-                    });
-                }
-                Some(found) if found < u64::from(CURRENT_SCHEMA) => {
-                    meta.insert("schema_version", u64::from(CURRENT_SCHEMA))
-                        .map_err(database_error)?;
-                }
-                None => {
-                    meta.insert("schema_version", u64::from(CURRENT_SCHEMA))
-                        .map_err(database_error)?;
-                }
-                Some(_) => {}
+                .map(|version| version.value())
+        };
+        match found {
+            Some(found) if found > u64::from(CURRENT_SCHEMA) => {
+                return Err(StoreError::NewerSchema {
+                    found,
+                    supported: CURRENT_SCHEMA,
+                });
             }
+            Some(found) if found < u64::from(CURRENT_SCHEMA) => {
+                if found < u64::from(SPLIT_LAYOUT_SCHEMA) {
+                    migrate_to_split_layout(&transaction)?;
+                }
+                let mut meta = transaction.open_table(META).map_err(database_error)?;
+                meta.insert("schema_version", u64::from(CURRENT_SCHEMA))
+                    .map_err(database_error)?;
+            }
+            None => {
+                let mut meta = transaction.open_table(META).map_err(database_error)?;
+                meta.insert("schema_version", u64::from(CURRENT_SCHEMA))
+                    .map_err(database_error)?;
+            }
+            Some(_) => {}
         }
         self.commit(transaction)
     }
@@ -454,14 +601,18 @@ impl StateStore {
         let transaction = self.database.begin_write().map_err(database_error)?;
         {
             let mut torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
+            let mut metainfo = transaction.open_table(METAINFO).map_err(database_error)?;
             let mut progress = transaction.open_table(PROGRESS).map_err(database_error)?;
+            let mut bitfield = transaction.open_table(BITFIELD).map_err(database_error)?;
             let mut quarantine = transaction.open_table(QUARANTINE).map_err(database_error)?;
             for (id, raw) in corrupt {
                 quarantine
                     .insert(id.as_slice(), raw.as_slice())
                     .map_err(database_error)?;
                 torrents.remove(id.as_slice()).map_err(database_error)?;
+                metainfo.remove(id.as_slice()).map_err(database_error)?;
                 progress.remove(id.as_slice()).map_err(database_error)?;
+                bitfield.remove(id.as_slice()).map_err(database_error)?;
             }
             let mut hashes = transaction.open_table(HASH_INDEX).map_err(database_error)?;
             let mut orphan_hashes = Vec::new();
@@ -480,7 +631,16 @@ impl StateStore {
 
     fn commit(&self, transaction: redb::WriteTransaction) -> Result<(), StoreError> {
         self.maybe_fail_commit()?;
-        transaction.commit().map_err(database_error)
+        transaction.commit().map_err(database_error)?;
+        self.commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Number of successful write commits since the store was opened.
+    #[must_use]
+    pub fn commit_count(&self) -> u64 {
+        self.commits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(feature = "fault-injection")]
@@ -508,6 +668,65 @@ impl StateStore {
     }
 }
 
+/// Moves inline metainfo and bitfields out of the base records and converts
+/// legacy `progress` values into counters. Records that do not decode are left
+/// in place for quarantine.
+fn migrate_to_split_layout(transaction: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let mut torrents = transaction.open_table(TORRENTS).map_err(database_error)?;
+    let mut metainfo = transaction.open_table(METAINFO).map_err(database_error)?;
+    let mut progress = transaction.open_table(PROGRESS).map_err(database_error)?;
+    let mut bitfield = transaction.open_table(BITFIELD).map_err(database_error)?;
+    let mut records = Vec::new();
+    for entry in torrents.iter().map_err(database_error)? {
+        let (key, value) = entry.map_err(database_error)?;
+        if let Ok(record) = decode_record(value.value()) {
+            records.push((key.value().to_vec(), record));
+        }
+    }
+    for (key, mut record) in records {
+        if let Some(value) = progress.get(key.as_slice()).map_err(database_error)?
+            && let Ok(legacy) = postcard::from_bytes::<LegacyProgress>(value.value())
+        {
+            record.state = legacy.state;
+            record.completed_pieces = legacy.completed_pieces;
+            record.downloaded = legacy.downloaded;
+            record.uploaded = legacy.uploaded;
+        }
+        let base = postcard::to_allocvec(&record.base())?;
+        torrents
+            .insert(key.as_slice(), base.as_slice())
+            .map_err(database_error)?;
+        if record.raw_metainfo.is_empty() {
+            metainfo.remove(key.as_slice()).map_err(database_error)?;
+        } else {
+            metainfo
+                .insert(key.as_slice(), record.raw_metainfo.as_slice())
+                .map_err(database_error)?;
+        }
+        let counters = postcard::to_allocvec(&TorrentCounters::from_record(&record))?;
+        progress
+            .insert(key.as_slice(), counters.as_slice())
+            .map_err(database_error)?;
+        bitfield
+            .insert(key.as_slice(), record.completed_pieces.as_slice())
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn read_counters(
+    progress: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    key: &[u8],
+    base: &[u8],
+) -> Result<TorrentCounters, StoreError> {
+    if let Some(value) = progress.get(key).map_err(database_error)?
+        && let Ok(counters) = postcard::from_bytes::<TorrentCounters>(value.value())
+    {
+        return Ok(counters);
+    }
+    Ok(TorrentCounters::from_record(&decode_record(base)?))
+}
+
 #[cfg(feature = "fault-injection")]
 impl CommitFaultHandle {
     pub fn arm(&self, successful_commits: usize, kind: io::ErrorKind) -> Result<(), StoreError> {
@@ -532,6 +751,57 @@ impl CommitFaultHandle {
     }
 }
 
+/// In-memory copy of every record without metainfo, kept on the state thread
+/// so reads that only need summaries never open a database transaction.
+#[derive(Default)]
+struct Mirror {
+    summaries: BTreeMap<TorrentId, TorrentRecord>,
+    wire_hashes: HashMap<Sha1Hash, TorrentId>,
+}
+
+impl Mirror {
+    fn load(store: &StateStore) -> Result<Self, StoreError> {
+        let mut mirror = Self::default();
+        for record in store.list_summaries()? {
+            mirror.upsert(record);
+        }
+        Ok(mirror)
+    }
+
+    fn upsert(&mut self, record: TorrentRecord) {
+        self.remove(record.id);
+        if let Some(hash) = wire_info_hash(&record) {
+            self.wire_hashes.insert(hash, record.id);
+        }
+        self.summaries.insert(record.id, record);
+    }
+
+    fn remove(&mut self, id: TorrentId) {
+        if let Some(previous) = self.summaries.remove(&id)
+            && let Some(hash) = wire_info_hash(&previous)
+            && self.wire_hashes.get(&hash) == Some(&id)
+        {
+            self.wire_hashes.remove(&hash);
+        }
+    }
+
+    fn refresh(&mut self, store: &StateStore, id: TorrentId) {
+        match store.get_summary(id) {
+            Ok(Some(record)) => self.upsert(record),
+            Ok(None) => self.remove(id),
+            Err(_) => {
+                if let Ok(reloaded) = Self::load(store) {
+                    *self = reloaded;
+                }
+            }
+        }
+    }
+
+    fn list(&self) -> Vec<TorrentRecord> {
+        self.summaries.values().cloned().collect()
+    }
+}
+
 impl StateStoreHandle {
     pub fn start(path: &Path, queue_capacity: usize) -> Result<Self, StoreError> {
         let store = StateStore::open(path)?;
@@ -550,41 +820,97 @@ impl StateStoreHandle {
 
     fn start_store(store: StateStore, queue_capacity: usize) -> Result<Self, StoreError> {
         let (sender, mut receiver) = mpsc::channel(queue_capacity);
+        let commits = store.commits.clone();
+        let mut mirror = Mirror::load(&store)?;
         std::thread::Builder::new()
             .name("dendrite-state".to_owned())
             .spawn(move || {
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
                         StoreCommand::Put(record, reply) => {
-                            let _result_ignored = reply.send(store.put_torrent(&record));
+                            let id = record.id;
+                            let result = store.put_torrent(&record);
+                            mirror.refresh(&store, id);
+                            let _result_ignored = reply.send(result);
                         }
                         StoreCommand::Replace(record, reply) => {
-                            let _result_ignored = reply.send(store.replace_torrent(&record));
+                            let id = record.id;
+                            let result = store.replace_torrent(&record);
+                            mirror.refresh(&store, id);
+                            let _result_ignored = reply.send(result);
                         }
                         StoreCommand::Get(id, reply) => {
-                            let _result_ignored = reply.send(store.get_torrent(id));
+                            let result = store.get_torrent(id);
+                            if matches!(result, Ok(None)) && mirror.summaries.contains_key(&id) {
+                                mirror.refresh(&store, id);
+                            }
+                            let _result_ignored = reply.send(result);
+                        }
+                        StoreCommand::GetSummary(id, reply) => {
+                            let _result_ignored = reply.send(mirror.summaries.get(&id).cloned());
+                        }
+                        StoreCommand::GetMetainfo(id, reply) => {
+                            let _result_ignored = reply.send(store.get_metainfo(id));
+                        }
+                        StoreCommand::FindByWireHash(hash, reply) => {
+                            let _result_ignored =
+                                reply.send(mirror.wire_hashes.get(&hash).copied());
                         }
                         StoreCommand::List(reply) => {
-                            let _result_ignored = reply.send(store.list_torrents());
+                            let result = store.list_torrents();
+                            if let Ok(records) = &result
+                                && records.len() != mirror.summaries.len()
+                                && let Ok(reloaded) = Mirror::load(&store)
+                            {
+                                mirror = reloaded;
+                            }
+                            let _result_ignored = reply.send(result);
+                        }
+                        StoreCommand::ListSummaries(reply) => {
+                            let _result_ignored = reply.send(mirror.list());
                         }
                         StoreCommand::QuarantinedCount(reply) => {
                             let _result_ignored = reply.send(store.quarantined_record_count());
                         }
                         StoreCommand::Remove(id, reply) => {
-                            let _result_ignored = reply.send(store.remove_torrent(id));
+                            let result = store.remove_torrent(id);
+                            mirror.refresh(&store, id);
+                            let _result_ignored = reply.send(result);
                         }
                         StoreCommand::IncrementUploaded(id, bytes, reply) => {
-                            let _result_ignored = reply.send(store.increment_uploaded(id, bytes));
+                            let result = store.increment_uploaded(id, bytes);
+                            if let (Ok(true), Some(summary)) =
+                                (&result, mirror.summaries.get_mut(&id))
+                            {
+                                summary.uploaded = summary.uploaded.saturating_add(bytes);
+                            }
+                            let _result_ignored = reply.send(result);
                         }
                         StoreCommand::UpdateDownloadProgress(update, reply) => {
-                            let _result_ignored =
-                                reply.send(store.update_download_progress(update));
+                            let id = update.id;
+                            let result = store.update_download_progress(&update);
+                            mirror.refresh(&store, id);
+                            let _result_ignored = reply.send(result);
                         }
                     }
                 }
             })
             .map_err(database_error)?;
-        Ok(Self { sender })
+        Ok(Self { sender, commits })
+    }
+
+    /// Commands waiting for the state thread.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity())
+    }
+
+    /// Successful write commits since the store was opened.
+    #[must_use]
+    pub fn commit_count(&self) -> u64 {
+        self.commits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn put_torrent(&self, record: TorrentRecord) -> Result<(), StoreError> {
@@ -620,6 +946,41 @@ impl StateStoreHandle {
             .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?
     }
 
+    /// The record without its metainfo, served from memory.
+    pub async fn get_summary(&self, id: TorrentId) -> Result<Option<TorrentRecord>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::GetSummary(id, reply))
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?;
+        response
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))
+    }
+
+    pub async fn get_metainfo(&self, id: TorrentId) -> Result<Option<Vec<u8>>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::GetMetainfo(id, reply))
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?;
+        response
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?
+    }
+
+    /// The torrent whose wire info hash is `hash`, served from memory.
+    pub async fn find_by_wire_hash(&self, hash: Sha1Hash) -> Result<Option<TorrentId>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::FindByWireHash(hash, reply))
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?;
+        response
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))
+    }
+
     pub async fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StoreError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -629,6 +990,18 @@ impl StateStoreHandle {
         response
             .await
             .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?
+    }
+
+    /// Every record without its metainfo, sorted by id, served from memory.
+    pub async fn list_summaries(&self) -> Result<Vec<TorrentRecord>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::ListSummaries(reply))
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))?;
+        response
+            .await
+            .map_err(|_| StoreError::Database("state writer stopped".to_owned()))
     }
 
     pub async fn quarantined_record_count(&self) -> Result<usize, StoreError> {
@@ -736,6 +1109,158 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!("dendrite-{nonce}.redb"))
+    }
+
+    #[test]
+    fn schema_four_layout_migrates_to_split_tables() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_database();
+        let mut record = TorrentRecord {
+            record_version: TorrentRecord::RECORD_VERSION,
+            id: TorrentId::new(),
+            name: "legacy".to_owned(),
+            state: TorrentState::Stopped,
+            v1_info_hash: Some(Sha1Hash::from_bytes([0x91; 20])),
+            v2_info_hash: None,
+            total_length: 1024,
+            raw_metainfo: vec![0x5a; 4096],
+            magnet_uri: None,
+            stop_on_complete: true,
+            completed_pieces: vec![0],
+            downloaded: 0,
+            uploaded: 0,
+            added_at_unix_ms: 7,
+        };
+        {
+            // Write the schema-4 layout by hand: inline metainfo in the base
+            // record and a progress value carrying the bitfield.
+            let database = Database::create(&path)?;
+            let transaction = database.begin_write()?;
+            {
+                let mut meta = transaction.open_table(META)?;
+                meta.insert("schema_version", 4_u64)?;
+                let mut torrents = transaction.open_table(TORRENTS)?;
+                let encoded = postcard::to_allocvec(&record)?;
+                let uuid = record.id.as_uuid();
+                torrents.insert(uuid.as_bytes().as_slice(), encoded.as_slice())?;
+                let mut progress = transaction.open_table(PROGRESS)?;
+                let legacy = postcard::to_allocvec(&LegacyProgress {
+                    state: TorrentState::Downloading,
+                    completed_pieces: vec![0x80],
+                    downloaded: 512,
+                    uploaded: 64,
+                })?;
+                progress.insert(uuid.as_bytes().as_slice(), legacy.as_slice())?;
+                let mut hashes = transaction.open_table(HASH_INDEX)?;
+                for key in hash_keys(&record) {
+                    hashes.insert(key.as_slice(), uuid.as_bytes().as_slice())?;
+                }
+                let _quarantine = transaction.open_table(QUARANTINE)?;
+            }
+            transaction.commit()?;
+        }
+        let store = StateStore::open(&path)?;
+        let migrated = store
+            .get_torrent(record.id)?
+            .ok_or("record lost in migration")?;
+        assert_eq!(migrated.raw_metainfo, record.raw_metainfo);
+        assert_eq!(migrated.state, TorrentState::Downloading);
+        assert_eq!(migrated.completed_pieces, vec![0x80]);
+        assert_eq!(migrated.downloaded, 512);
+        assert_eq!(migrated.uploaded, 64);
+        assert!(migrated.stop_on_complete);
+        let summary = store.get_summary(record.id)?.ok_or("summary missing")?;
+        assert!(summary.raw_metainfo.is_empty());
+        assert_eq!(summary.completed_pieces, vec![0x80]);
+        assert_eq!(summary.uploaded, 64);
+        assert_eq!(
+            store.get_metainfo(record.id)?,
+            Some(record.raw_metainfo.clone())
+        );
+        {
+            let transaction = store.database.begin_read()?;
+            let torrents = transaction.open_table(TORRENTS)?;
+            let uuid = record.id.as_uuid();
+            let base = torrents
+                .get(uuid.as_bytes().as_slice())?
+                .ok_or("base record missing")?
+                .value()
+                .len();
+            assert!(
+                base < 256,
+                "base record still carries metainfo: {base} bytes"
+            );
+            let meta = transaction.open_table(META)?;
+            assert_eq!(
+                meta.get("schema_version")?.map(|value| value.value()),
+                Some(u64::from(CURRENT_SCHEMA))
+            );
+        }
+        assert!(store.increment_uploaded(record.id, 1)?);
+        record.uploaded = 65;
+        assert_eq!(
+            store.get_summary(record.id)?.map(|value| value.uploaded),
+            Some(65)
+        );
+        assert!(store.commit_count() >= 2);
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_serves_summaries_and_hash_lookups_from_memory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_database();
+        let handle = StateStoreHandle::start(&path, 8)?;
+        let record = TorrentRecord {
+            record_version: TorrentRecord::RECORD_VERSION,
+            id: TorrentId::new(),
+            name: "mirror".to_owned(),
+            state: TorrentState::Downloading,
+            v1_info_hash: None,
+            v2_info_hash: Some(Sha256Hash::from_bytes([0x33; 32])),
+            total_length: 2,
+            raw_metainfo: vec![1, 2, 3],
+            magnet_uri: None,
+            stop_on_complete: false,
+            completed_pieces: vec![0],
+            downloaded: 0,
+            uploaded: 0,
+            added_at_unix_ms: 0,
+        };
+        let wire = wire_info_hash(&record).ok_or("wire hash")?;
+        assert_eq!(handle.find_by_wire_hash(wire).await?, None);
+        handle.put_torrent(record.clone()).await?;
+        assert_eq!(handle.find_by_wire_hash(wire).await?, Some(record.id));
+        let summaries = handle.list_summaries().await?;
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].raw_metainfo.is_empty());
+        assert_eq!(handle.get_metainfo(record.id).await?, Some(vec![1, 2, 3]));
+        assert!(handle.increment_uploaded(record.id, 9).await?);
+        assert_eq!(
+            handle
+                .get_summary(record.id)
+                .await?
+                .map(|value| value.uploaded),
+            Some(9)
+        );
+        assert!(
+            handle
+                .update_download_progress(record.id, TorrentState::Seeding, vec![0xc0], 2)
+                .await?
+        );
+        let summary = handle.get_summary(record.id).await?.ok_or("summary")?;
+        assert_eq!(summary.state, TorrentState::Seeding);
+        assert_eq!(summary.completed_pieces, vec![0xc0]);
+        assert_eq!(summary.uploaded, 9);
+        assert!(handle.remove_torrent(record.id).await?);
+        assert_eq!(handle.find_by_wire_hash(wire).await?, None);
+        assert!(handle.list_summaries().await?.is_empty());
+        assert_eq!(handle.queue_depth(), 0);
+        assert!(handle.commit_count() >= 3);
+        drop(handle);
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
@@ -875,7 +1400,7 @@ mod tests {
 
         record.completed_pieces[0] = 0x80;
         record.downloaded = 16 * 1024 * 1024;
-        assert!(store.update_download_progress(DownloadProgress {
+        assert!(store.update_download_progress(&DownloadProgress {
             id: record.id,
             state: record.state,
             completed_pieces: record.completed_pieces.clone(),
@@ -1449,6 +1974,7 @@ mod tests {
         };
         let failed = StateStore {
             database: Arc::new(Database::create(&path)?),
+            commits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commit_fault: faults,
         };
         assert!(matches!(

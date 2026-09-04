@@ -13,7 +13,45 @@ pub struct Settings {
     pub download_dir: PathBuf,
     pub listen: ListenSettings,
     pub limits: Limits,
+    pub transfer: Transfer,
     pub logging: Logging,
+}
+
+/// Upload economics: how many peers are served, how much upload a peer earns
+/// per byte it delivers, and hard caps on egress.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Transfer {
+    /// Regular upload slots per torrent, filled by the peers currently
+    /// delivering the most verified data to us.
+    pub upload_slots: usize,
+    /// Rotating slots that audition otherwise unproven peers.
+    pub optimistic_upload_slots: usize,
+    /// Bytes a downloading torrent may upload to a peer per verified byte
+    /// received from it, on top of the bootstrap allowance. `0` disables the
+    /// reciprocal cap entirely.
+    pub reciprocal_ratio: f64,
+    /// Allowance granted to every peer per hour of connection so it can start
+    /// reciprocating before it has delivered anything.
+    pub reciprocal_bootstrap_bytes: u64,
+    /// Global upload ceiling in bytes per second; `0` is unlimited.
+    pub upload_rate_limit_bytes: u64,
+    /// Per-torrent uploaded/downloaded ratio at which every peer is choked;
+    /// `0` is unlimited.
+    pub torrent_max_upload_ratio: f64,
+}
+
+impl Default for Transfer {
+    fn default() -> Self {
+        Self {
+            upload_slots: 16,
+            optimistic_upload_slots: 4,
+            reciprocal_ratio: 1.0,
+            reciprocal_bootstrap_bytes: 8 * 1024 * 1024,
+            upload_rate_limit_bytes: 0,
+            torrent_max_upload_ratio: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +90,8 @@ pub struct Limits {
     pub api_requests_per_second: usize,
     pub browser_sessions: usize,
     pub list_page_size: usize,
+    pub download_buffer_bytes: usize,
+    pub piece_cache_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -78,6 +118,8 @@ pub enum SettingsError {
         maximum: usize,
         actual: usize,
     },
+    #[error("transfer ratio {name} must be a finite non-negative number, got {actual}")]
+    InvalidRatio { name: &'static str, actual: f64 },
 }
 
 impl Default for Settings {
@@ -87,6 +129,7 @@ impl Default for Settings {
             download_dir: PathBuf::from("./downloads"),
             listen: ListenSettings::default(),
             limits: Limits::default(),
+            transfer: Transfer::default(),
             logging: Logging::default(),
         }
     }
@@ -121,6 +164,8 @@ impl Default for Limits {
             api_requests_per_second: 1_000,
             browser_sessions: 1_024,
             list_page_size: 200,
+            download_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            piece_cache_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -194,6 +239,36 @@ impl Settings {
         )?;
         check_limit("browser_sessions", self.limits.browser_sessions, 1, 100_000)?;
         check_limit("list_page_size", self.limits.list_page_size, 1, 10_000)?;
+        check_limit(
+            "download_buffer_bytes",
+            self.limits.download_buffer_bytes,
+            16 * 1024 * 1024,
+            64 * 1024 * 1024 * 1024,
+        )?;
+        check_limit(
+            "piece_cache_bytes",
+            self.limits.piece_cache_bytes,
+            16 * 1024 * 1024,
+            64 * 1024 * 1024 * 1024,
+        )?;
+        check_limit("upload_slots", self.transfer.upload_slots, 1, 1_000)?;
+        check_limit(
+            "optimistic_upload_slots",
+            self.transfer.optimistic_upload_slots,
+            0,
+            100,
+        )?;
+        for (name, actual) in [
+            ("reciprocal_ratio", self.transfer.reciprocal_ratio),
+            (
+                "torrent_max_upload_ratio",
+                self.transfer.torrent_max_upload_ratio,
+            ),
+        ] {
+            if !actual.is_finite() || actual < 0.0 {
+                return Err(SettingsError::InvalidRatio { name, actual });
+            }
+        }
         if self.limits.active_torrents > self.limits.loaded_torrents {
             return Err(SettingsError::InvalidLimit {
                 name: "active_torrents",
@@ -237,6 +312,28 @@ mod tests {
             PeerEncryption::Preferred
         ));
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn transfer_ratios_must_be_finite() {
+        let mut settings = Settings::default();
+        settings.transfer.reciprocal_ratio = f64::NAN;
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidRatio {
+                name: "reciprocal_ratio",
+                ..
+            })
+        ));
+        settings.transfer.reciprocal_ratio = 0.5;
+        settings.transfer.upload_slots = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidLimit {
+                name: "upload_slots",
+                ..
+            })
+        ));
     }
 
     #[test]

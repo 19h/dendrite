@@ -102,13 +102,34 @@ nodes.
 
 The actor connects to a bounded set of discovered peers over TCP or uTP,
 performs protocol negotiation, and chooses pieces rarest-first. The current
-transfer scheduler uses up to 256 peers, with a 128-block request pipeline per
-peer. Near completion, endgame scheduling can duplicate outstanding requests
-and cancel redundant work when one copy arrives.
+transfer scheduler uses up to 256 peers. Each peer holds a queue of assigned
+pieces sized by its measured rate (2–16 MiB), and its request pipeline spans
+piece boundaries so a piece completing never drains the connection; the
+pipeline grows from 128 to 512 outstanding blocks with the peer's rate, capped
+by the `reqq` the peer advertises. Piece selection is skipped for a peer until
+something it could use becomes selectable, so scheduling cost does not grow
+with piece count. The buffers assigned across every torrent are bounded by
+`limits.download_buffer_bytes`. Near completion, endgame scheduling can
+duplicate outstanding requests and cancel redundant work when one copy
+arrives.
+
+Piece hashes are verified on the blocking thread pool, never on the runtime
+workers that service peer sockets. Verified pieces served to other peers are
+cached per torrent within `limits.piece_cache_bytes`.
+
+Candidates that resolve to this daemon's own address and peer port, and
+connections that present this daemon's own peer id, are rejected.
 
 Peer availability, choke state, timeouts, invalid messages, failed hashes, and
 global connection admission all influence useful concurrency. The constants
 above are upper implementation bounds, not throughput guarantees.
+
+The TCP and uTP accept loops drain their listeners before admission. Incomplete
+incoming handshakes have a separate bounded pool, and excess sockets are closed
+immediately instead of accumulating in the kernel accept queue. Outbound work
+cannot consume the global connection pool's reserved inbound capacity. When a
+connection storm subsides, newly arriving peers are admitted automatically;
+restarting the daemon is not part of the recovery path.
 
 Connections are classified after peer-wire negotiation. A complete bitfield
 marks a full seed. Verified byte rate, remaining useful pieces, integrity

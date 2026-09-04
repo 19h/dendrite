@@ -28,6 +28,7 @@ above are for a short local illustration.
 | `POST` | `/api/v2/torrents` | required | 201 JSON | multipart metainfo import |
 | `POST` | `/api/v2/torrents/magnet` | required | 201 JSON | magnet import |
 | `GET` | `/api/v2/torrents/{id}` | required | 200 JSON | one torrent summary |
+| `PATCH` | `/api/v2/torrents/{id}` | required | 200 JSON | update persistent torrent settings |
 | `DELETE` | `/api/v2/torrents/{id}` | required | 204 | remove record, retain payload |
 | `POST` | `/api/v2/torrents/{id}/actions` | required | 200 JSON | pause, resume, recheck, or announce |
 | `GET` | `/api/v2/events` | required | 101 WebSocket | process-local event stream |
@@ -171,6 +172,22 @@ Supported options:
 `stop_on_complete` defaults to false. When true, successful download or recheck
 completion transitions to `stopped` instead of `seeding`.
 
+## Update torrent settings
+
+```sh
+curl --fail --show-error \
+  -X PATCH \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"stop_on_complete":true}' \
+  "$API/torrents/$ID"
+```
+
+The update is durable and returns the updated torrent summary. Active downloads
+and rechecks observe the latest value at completion. Enabling the setting on a
+torrent already in `seeding` stops it immediately; disabling it does not resume
+a stopped torrent.
+
 The shared options type also contains `destination` and `sequential`, but API
 v2.0 rejects a non-null destination or `sequential: true`. All payloads use the
 global download root and the engine's normal scheduler.
@@ -225,8 +242,8 @@ Each WebSocket text frame is:
 }
 ```
 
-Kinds are `torrent_added`, `torrent_state_changed`, `torrent_removed`, and
-`resync_required`. Sequence is process-local, not a replay offset. On subscriber
+Kinds are `torrent_added`, `torrent_state_changed`, `torrent_settings_changed`,
+`torrent_removed`, and `resync_required`. Sequence is process-local, not a replay offset. On subscriber
 lag the daemon sends `resync_required`, closes the socket, and expects the client
 to retrieve a fresh paginated snapshot.
 
@@ -242,6 +259,10 @@ dendrite_token_rotations_total
 dendrite_browser_sessions_created_total
 dendrite_torrents
 dendrite_active_torrents
+dendrite_state_commits_total
+dendrite_state_queue_depth
+dendrite_downloaded_bytes_total
+dendrite_uploaded_bytes_total
 ```
 
 Counters reset on process restart; there are no per-torrent metric labels.

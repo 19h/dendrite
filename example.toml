@@ -38,6 +38,24 @@ api_concurrency = 256
 api_requests_per_second = 1000
 browser_sessions = 1024
 list_page_size = 200
+# Piece buffers assigned to downloading peers across all torrents, and verified
+# pieces cached for uploads. Raise both on hosts with memory to spare and many
+# peers on large-piece torrents.
+download_buffer_bytes = 8589934592
+piece_cache_bytes = 1073741824
+
+[transfer]
+# Regular slots reward peers by the rate they deliver verified data; optimistic
+# slots audition newcomers. Upload while downloading is capped per peer at the
+# hourly bootstrap plus reciprocal_ratio times what the peer delivered.
+upload_slots = 16
+optimistic_upload_slots = 4
+reciprocal_ratio = 0.5
+reciprocal_bootstrap_bytes = 8388608
+# Hard egress caps: bytes per second across the daemon (0 = unlimited) and the
+# per-torrent uploaded/downloaded ratio at which every peer is choked (0 = off).
+upload_rate_limit_bytes = 0
+torrent_max_upload_ratio = 0.5
 
 [logging]
 filter = "dendrite=info"

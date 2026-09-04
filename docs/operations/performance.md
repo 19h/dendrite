@@ -105,14 +105,29 @@ run the owning tests and relevant fuzz smoke target in addition to the benchmark
 
 Piece writes are concurrent across peers, and verified peers resume downloading
 before a one-second group durability barrier commits their completion bits.
-Full piece buffers remain bounded by the active write set. Mutable completion
-state is stored separately from immutable metainfo, and upload counters are
-flushed in per-torrent batches; these invariants prevent metadata size or peer
-block rate from amplifying state database writes.
+Full piece buffers are bounded globally by `limits.download_buffer_bytes`.
+Piece verification runs on the blocking pool with at most half the CPU
+threads hashing at once. Mutable counters, the completion bitfield, and the
+immutable metainfo are stored in separate tables, upload counters are flushed
+in per-torrent batches without a durable commit of their own, and summaries and
+info-hash lookups are served from an in-memory mirror; these invariants prevent
+metadata size, piece count, or peer block rate from amplifying state database
+work.
+
+Piece selection uses word-level candidate bitsets and a selectability
+generation: a peer that has nothing selectable costs one pass over
+`pieces / 64` words and is not asked again until the generation changes. Each
+peer keeps a rate-sized queue of assigned pieces and a request pipeline that
+spans piece boundaries (128–512 blocks, bounded by the remote `reqq`).
 
 Outbound connection establishment is limited to 128 concurrent handshakes per
 torrent even when the ready-peer ceiling is higher. This avoids synchronized
 timeout waves consuming the entire candidate pool.
+
+Incoming TCP and uTP handshakes share a separate 256-session admission bound.
+The accept loops continue draining excess connections, while a reserved slice
+of the global peer limit prevents outbound workers from starving inbound peer
+admission.
 
 Magnet metadata discovery can probe 32 candidates per torrent, while metadata
 payload transfer is separately limited to four concurrent sessions across the
@@ -124,11 +139,16 @@ multiply memory into gigabytes or one round trip serialize every block.
 While downloading, verified byte rate, useful-piece availability, failures,
 and upload/download reciprocity influence peer retention. Full seeds receive a
 retention preference and scheduling priority; stale or choked non-seeds are
-rotated so queued candidates can be classified. During download, upload credit
-is limited to verified bytes received from the same peer plus a 4 MiB
-bootstrap allowance. Two rotating optimistic slots expose that allowance to
-unknown peers. In `seeding`, reciprocal credit is disabled and recent upload
-rate supplies the fair slot ordering instead.
+rotated so queued candidates can be classified. During download, regular
+upload slots go to peers that hold pieces we still need, ordered by the rate at
+which they deliver verified data; upload credit per peer is
+`reciprocal_bootstrap_bytes` per connected hour plus `reciprocal_ratio` times
+the verified bytes received from it. Optimistic slots rotate through the
+remaining interesting peers with credit. In `seeding`, reciprocal credit is
+disabled and recent upload rate supplies the fair slot ordering instead. A
+global `upload_rate_limit_bytes` and a per-torrent `torrent_max_upload_ratio`
+cap egress independently of slot policy; see the `[transfer]` section of the
+configuration reference.
 
 ## Reproducible result template
 

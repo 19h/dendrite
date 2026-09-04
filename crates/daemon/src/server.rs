@@ -27,11 +27,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dendrite_api_types::{
     API_VERSION, AddTorrentOptions, AddTorrentRequest, BrowserSessionResponse, EventEnvelope,
     ListResponse, Problem, StatusResponse, TokenRotationResponse, TorrentAction,
-    TorrentActionRequest, TorrentSummary,
+    TorrentActionRequest, TorrentSettingsUpdate, TorrentSummary,
 };
 use dendrite_config::{PeerEncryption, Settings};
 use dendrite_core::{TorrentId, TorrentState};
-use dendrite_engine::{EngineHandle, EngineOptions};
+use dendrite_engine::{EngineHandle, EngineOptions, TransferPolicy};
 use dendrite_metainfo::{BencodeLimits, Magnet, Metainfo};
 use dendrite_net::{
     dht::DhtClient,
@@ -167,7 +167,12 @@ fn build_router(settings: &Settings, state: &AppState) -> Result<Router, ServerE
         .route("/status", get(status))
         .route("/torrents", get(list_torrents).post(add_torrent))
         .route("/torrents/magnet", post(add_magnet))
-        .route("/torrents/{id}", get(get_torrent).delete(remove_torrent))
+        .route(
+            "/torrents/{id}",
+            get(get_torrent)
+                .patch(update_torrent_settings)
+                .delete(remove_torrent),
+        )
         .route("/torrents/{id}/actions", post(torrent_action))
         .route("/events", get(events))
         .route("/auth/session", post(create_browser_session))
@@ -266,8 +271,7 @@ async fn initialize_state(settings: &Settings) -> Result<AppState, ServerError> 
     let token = Arc::new(RwLock::new(load_or_create_token(&token_path)?));
     let store = StateStoreHandle::start(&settings.data_dir.join("state.redb"), 256)?;
     let storage = StorageHandle::start(&settings.download_dir, 1024)?;
-    let peer_listener = TcpListener::bind(settings.listen.peer)
-        .await
+    let peer_listener = bind_peer_listener(settings.listen.peer)
         .map_err(|error| ServerError::Server(error.to_string()))?;
     let utp = UtpEndpoint::bind(settings.listen.peer)
         .await
@@ -292,6 +296,16 @@ async fn initialize_state(settings: &Settings) -> Result<AppState, ServerError> 
             },
             peer_connection_limit: settings.limits.peer_connections,
             allow_private_web_seeds: false,
+            download_buffer_bytes: settings.limits.download_buffer_bytes,
+            piece_cache_bytes: settings.limits.piece_cache_bytes,
+            transfer: TransferPolicy {
+                upload_slots: settings.transfer.upload_slots,
+                optimistic_upload_slots: settings.transfer.optimistic_upload_slots,
+                reciprocal_ratio: settings.transfer.reciprocal_ratio,
+                reciprocal_bootstrap_bytes: settings.transfer.reciprocal_bootstrap_bytes,
+                upload_rate_limit_bytes: settings.transfer.upload_rate_limit_bytes,
+                torrent_max_upload_ratio: settings.transfer.torrent_max_upload_ratio,
+            },
         },
     );
     engine.serve_incoming(peer_listener);
@@ -367,12 +381,29 @@ async fn serve(settings: Settings, state: AppState, app: Router) -> Result<(), S
     Ok(())
 }
 
+/// Peer listener with a deep accept queue: bursts of inbound connections
+/// after an announce must not overflow the kernel backlog while handshakes are
+/// being admitted.
+fn bind_peer_listener(address: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    const PEER_LISTEN_BACKLOG: i32 = 4096;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(PEER_LISTEN_BACKLOG)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
+}
+
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let records = state.store.list_torrents().await.unwrap_or_default();
+    let records = state.store.list_summaries().await.unwrap_or_default();
     let quarantined_records = state
         .store
         .quarantined_record_count()
@@ -413,7 +444,7 @@ async fn list_torrents(
     }
     let mut records: Vec<_> = state
         .store
-        .list_torrents()
+        .list_summaries()
         .await
         .map_err(ApiError::from)?
         .into_iter()
@@ -447,7 +478,7 @@ async fn get_torrent(
     let id = parse_id(&id)?;
     state
         .store
-        .get_torrent(id)
+        .get_summary(id)
         .await
         .map_err(ApiError::from)?
         .map(|record| Json(summary(&state, &record)))
@@ -662,6 +693,58 @@ async fn torrent_action(
     Ok(Json(summary(&state, &record)))
 }
 
+async fn update_torrent_settings(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<TorrentSettingsUpdate>,
+) -> Result<Json<TorrentSummary>, ApiError> {
+    let _mutation = state
+        .mutation_slot
+        .acquire()
+        .await
+        .map_err(|_| ApiError::Internal("mutation coordinator stopped".to_owned()))?;
+    let id = parse_id(&id)?;
+    let mut record = state
+        .store
+        .get_torrent(id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::NotFound)?;
+    record.stop_on_complete = request.stop_on_complete;
+    if !state
+        .store
+        .replace_torrent(record.clone())
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::NotFound);
+    }
+    let complete_payload = record.total_length > 0 && record.downloaded >= record.total_length;
+    if request.stop_on_complete
+        && (record.state == TorrentState::Seeding || complete_payload)
+        && record.state != TorrentState::Stopped
+    {
+        state
+            .engine
+            .pause(id)
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        record = state
+            .store
+            .get_torrent(id)
+            .await
+            .map_err(ApiError::from)?
+            .ok_or(ApiError::NotFound)?;
+    }
+    publish(
+        &state,
+        Some(record.id.to_string()),
+        "torrent_settings_changed",
+        serde_json::json!({ "stop_on_complete": record.stop_on_complete }),
+    );
+    Ok(Json(summary(&state, &record)))
+}
+
 async fn remove_torrent(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -825,7 +908,7 @@ async fn rotate_token(
 }
 
 async fn metrics(State(state): State<AppState>) -> Response {
-    let records = state.store.list_torrents().await.unwrap_or_default();
+    let records = state.store.list_summaries().await.unwrap_or_default();
     let active = records
         .iter()
         .filter(|record| is_active(record.state))
@@ -845,7 +928,15 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "# TYPE dendrite_torrents gauge\n",
             "dendrite_torrents {}\n",
             "# TYPE dendrite_active_torrents gauge\n",
-            "dendrite_active_torrents {}\n"
+            "dendrite_active_torrents {}\n",
+            "# TYPE dendrite_state_commits_total counter\n",
+            "dendrite_state_commits_total {}\n",
+            "# TYPE dendrite_state_queue_depth gauge\n",
+            "dendrite_state_queue_depth {}\n",
+            "# TYPE dendrite_downloaded_bytes_total counter\n",
+            "dendrite_downloaded_bytes_total {}\n",
+            "# TYPE dendrite_uploaded_bytes_total counter\n",
+            "dendrite_uploaded_bytes_total {}\n"
         ),
         state.metrics.requests.load(Ordering::Relaxed),
         state
@@ -857,6 +948,13 @@ async fn metrics(State(state): State<AppState>) -> Response {
         state.metrics.sessions_created.load(Ordering::Relaxed),
         records.len(),
         active,
+        state.store.commit_count(),
+        state.store.queue_depth(),
+        records.iter().fold(0_u64, |total, record| total
+            .saturating_add(record.downloaded)),
+        records
+            .iter()
+            .fold(0_u64, |total, record| total.saturating_add(record.uploaded)),
     );
     (
         [(
@@ -898,7 +996,11 @@ async fn openapi() -> Json<serde_json::Value> {
                 "post": { "requestBody": { "required": true }, "responses": { "201": { "description": "Torrent added" } } }
             },
             "/torrents/magnet": { "post": { "responses": { "201": { "description": "Magnet added" } } } },
-            "/torrents/{id}": { "get": { "responses": { "200": { "description": "Torrent" } } }, "delete": { "responses": { "204": { "description": "Removed" } } } },
+            "/torrents/{id}": {
+                "get": { "responses": { "200": { "description": "Torrent" } } },
+                "patch": { "responses": { "200": { "description": "Settings updated" } } },
+                "delete": { "responses": { "204": { "description": "Removed" } } }
+            },
             "/torrents/{id}/actions": { "post": { "responses": { "200": { "description": "Action accepted" } } } },
             "/events": { "get": { "responses": { "101": { "description": "WebSocket event stream" } } } },
             "/auth/session": { "post": { "responses": { "200": { "description": "Browser session created" } } } },
@@ -1095,7 +1197,7 @@ fn sample_rates(state: &AppState, record: &TorrentRecord) -> (u64, u64) {
 }
 
 async fn enforce_capacity(state: &AppState, active: bool) -> Result<(), ApiError> {
-    let records = state.store.list_torrents().await.map_err(ApiError::from)?;
+    let records = state.store.list_summaries().await.map_err(ApiError::from)?;
     if !active && records.len() >= state.loaded_limit {
         return Err(ApiError::Limit(format!(
             "loaded torrent limit {} has been reached",
@@ -1167,7 +1269,7 @@ fn restore_active_torrents(state: &AppState) {
     let store = state.store.clone();
     let engine = state.engine.clone();
     tokio::spawn(async move {
-        let records = match store.list_torrents().await {
+        let records = match store.list_summaries().await {
             Ok(records) => records,
             Err(error) => {
                 warn!(%error, "failed to restore active torrents");
@@ -1488,6 +1590,62 @@ mod tests {
             .await?
             .ok_or("added torrent disappeared")?;
         assert!(record.stop_on_complete);
+        state.engine.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_update_persists_mode_and_stops_existing_seed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, state, token) = test_state(100)?;
+        let id = TorrentId::new();
+        state
+            .store
+            .put_torrent(TorrentRecord {
+                record_version: TorrentRecord::RECORD_VERSION,
+                id,
+                name: "finished-seed".to_owned(),
+                state: TorrentState::Seeding,
+                v1_info_hash: Some(dendrite_core::Sha1Hash::from_bytes([7; 20])),
+                v2_info_hash: None,
+                total_length: 1,
+                raw_metainfo: Vec::new(),
+                magnet_uri: None,
+                stop_on_complete: false,
+                completed_pieces: vec![0x80],
+                downloaded: 1,
+                uploaded: 0,
+                added_at_unix_ms: 0,
+            })
+            .await?;
+        let app = build_router(&test_settings(), &state)?;
+        let enable = Request::patch(format!("/api/v2/torrents/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"stop_on_complete":true}"#))?;
+        let response = app.clone().oneshot(enable).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: TorrentSummary =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+        assert!(summary.stop_on_complete);
+        assert_eq!(summary.state, TorrentState::Stopped);
+
+        let disable = Request::patch(format!("/api/v2/torrents/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"stop_on_complete":false}"#))?;
+        let response = app.oneshot(disable).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: TorrentSummary =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+        assert!(!summary.stop_on_complete);
+        assert_eq!(summary.state, TorrentState::Stopped);
+        let record = state
+            .store
+            .get_torrent(id)
+            .await?
+            .ok_or("updated torrent disappeared")?;
+        assert!(!record.stop_on_complete);
         state.engine.shutdown().await?;
         Ok(())
     }

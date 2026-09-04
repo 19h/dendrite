@@ -14,6 +14,8 @@ pub const LOCAL_PEX_EXTENSION_ID: u8 = 2;
 pub const LOCAL_HOLEPUNCH_EXTENSION_ID: u8 = 3;
 pub const METADATA_BLOCK_BYTES: usize = 16 * 1024;
 pub const PEX_PEER_LIMIT: usize = 50;
+/// Outstanding block requests we accept per peer, advertised as `reqq`.
+pub const REQUEST_QUEUE_LIMIT: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtensionHandshake {
@@ -21,6 +23,10 @@ pub struct ExtensionHandshake {
     pub metadata_size: Option<usize>,
     pub pex_extension_id: Option<u8>,
     pub holepunch_extension_id: Option<u8>,
+    /// Outstanding requests the remote is willing to queue (`reqq`).
+    pub request_queue: Option<usize>,
+    /// The address the remote sees us at (`yourip`).
+    pub your_ip: Option<std::net::IpAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,11 +96,11 @@ pub enum ExtensionCodecError {
 
 #[must_use]
 pub fn encode_extension_handshake(metadata_size: Option<usize>) -> Bytes {
-    let mut encoded = BytesMut::from(&b"d1:md12:ut_holepunchi3e11:ut_metadatai1e6:ut_pexi2eee"[..]);
+    let mut encoded = BytesMut::from(&b"d1:md12:ut_holepunchi3e11:ut_metadatai1e6:ut_pexi2ee"[..]);
     if let Some(size) = metadata_size {
-        encoded.truncate(encoded.len() - 1);
-        encoded.extend_from_slice(format!("13:metadata_sizei{size}ee").as_bytes());
+        encoded.extend_from_slice(format!("13:metadata_sizei{size}e").as_bytes());
     }
+    encoded.extend_from_slice(format!("4:reqqi{REQUEST_QUEUE_LIMIT}ee").as_bytes());
     encoded.freeze()
 }
 
@@ -156,11 +162,28 @@ pub fn decode_extension_handshake(
                 .ok_or(ExtensionCodecError::Field("m.ut_holepunch"))
         })
         .transpose()?;
+    let request_queue = root
+        .value
+        .dictionary_get(b"reqq")
+        .and_then(|value| value.value.as_integer())
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let your_ip = root
+        .value
+        .dictionary_get(b"yourip")
+        .and_then(|value| value.value.as_bytes())
+        .and_then(|bytes| match bytes.len() {
+            4 => <[u8; 4]>::try_from(bytes).ok().map(std::net::IpAddr::from),
+            16 => <[u8; 16]>::try_from(bytes).ok().map(std::net::IpAddr::from),
+            _ => None,
+        });
     Ok(ExtensionHandshake {
         metadata_extension_id,
         metadata_size,
         pex_extension_id,
         holepunch_extension_id,
+        request_queue,
+        your_ip,
     })
 }
 
@@ -526,8 +549,30 @@ mod tests {
                 metadata_size: Some(32_768),
                 pex_extension_id: Some(LOCAL_PEX_EXTENSION_ID),
                 holepunch_extension_id: Some(LOCAL_HOLEPUNCH_EXTENSION_ID),
+                request_queue: Some(REQUEST_QUEUE_LIMIT),
+                your_ip: None,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn extension_handshake_reads_remote_queue_and_our_address() -> Result<(), ExtensionCodecError> {
+        let encoded = b"d1:md11:ut_metadatai7ee4:reqqi250e6:yourip4:\x7f\x00\x00\x01e";
+        let handshake = decode_extension_handshake(encoded, 64 * 1024)?;
+        assert_eq!(handshake.request_queue, Some(250));
+        assert_eq!(
+            handshake.your_ip,
+            Some(std::net::IpAddr::from([127, 0, 0, 1]))
+        );
+        let v6 =
+            b"d1:mde6:yourip16:\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01e";
+        let handshake = decode_extension_handshake(v6, 64 * 1024)?;
+        assert_eq!(
+            handshake.your_ip,
+            Some(std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]))
+        );
+        assert_eq!(handshake.request_queue, None);
         Ok(())
     }
 

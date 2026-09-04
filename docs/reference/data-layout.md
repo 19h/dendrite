@@ -68,14 +68,19 @@ The unit grants write access only to the state and payload roots and runs with
 
 ## What the database owns
 
-The current database schema stores:
+The current database schema (version 5) stores, in separate tables keyed by
+torrent id:
 
-- UUID, name, lifecycle state, v1/v2 identity;
-- raw metainfo or original magnet URI;
-- total length and piece-completion bitmap;
-- downloaded/uploaded counters and added timestamp;
+- the immutable record: UUID, name, v1/v2 identity, total length, original
+  magnet URI, and the stop-on-complete setting;
+- the raw metainfo;
+- the small mutable counters: lifecycle state and downloaded/uploaded bytes;
+- the piece-completion bitmap;
 - unique identity indexes;
 - quarantined undecodable record bytes.
+
+Databases written by earlier schemas are migrated into this layout when the
+daemon opens them.
 
 It does not embed torrent payloads. It also does not provide a supported public
 editing or export format.

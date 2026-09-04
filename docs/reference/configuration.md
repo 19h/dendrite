@@ -67,10 +67,32 @@ remain operator responsibilities.
 | `api_requests_per_second` | 1,000 | 1–1,000,000 | fixed one-second admission window |
 | `browser_sessions` | 1,024 | 1–100,000 | in-memory browser sessions |
 | `list_page_size` | 200 | 1–10,000 | maximum/default torrent list page |
+| `download_buffer_bytes` | 2,147,483,648 (2 GiB) | 16 MiB–64 GiB | piece buffers assigned to downloading peers across all torrents |
+| `piece_cache_bytes` | 536,870,912 (512 MiB) | 16 MiB–64 GiB | verified pieces cached for upload across all torrents |
 
 These are ceilings, not allocations or recommended values for every host.
 Configured body sizes do not relax lower-level structural/message limits in the
 owning parsers.
+
+## `[transfer]`
+
+Upload economics. Regular slots reward peers by the rate at which they deliver
+verified data; every other lever bounds egress.
+
+| Setting | Type | Default | Meaning |
+|---|---|---:|---|
+| `upload_slots` | integer 1–1,000 | `16` | regular upload slots per torrent |
+| `optimistic_upload_slots` | integer 0–100 | `4` | rotating audition slots per torrent |
+| `reciprocal_ratio` | non-negative number | `1.0` | bytes a downloading torrent may upload to a peer per verified byte received from it; `0` disables the cap |
+| `reciprocal_bootstrap_bytes` | integer | `8388608` (8 MiB) | allowance granted to each peer per hour of connection before it has delivered anything |
+| `upload_rate_limit_bytes` | integer | `0` | global upload ceiling in bytes per second; `0` is unlimited |
+| `torrent_max_upload_ratio` | non-negative number | `0` | uploaded/downloaded ratio at which a torrent chokes every peer; `0` is unlimited |
+
+While a torrent is downloading, regular slots go only to peers that hold
+pieces the torrent still needs, because upload to anyone else cannot be repaid
+in kind. While seeding, interest is ignored and recent upload rate orders the
+slots. The credit cap and the ratio cap are independent: the first is per peer,
+the second per torrent.
 
 ## `[logging]`
 
@@ -106,6 +128,16 @@ api_concurrency = 256
 api_requests_per_second = 1000
 browser_sessions = 1024
 list_page_size = 200
+download_buffer_bytes = 2147483648
+piece_cache_bytes = 536870912
+
+[transfer]
+upload_slots = 16
+optimistic_upload_slots = 4
+reciprocal_ratio = 1.0
+reciprocal_bootstrap_bytes = 8388608
+upload_rate_limit_bytes = 0
+torrent_max_upload_ratio = 0.0
 
 [logging]
 filter = "dendrite=info"
