@@ -97,7 +97,7 @@ verified data; every other lever bounds egress.
 | `optimistic_upload_slots` | integer 0–100 | `4` | rotating audition slots per torrent |
 | `reciprocal_ratio` | non-negative number | `1.0` | bytes a downloading torrent may upload to a peer per verified byte received from it; `0` disables the cap |
 | `reciprocal_bootstrap_bytes` | integer | `8388608` (8 MiB) | allowance granted to each peer per hour of connection before it has delivered anything |
-| `upload_rate_limit_bytes` | integer | `0` | global upload ceiling in bytes per second; `0` is unlimited |
+| `upload_rate_limit_bytes` | integer | `0` | upload ceiling per torrent in bytes per second; `0` is unlimited |
 | `torrent_max_upload_ratio` | non-negative number | `0` | uploaded/downloaded ratio at which a torrent chokes every peer; `0` is unlimited |
 
 While a torrent is downloading, regular slots go only to peers that hold

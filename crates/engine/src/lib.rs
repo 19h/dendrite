@@ -348,7 +348,7 @@ pub struct TransferPolicy {
     pub reciprocal_ratio: f64,
     /// Allowance every peer earns per hour of connection.
     pub reciprocal_bootstrap_bytes: u64,
-    /// Global upload ceiling in bytes per second; `0` is unlimited.
+    /// Upload ceiling per torrent in bytes per second; `0` is unlimited.
     pub upload_rate_limit_bytes: u64,
     /// Uploaded/downloaded ratio at which a torrent chokes everyone; `0.0`
     /// is unlimited.
@@ -448,6 +448,9 @@ struct Services {
     connected_peers: Arc<AtomicUsize>,
     torrent_activity: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     payload_claims: Arc<std::sync::Mutex<PayloadClaims>>,
+    /// Non-padding payload paths per loaded torrent, parsed once so starting a
+    /// torrent does not re-decode every other torrent's metainfo.
+    payload_paths: Arc<std::sync::Mutex<HashMap<TorrentId, Arc<Vec<TorrentPath>>>>>,
     download_budget: Arc<DownloadBudget>,
     piece_cache_budget: Arc<CacheBudget>,
     hash_slots: Arc<Semaphore>,
@@ -661,7 +664,9 @@ struct UploadPolicy {
     sessions: HashMap<u64, UploadSession>,
     reputation: HashMap<(TorrentId, PeerKey), PeerReputation>,
     round: u64,
-    limiter: UploadLimiter,
+    /// One token bucket per torrent: the configured ceiling applies to each
+    /// torrent, so extra torrents never dilute another's reciprocity budget.
+    limiters: HashMap<TorrentId, UploadLimiter>,
 }
 
 /// Token bucket for the global upload ceiling; negative balances translate
@@ -1076,6 +1081,7 @@ impl EngineHandle {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(options.download_buffer_bytes.max(1))),
             piece_cache_budget: Arc::new(CacheBudget::new(options.piece_cache_bytes)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -1448,7 +1454,9 @@ fn set_session_interesting(
 }
 
 /// Delays the caller so global upload stays under the configured ceiling.
-async fn throttle_upload(services: &Services, bytes: u64) {
+/// Delays the caller so the torrent's upload stays under the configured
+/// per-torrent ceiling.
+async fn throttle_upload(services: &Services, torrent_id: TorrentId, bytes: u64) {
     let rate = services.transfer.upload_rate_limit_bytes;
     if rate == 0 {
         return;
@@ -1457,7 +1465,11 @@ async fn throttle_upload(services: &Services, bytes: u64) {
         .upload_policy
         .lock()
         .map_or(Duration::ZERO, |mut policy| {
-            policy.limiter.charge(rate, bytes)
+            policy
+                .limiters
+                .entry(torrent_id)
+                .or_default()
+                .charge(rate, bytes)
         });
     if !wait.is_zero() {
         tokio::time::sleep(wait).await;
@@ -1630,6 +1642,19 @@ async fn run_upload_choker(services: Services) {
     }
 }
 
+/// Drops reputation for peers not seen in an hour and limiters for torrents
+/// without sessions, so neither grows with churn.
+fn prune_upload_policy(policy: &mut UploadPolicy, active: &HashSet<(TorrentId, PeerKey)>) {
+    policy.reputation.retain(|key, reputation| {
+        active.contains(key) || reputation.last_seen.elapsed() < REPUTATION_RETENTION
+    });
+    let active_torrents: HashSet<TorrentId> =
+        active.iter().map(|(torrent_id, _)| *torrent_id).collect();
+    policy
+        .limiters
+        .retain(|torrent_id, _| active_torrents.contains(torrent_id));
+}
+
 async fn rebalance_upload_slots(services: &Services) {
     let transfer = services.transfer;
     let summaries = services.store.list_summaries().await.unwrap_or_default();
@@ -1661,9 +1686,7 @@ async fn rebalance_upload_slots(services: &Services) {
             .values()
             .map(|entry| (entry.torrent_id, entry.peer))
             .collect();
-        policy.reputation.retain(|key, reputation| {
-            active.contains(key) || reputation.last_seen.elapsed() < REPUTATION_RETENTION
-        });
+        prune_upload_policy(&mut policy, &active);
         let mut by_torrent = HashMap::<TorrentId, Vec<UploadCandidate>>::new();
         let reputation = &policy.reputation;
         for (session, entry) in &policy.sessions {
@@ -2590,7 +2613,7 @@ async fn serve_piece_request(
     }
     let block = data.slice(begin..end);
     let uploaded = u64::try_from(block.len()).map_err(|_| ActorError::Arithmetic)?;
-    throttle_upload(services, uploaded).await;
+    throttle_upload(services, seed.torrent_id, uploaded).await;
     peer.send(PeerMessage::Piece {
         piece: request.piece,
         begin: request.begin,
@@ -2855,6 +2878,9 @@ async fn supervisor(
             EngineCommand::Forget { id, reply } => {
                 stop_actor(&mut active, id).await;
                 services.incoming_content.lock().await.remove(&id);
+                if let Ok(mut cache) = services.payload_paths.lock() {
+                    cache.remove(&id);
+                }
                 let _result_ignored = reply.send(());
             }
             EngineCommand::Shutdown { reply } => {
@@ -2974,27 +3000,17 @@ async fn ensure_exclusive_payload_paths(
 ) -> Result<(), ActorError> {
     let current_key = (record.added_at_unix_ms, record.id);
     let mut prior_paths = PayloadClaims::default();
-    for other in services.store.list_torrents().await? {
+    for other in services.store.list_summaries().await? {
         cancelled(cancellation)?;
-        if other.id == record.id
-            || other.raw_metainfo.is_empty()
-            || (other.added_at_unix_ms, other.id) > current_key
-        {
+        if other.id == record.id || (other.added_at_unix_ms, other.id) > current_key {
             continue;
         }
-        let Ok(other_metainfo) = Metainfo::parse(
-            &other.raw_metainfo,
-            BencodeLimits {
-                input_bytes: services.metainfo_limit,
-                byte_string_bytes: services.metainfo_limit,
-                ..BencodeLimits::default()
-            },
-        ) else {
+        let Some(paths) = payload_paths_for(other.id, services).await? else {
             continue;
         };
-        for file in other_metainfo.files.iter().filter(|file| !file.padding) {
+        for path in paths.iter() {
             cancelled(cancellation)?;
-            prior_paths.insert(other.id, &file.path);
+            prior_paths.insert(other.id, path);
         }
     }
     for file in metainfo.files.iter().filter(|file| !file.padding) {
@@ -3007,6 +3023,52 @@ async fn ensure_exclusive_payload_paths(
         }
     }
     Ok(())
+}
+
+/// Non-padding payload paths of a loaded torrent, parsed from its metainfo at
+/// most once per daemon run. `None` when the torrent has no metainfo yet.
+async fn payload_paths_for(
+    id: TorrentId,
+    services: &Services,
+) -> Result<Option<Arc<Vec<TorrentPath>>>, ActorError> {
+    if let Some(paths) = services
+        .payload_paths
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&id).cloned())
+    {
+        return Ok(Some(paths));
+    }
+    let Some(raw) = services
+        .store
+        .get_metainfo(id)
+        .await?
+        .filter(|raw| !raw.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Ok(metainfo) = Metainfo::parse(
+        &raw,
+        BencodeLimits {
+            input_bytes: services.metainfo_limit,
+            byte_string_bytes: services.metainfo_limit,
+            ..BencodeLimits::default()
+        },
+    ) else {
+        return Ok(None);
+    };
+    let paths = Arc::new(
+        metainfo
+            .files
+            .iter()
+            .filter(|file| !file.padding)
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+    );
+    if let Ok(mut cache) = services.payload_paths.lock() {
+        cache.insert(id, paths.clone());
+    }
+    Ok(Some(paths))
 }
 
 fn normalized_payload_path(path: &TorrentPath) -> String {
@@ -7290,12 +7352,14 @@ fn cancelled(token: &CancellationToken) -> Result<(), ActorError> {
     }
 }
 
+/// Azureus-style client prefix that starts every peer id this daemon uses.
+const PEER_ID_PREFIX: &[u8; 8] = b"-SY0010-";
+
 fn generate_peer_id() -> PeerId {
-    const PREFIX: &[u8; 8] = b"-SY0010-";
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let random: [u8; 12] = rand::random();
     let mut id = [0_u8; 20];
-    id[..8].copy_from_slice(PREFIX);
+    id[..8].copy_from_slice(PEER_ID_PREFIX);
     for (output, value) in id[8..].iter_mut().zip(random) {
         *output = ALPHABET[usize::from(value) % ALPHABET.len()];
     }
@@ -7691,7 +7755,8 @@ mod tests {
 
     #[test]
     fn peer_ids_have_stable_prefix() {
-        assert_eq!(&generate_peer_id().as_bytes()[..8], b"-SY2000-");
+        assert_eq!(&generate_peer_id().as_bytes()[..8], PEER_ID_PREFIX);
+        assert!(PEER_ID_PREFIX.starts_with(b"-SY") && PEER_ID_PREFIX.ends_with(b"-"));
     }
 
     #[test]
@@ -7981,6 +8046,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -8785,6 +8851,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -9017,6 +9084,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -9107,6 +9175,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -9657,6 +9726,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -9835,6 +9905,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
@@ -11912,6 +11983,7 @@ mod tests {
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
+            payload_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),

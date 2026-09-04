@@ -54,7 +54,7 @@ pub struct Transfer {
     /// Allowance granted to every peer per hour of connection so it can start
     /// reciprocating before it has delivered anything.
     pub reciprocal_bootstrap_bytes: u64,
-    /// Global upload ceiling in bytes per second; `0` is unlimited.
+    /// Upload ceiling per torrent in bytes per second; `0` is unlimited.
     pub upload_rate_limit_bytes: u64,
     /// Per-torrent uploaded/downloaded ratio at which every peer is choked;
     /// `0` is unlimited.

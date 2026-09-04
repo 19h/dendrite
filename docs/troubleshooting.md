@@ -238,7 +238,8 @@ that verified, and only peers holding pieces the torrent still needs occupy
 regular upload slots. If every peer is choking you, raise the bootstrap or
 ratio in `[transfer]` so remote tit-for-tat clients see you reciprocating; if
 `dendrite_uploaded_bytes_total` climbs faster than your egress budget allows,
-lower them or set `upload_rate_limit_bytes` / `torrent_max_upload_ratio`. A
+lower them or set the per-torrent `upload_rate_limit_bytes` /
+`torrent_max_upload_ratio`. A
 full seed cannot be rewarded with payload because it already has every piece
 and will not request any; Dendrite instead retains full seeds preferentially
 and schedules them before partial sources.

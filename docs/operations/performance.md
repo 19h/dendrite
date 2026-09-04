@@ -173,8 +173,8 @@ which they deliver verified data; upload credit per peer is
 the verified bytes received from it. Optimistic slots rotate through the
 remaining interesting peers with credit. In `seeding`, reciprocal credit is
 disabled and recent upload rate supplies the fair slot ordering instead. A
-global `upload_rate_limit_bytes` and a per-torrent `torrent_max_upload_ratio`
-cap egress independently of slot policy; see the `[transfer]` section of the
+per-torrent `upload_rate_limit_bytes` and `torrent_max_upload_ratio` cap
+egress independently of slot policy; see the `[transfer]` section of the
 configuration reference.
 
 ## Reproducible result template
