@@ -359,9 +359,10 @@ fn render_torrent_detail(torrent: &TorrentSummary) -> String {
     );
     let _ = writeln!(
         output,
-        "Sources  {} seeds   {} active downloaders   ETA {}",
+        "Sources  {} seeds   {} peer downloads   {} web seeds   ETA {}",
         torrent.seed_peers,
         torrent.active_downloaders,
+        torrent.active_web_seeds,
         format_eta(torrent)
     );
     output
@@ -389,6 +390,9 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
     let active_downloaders = torrents.iter().fold(0_u64, |total, torrent| {
         total.saturating_add(u64::from(torrent.active_downloaders))
     });
+    let active_web_seeds = torrents.iter().fold(0_u64, |total, torrent| {
+        total.saturating_add(u64::from(torrent.active_web_seeds))
+    });
     let mut output = String::new();
     let noun = if torrents.len() == 1 {
         "torrent"
@@ -402,14 +406,15 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
     );
     let _ = writeln!(
         output,
-        "Total: ↓ {}   ↑ {}   peers {} ({} in / {} out)   sources {} seeds / {} active\n",
+        "Total: ↓ {}   ↑ {}   peers {} ({} in / {} out)   sources {} seeds / {} peer / {} web\n",
         format_rate(download_rate),
         format_rate(upload_rate),
         peers,
         inbound_peers,
         outbound_peers,
         seed_peers,
-        active_downloaders
+        active_downloaders,
+        active_web_seeds
     );
     if torrents.is_empty() {
         let _ = writeln!(output, "No torrents.");
@@ -425,7 +430,7 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
         "DOWN",
         "UP",
         "PEERS T/I/O",
-        "SEEDS/ACTIVE",
+        "SEED/P2P/WEB",
         "ETA"
     );
     for torrent in torrents {
@@ -451,7 +456,10 @@ fn render_torrent_table(torrents: &[TorrentSummary]) -> String {
                 "{}/{}/{}",
                 torrent.peers, torrent.inbound_peers, torrent.outbound_peers
             ),
-            format!("{}/{}", torrent.seed_peers, torrent.active_downloaders),
+            format!(
+                "{}/{}/{}",
+                torrent.seed_peers, torrent.active_downloaders, torrent.active_web_seeds
+            ),
             format_eta(torrent)
         );
     }
@@ -790,6 +798,7 @@ mod tests {
         assert!(detail.contains("↓ 1.00 KiB/s"));
         assert!(detail.contains("31 inbound"));
         assert!(detail.contains("8 seeds"));
+        assert!(detail.contains("2 web seeds"));
         assert!(detail.contains("Complete stop"));
         assert!(detail.contains("ETA 3s"));
 
@@ -797,7 +806,7 @@ mod tests {
         assert!(table.contains("1 torrent"));
         assert!(table.contains("Total: ↓ 1.00 KiB/s"));
         assert!(table.contains("51/31/20"));
-        assert!(table.contains("8/6"));
+        assert!(table.contains("8/6/2"));
         assert!(table.contains("DOWN"));
         assert!(table.contains("steam2"));
         assert!(render_torrent_table(&[]).contains("No torrents."));
@@ -886,6 +895,7 @@ mod tests {
             outbound_peers: 20,
             seed_peers: 8,
             active_downloaders: 6,
+            active_web_seeds: 2,
         }
     }
 }

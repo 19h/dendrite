@@ -53,6 +53,8 @@ pub struct TorrentSummary {
     pub seed_peers: u32,
     #[serde(default)]
     pub active_downloaders: u32,
+    #[serde(default)]
+    pub active_web_seeds: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -351,7 +351,14 @@ fn parse_v2_files(
     let tree = get(info, b"file tree").ok_or(MetainfoError::Field("info.file tree"))?;
     let tree_dict = dictionary(tree).ok_or(MetainfoError::Field("info.file tree"))?;
     let mut files = Vec::new();
-    let mut components = vec![name.to_owned()];
+    // BEP 52 paths start at the file-tree root and `info.name` is advisory.
+    // A hybrid v1 multifile layout is the exception in our normalized model:
+    // its `files` paths are relative to the directory named by `info.name`.
+    let mut components = if get(info, b"files").is_some() {
+        vec![name.to_owned()]
+    } else {
+        Vec::new()
+    };
     walk_v2_tree(tree_dict, &mut components, &mut files, 0)?;
     if files.is_empty() {
         return Err(MetainfoError::EmptyFiles);
@@ -699,6 +706,48 @@ mod tests {
             Err(MetainfoError::PieceLayerRoot(value)) if value == root
         ));
         Ok(())
+    }
+
+    #[test]
+    fn parses_single_file_hybrid_without_duplicating_info_name() -> Result<(), MetainfoError> {
+        let input = single_file_hybrid_metainfo("test", 4);
+        let parsed = Metainfo::parse(&input, BencodeLimits::default())?;
+
+        assert_eq!(parsed.version, TorrentVersion::Hybrid);
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].path.to_string(), "test");
+        assert_eq!(parsed.files[0].path, parsed.v1_files[0].path);
+        assert_eq!(parsed.files[0].length, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_genuinely_mismatched_single_file_hybrid() {
+        let input = single_file_hybrid_metainfo("other", 4);
+        assert!(matches!(
+            Metainfo::parse(&input, BencodeLimits::default()),
+            Err(MetainfoError::HybridFileMismatch)
+        ));
+    }
+
+    fn single_file_hybrid_metainfo(v2_file_name: &str, length: u64) -> Vec<u8> {
+        let mut input = format!(
+            "d4:infod9:file treed{}:{}d0:d6:lengthi{}e11:pieces root32:",
+            v2_file_name.len(),
+            v2_file_name,
+            length
+        )
+        .into_bytes();
+        input.extend_from_slice(&[1; 32]);
+        input.extend_from_slice(
+            format!(
+                "eee6:lengthi{length}e12:meta versioni2e4:name4:test12:piece lengthi16384e6:pieces20:"
+            )
+            .as_bytes(),
+        );
+        input.extend_from_slice(&[2; 20]);
+        input.extend_from_slice(b"ee");
+        input
     }
 
     fn v2_metainfo(root: Sha256Hash, first: Sha256Hash, second: Sha256Hash) -> Vec<u8> {

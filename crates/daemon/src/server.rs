@@ -1163,6 +1163,7 @@ fn summary(state: &AppState, record: &TorrentRecord) -> TorrentSummary {
         outbound_peers: u32::try_from(peers.outbound).unwrap_or(u32::MAX),
         seed_peers: u32::try_from(peers.seeds).unwrap_or(u32::MAX),
         active_downloaders: u32::try_from(peers.active_downloaders).unwrap_or(u32::MAX),
+        active_web_seeds: u32::try_from(peers.active_web_seeds).unwrap_or(u32::MAX),
     }
 }
 

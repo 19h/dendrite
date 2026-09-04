@@ -183,7 +183,7 @@ fn tracker_client_builder() -> reqwest::ClientBuilder {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(3))
-        .user_agent(concat!("dendrite/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("synapse/", env!("CARGO_PKG_VERSION")))
 }
 
 fn announce_url(base: &Url, request: TrackerRequest) -> Result<Url, TrackerServiceError> {

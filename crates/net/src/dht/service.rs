@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    io,
+    fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -8,15 +8,13 @@ use std::{
 
 use bytes::Bytes;
 use dendrite_core::Sha1Hash;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use thiserror::Error;
-use tokio::{
-    net::UdpSocket,
-    sync::Mutex,
-    time::{Instant, timeout_at},
-};
+use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
+use tokio_util::sync::CancellationToken;
 
 use super::{
-    DhtCodecError, DhtMessage, NodeId, decode_message, encode_announce_peer_query,
+    DhtCodecError, DhtMessage, DhtResponse, NodeId, decode_message, encode_announce_peer_query,
     encode_get_peers_query,
 };
 
@@ -36,8 +34,152 @@ pub struct DhtClient {
     query_limit: usize,
     packet_limit: usize,
     query_timeout: Duration,
-    socket: Option<Arc<Mutex<UdpSocket>>>,
+    transport: Option<Arc<BoundTransport>>,
     known_nodes: Arc<std::sync::Mutex<VecDeque<SocketAddr>>>,
+}
+
+struct PendingQuery {
+    expected: SocketAddr,
+    response: oneshot::Sender<DhtResponse>,
+}
+
+struct BoundTransport {
+    socket: Arc<UdpSocket>,
+    pending: Arc<std::sync::Mutex<HashMap<[u8; 4], PendingQuery>>>,
+    shutdown: CancellationToken,
+}
+
+impl fmt::Debug for BoundTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundTransport")
+            .field("local_address", &self.socket.local_addr().ok())
+            .field(
+                "pending_queries",
+                &self.pending.lock().map_or(0, |pending| pending.len()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for BoundTransport {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+struct PendingGuard {
+    transaction: [u8; 4],
+    pending: Arc<std::sync::Mutex<HashMap<[u8; 4], PendingQuery>>>,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.transaction);
+        }
+    }
+}
+
+impl BoundTransport {
+    async fn bind(address: SocketAddr, packet_limit: usize) -> Result<Arc<Self>, DhtServiceError> {
+        let socket = Arc::new(
+            UdpSocket::bind(address)
+                .await
+                .map_err(DhtServiceError::Io)?,
+        );
+        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let shutdown = CancellationToken::new();
+        tokio::spawn(dispatch_responses(
+            socket.clone(),
+            pending.clone(),
+            shutdown.clone(),
+            packet_limit,
+        ));
+        Ok(Arc::new(Self {
+            socket,
+            pending,
+            shutdown,
+        }))
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr, DhtServiceError> {
+        self.socket.local_addr().map_err(DhtServiceError::Io)
+    }
+
+    async fn query(
+        &self,
+        address: SocketAddr,
+        node_id: NodeId,
+        info_hash: Sha1Hash,
+        query_timeout: Duration,
+    ) -> (SocketAddr, Option<DhtResponse>) {
+        let (response, receiver) = oneshot::channel();
+        let transaction = loop {
+            let candidate: [u8; 4] = rand::random();
+            let Ok(mut pending) = self.pending.lock() else {
+                return (address, None);
+            };
+            if let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(candidate) {
+                entry.insert(PendingQuery {
+                    expected: address,
+                    response,
+                });
+                break candidate;
+            }
+        };
+        let _guard = PendingGuard {
+            transaction,
+            pending: self.pending.clone(),
+        };
+        let query = encode_get_peers_query(&transaction, node_id, info_hash);
+        if self.socket.send_to(&query, address).await.is_err() {
+            return (address, None);
+        }
+        let response = timeout(query_timeout, receiver)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        (address, response)
+    }
+}
+
+async fn dispatch_responses(
+    socket: Arc<UdpSocket>,
+    pending: Arc<std::sync::Mutex<HashMap<[u8; 4], PendingQuery>>>,
+    shutdown: CancellationToken,
+    packet_limit: usize,
+) {
+    let mut packet = vec![0_u8; packet_limit];
+    loop {
+        let received = tokio::select! {
+            () = shutdown.cancelled() => return,
+            received = socket.recv_from(&mut packet) => received,
+        };
+        let Ok((length, source)) = received else {
+            return;
+        };
+        let Ok(DhtMessage::Response {
+            transaction,
+            response,
+        }) = decode_message(&packet[..length])
+        else {
+            continue;
+        };
+        let Ok(transaction) = <[u8; 4]>::try_from(transaction.as_ref()) else {
+            continue;
+        };
+        let query = pending.lock().ok().and_then(|mut pending| {
+            pending
+                .get(&transaction)
+                .is_some_and(|query| query.expected == source)
+                .then(|| pending.remove(&transaction))
+                .flatten()
+        });
+        if let Some(query) = query {
+            let _result_ignored = query.response.send(response);
+        }
+    }
 }
 
 /// Result of an iterative lookup: the peers found and the closest nodes that
@@ -76,13 +218,13 @@ impl DhtClient {
             query_limit,
             packet_limit: packet_limit.min(65_507),
             query_timeout,
-            socket: None,
+            transport: None,
             known_nodes: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         })
     }
 
-    /// Bind a reusable DHT socket. Lookups are serialized so transaction
-    /// responses cannot be consumed by a different concurrent lookup.
+    /// Bind a reusable DHT socket. A single receiver dispatches responses by
+    /// transaction ID so independent lookups can safely run concurrently.
     pub async fn bind(
         address: SocketAddr,
         query_limit: usize,
@@ -90,10 +232,7 @@ impl DhtClient {
         query_timeout: Duration,
     ) -> Result<Self, DhtServiceError> {
         let mut client = Self::new(query_limit, packet_limit, query_timeout)?;
-        let socket = UdpSocket::bind(address)
-            .await
-            .map_err(DhtServiceError::Io)?;
-        client.socket = Some(Arc::new(Mutex::new(socket)));
+        client.transport = Some(BoundTransport::bind(address, client.packet_limit).await?);
         Ok(client)
     }
 
@@ -132,19 +271,17 @@ impl DhtClient {
         bootstrap: &[SocketAddr],
         announce_port: Option<u16>,
     ) -> Result<DhtLookup, DhtServiceError> {
-        if let Some(socket) = &self.socket {
-            let socket = socket.lock().await;
-            return self
-                .lookup_with_retry(&socket, info_hash, bootstrap, announce_port)
-                .await;
-        }
-        let first = bootstrap.first().ok_or(DhtServiceError::NoBootstrap)?;
-        let bind = match first.ip() {
-            IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+        let transport = if let Some(transport) = &self.transport {
+            transport.clone()
+        } else {
+            let first = bootstrap.first().ok_or(DhtServiceError::NoBootstrap)?;
+            let bind = match first.ip() {
+                IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+                IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+            };
+            BoundTransport::bind(bind, self.packet_limit).await?
         };
-        let socket = UdpSocket::bind(bind).await.map_err(DhtServiceError::Io)?;
-        self.lookup_with_retry(&socket, info_hash, bootstrap, announce_port)
+        self.lookup_with_retry(&transport, info_hash, bootstrap, announce_port)
             .await
     }
 
@@ -153,14 +290,14 @@ impl DhtClient {
     /// one more attempt with a doubled timeout recovers that case.
     async fn lookup_with_retry(
         &self,
-        socket: &UdpSocket,
+        transport: &Arc<BoundTransport>,
         info_hash: Sha1Hash,
         bootstrap: &[SocketAddr],
         announce_port: Option<u16>,
     ) -> Result<DhtLookup, DhtServiceError> {
         let first = self
             .lookup(
-                socket,
+                transport,
                 info_hash,
                 bootstrap,
                 announce_port,
@@ -171,7 +308,7 @@ impl DhtClient {
             return Ok(first);
         }
         self.lookup(
-            socket,
+            transport,
             info_hash,
             bootstrap,
             announce_port,
@@ -191,7 +328,7 @@ impl DhtClient {
     #[allow(clippy::too_many_lines)] // The dispatch/receive loop shares all lookup state.
     async fn lookup(
         &self,
-        socket: &UdpSocket,
+        transport: &Arc<BoundTransport>,
         info_hash: Sha1Hash,
         bootstrap: &[SocketAddr],
         announce_port: Option<u16>,
@@ -200,7 +337,7 @@ impl DhtClient {
         if bootstrap.is_empty() {
             return Err(DhtServiceError::NoBootstrap);
         }
-        let ipv4 = socket.local_addr().map_err(DhtServiceError::Io)?.is_ipv4();
+        let ipv4 = transport.local_addr()?.is_ipv4();
         let mut seeds: VecDeque<SocketAddr> = VecDeque::new();
         let mut seeded = HashSet::new();
         if let Ok(known) = self.known_nodes.lock() {
@@ -217,11 +354,10 @@ impl DhtClient {
         }
         let mut candidates: BTreeMap<[u8; 20], SocketAddr> = BTreeMap::new();
         let mut queried: HashSet<SocketAddr> = HashSet::new();
-        let mut in_flight: HashMap<[u8; 4], (SocketAddr, Instant)> = HashMap::new();
+        let mut in_flight = FuturesUnordered::new();
         let mut responders: BTreeMap<[u8; 20], (SocketAddr, Option<Bytes>)> = BTreeMap::new();
         let mut peers: HashSet<SocketAddr> = HashSet::new();
         let mut sent = 0_usize;
-        let mut packet = vec![0_u8; self.packet_limit];
         loop {
             while in_flight.len() < LOOKUP_CONCURRENCY && sent < self.query_limit {
                 let next = if let Some(address) = seeds.pop_front() {
@@ -248,46 +384,18 @@ impl DhtClient {
                 if !queried.insert(address) {
                     continue;
                 }
-                let transaction: [u8; 4] = rand::random();
-                let query = encode_get_peers_query(&transaction, self.node_id, info_hash);
-                if socket.send_to(&query, address).await.is_err() {
-                    continue;
-                }
-                in_flight.insert(transaction, (address, Instant::now()));
+                in_flight.push(transport.query(address, self.node_id, info_hash, query_timeout));
                 sent += 1;
             }
             if in_flight.is_empty() || peers.len() >= MAX_DHT_PEERS {
                 break;
             }
-            let oldest = in_flight
-                .values()
-                .map(|(_, sent)| *sent)
-                .min()
-                .unwrap_or_else(Instant::now);
-            let deadline = oldest + query_timeout;
-            let Ok(received) = timeout_at(deadline, socket.recv_from(&mut packet)).await else {
-                let now = Instant::now();
-                in_flight.retain(|_, (_, at)| now.duration_since(*at) < query_timeout);
+            let Some((source, response)) = in_flight.next().await else {
+                break;
+            };
+            let Some(response) = response else {
                 continue;
             };
-            let (length, source) = received.map_err(DhtServiceError::Io)?;
-            let Ok(DhtMessage::Response {
-                transaction,
-                response,
-            }) = decode_message(&packet[..length])
-            else {
-                continue;
-            };
-            let Ok(key) = <[u8; 4]>::try_from(transaction.as_ref()) else {
-                continue;
-            };
-            let Some((expected, _)) = in_flight.get(&key).copied() else {
-                continue;
-            };
-            if expected != source {
-                continue;
-            }
-            in_flight.remove(&key);
             responders.insert(distance(response.id, info_hash), (source, response.token));
             while responders.len() > CLOSEST_NODES * 2 {
                 responders.pop_last();
@@ -316,7 +424,7 @@ impl DhtClient {
                 let transaction: [u8; 4] = rand::random();
                 let query =
                     encode_announce_peer_query(&transaction, self.node_id, info_hash, port, token);
-                let _result_ignored = socket.send_to(&query, *address).await;
+                let _result_ignored = transport.socket.send_to(&query, *address).await;
             }
         }
         let mut peers: Vec<SocketAddr> = peers.into_iter().take(MAX_DHT_PEERS).collect();
@@ -425,6 +533,88 @@ mod tests {
             .await?;
         assert_eq!(peers, [SocketAddr::from(([8, 8, 8, 8], 6881))]);
         server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_client_dispatches_concurrent_lookups_without_head_of_line_blocking()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let slow_node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let fast_node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let slow_address = slow_node.local_addr()?;
+        let fast_address = fast_node.local_addr()?;
+        let (slow_started, slow_received) = oneshot::channel();
+        let slow_server = tokio::spawn(async move {
+            let mut packet = [0_u8; 1024];
+            let (length, source) = slow_node.recv_from(&mut packet).await?;
+            let transaction = response_transaction(&packet[..length])?;
+            let _result_ignored = slow_started.send(());
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            send_peer_response(&slow_node, source, &transaction, [8, 8, 8, 8]).await
+        });
+        let fast_server = tokio::spawn(async move {
+            let mut packet = [0_u8; 1024];
+            let (length, source) = fast_node.recv_from(&mut packet).await?;
+            let transaction = response_transaction(&packet[..length])?;
+            send_peer_response(&fast_node, source, &transaction, [8, 8, 4, 4]).await
+        });
+
+        let client = DhtClient::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            8,
+            4096,
+            Duration::from_secs(1),
+        )
+        .await?;
+        let slow_lookup = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .get_peers(Sha1Hash::from_bytes([1; 20]), &[slow_address])
+                    .await
+            })
+        };
+        slow_received.await?;
+        let fast_peers = timeout(
+            Duration::from_millis(100),
+            client.get_peers(Sha1Hash::from_bytes([2; 20]), &[fast_address]),
+        )
+        .await
+        .map_err(|_| "fast lookup was blocked behind the slow lookup")??;
+        assert_eq!(fast_peers, [SocketAddr::from(([8, 8, 4, 4], 6881))]);
+        assert_eq!(
+            slow_lookup.await??,
+            [SocketAddr::from(([8, 8, 8, 8], 6881))]
+        );
+        slow_server.await??;
+        fast_server.await??;
+        Ok(())
+    }
+
+    fn response_transaction(packet: &[u8]) -> Result<Bytes, io::Error> {
+        let DhtMessage::Query { transaction, .. } = decode_message(packet)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a query"));
+        };
+        Ok(transaction)
+    }
+
+    async fn send_peer_response(
+        node: &UdpSocket,
+        destination: SocketAddr,
+        transaction: &[u8],
+        peer: [u8; 4],
+    ) -> Result<(), io::Error> {
+        let mut response = b"d1:rd2:id20:012345678901234567896:valuesl6:".to_vec();
+        response.extend_from_slice(&peer);
+        response.extend_from_slice(&6881_u16.to_be_bytes());
+        response.extend_from_slice(b"ee1:t");
+        response.extend_from_slice(transaction.len().to_string().as_bytes());
+        response.push(b':');
+        response.extend_from_slice(transaction);
+        response.extend_from_slice(b"1:y1:re");
+        node.send_to(&response, destination).await?;
         Ok(())
     }
 

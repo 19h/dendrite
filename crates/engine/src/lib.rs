@@ -66,10 +66,13 @@ const DEFAULT_PIECE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const PEER_COMMAND_CAPACITY: usize = 64;
 const ACTIVE_PEER_LIMIT: usize = 512;
-const PEER_CONNECT_CONCURRENCY: usize = 128;
+const PEER_CONNECT_CONCURRENCY: usize = 16;
+const GLOBAL_PEER_CONNECT_CONCURRENCY: usize = 128;
 const INCOMING_PEER_LIMIT: usize = 256;
 const INCOMING_HANDSHAKE_LIMIT: usize = 256;
-const TRACKER_ANNOUNCE_CONCURRENCY: usize = 128;
+const TRACKER_ANNOUNCE_CONCURRENCY: usize = 64;
+const TRACKER_ANNOUNCE_CONCURRENCY_PER_TORRENT: usize = 8;
+const DHT_LOOKUP_CONCURRENCY: usize = 16;
 const DISCOVERY_EVENT_CAPACITY: usize = 256;
 const METADATA_PEER_CONCURRENCY: usize = 32;
 const METADATA_GLOBAL_CONCURRENCY: usize = 4;
@@ -93,10 +96,11 @@ const CANDIDATE_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const PEER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(25);
 const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const TRACKER_INTERVAL_MIN: Duration = Duration::from_secs(60);
+const ACTOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const BACKGROUND_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TRACKER_INTERVAL_MAX: Duration = Duration::from_secs(4 * 60 * 60);
 const SWARM_RETRY_MIN: Duration = Duration::from_secs(1);
-const SWARM_RETRY_MAX: Duration = Duration::from_secs(30);
+const SWARM_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 const ACCEPT_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
@@ -188,6 +192,11 @@ enum DiscoveryEvent {
         interval: Duration,
     },
     Finished(Result<(), ActorError>),
+}
+
+struct PeerDiscovery {
+    events: mpsc::Receiver<DiscoveryEvent>,
+    persistent: bool,
 }
 
 enum DiscoverySourceResult {
@@ -424,8 +433,11 @@ struct Services {
     events: broadcast::Sender<EngineEvent>,
     peer_slots: Arc<Semaphore>,
     outbound_slots: Arc<Semaphore>,
+    outbound_attempt_slots: Arc<Semaphore>,
     incoming_handshake_slots: Arc<Semaphore>,
     metadata_slots: Arc<Semaphore>,
+    tracker_announce_slots: Arc<Semaphore>,
+    dht_lookup_slots: Arc<Semaphore>,
     per_torrent_peer_limit: usize,
     lsd_cookie: String,
     encryption: EncryptionPolicy,
@@ -435,12 +447,13 @@ struct Services {
     upload_policy: Arc<std::sync::Mutex<UploadPolicy>>,
     connected_peers: Arc<AtomicUsize>,
     torrent_activity: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
-    payload_claims: Arc<std::sync::Mutex<HashMap<TorrentId, Vec<TorrentPath>>>>,
+    payload_claims: Arc<std::sync::Mutex<PayloadClaims>>,
     download_budget: Arc<DownloadBudget>,
     piece_cache_budget: Arc<CacheBudget>,
     hash_slots: Arc<Semaphore>,
     transfer: TransferPolicy,
     piece_flush_interval: Duration,
+    discovery_interval: Duration,
     /// Addresses this daemon is reachable at, learned from local interfaces
     /// and from peers' `yourip`; candidates on our own peer port at these
     /// addresses are never dialled.
@@ -756,6 +769,12 @@ struct ActiveDownloadGuard {
     torrent_id: TorrentId,
 }
 
+struct ActiveWebSeedGuard {
+    torrents: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
+    torrent_id: TorrentId,
+    downloaded_bytes: Arc<AtomicU64>,
+}
+
 struct SeedPeerGuard {
     torrents: Arc<std::sync::Mutex<HashMap<TorrentId, TorrentActivity>>>,
     torrent_id: TorrentId,
@@ -768,6 +787,7 @@ struct TorrentActivity {
     outbound_peers: usize,
     seed_peers: usize,
     active_downloaders: usize,
+    active_web_seeds: usize,
     /// Updated per block by every downloading worker without taking the map
     /// lock; readers sample it.
     downloaded_bytes: Arc<AtomicU64>,
@@ -788,17 +808,65 @@ pub struct TorrentPeerStats {
     pub outbound: usize,
     pub seeds: usize,
     pub active_downloaders: usize,
+    pub active_web_seeds: usize,
 }
 
 struct PayloadClaim {
-    claims: Arc<std::sync::Mutex<HashMap<TorrentId, Vec<TorrentPath>>>>,
+    claims: Arc<std::sync::Mutex<PayloadClaims>>,
     torrent_id: TorrentId,
+}
+
+#[derive(Clone)]
+struct PayloadPathOwner {
+    torrent_id: TorrentId,
+    display: String,
+}
+
+#[derive(Default)]
+struct PayloadClaims {
+    index: BTreeMap<String, PayloadPathOwner>,
+    by_owner: HashMap<TorrentId, Vec<String>>,
+}
+
+impl PayloadClaims {
+    fn conflict(&self, path: &TorrentPath) -> Option<&PayloadPathOwner> {
+        let key = normalized_payload_path(path);
+        for (separator, _) in key.match_indices('\0') {
+            if let Some(owner) = self.index.get(&key[..=separator]) {
+                return Some(owner);
+            }
+        }
+        self.index
+            .range(key.clone()..)
+            .next()
+            .and_then(|(candidate, owner)| candidate.starts_with(&key).then_some(owner))
+    }
+
+    fn insert(&mut self, torrent_id: TorrentId, path: &TorrentPath) {
+        let key = normalized_payload_path(path);
+        self.index.insert(
+            key.clone(),
+            PayloadPathOwner {
+                torrent_id,
+                display: path.to_string(),
+            },
+        );
+        self.by_owner.entry(torrent_id).or_default().push(key);
+    }
+
+    fn remove_owner(&mut self, torrent_id: TorrentId) {
+        if let Some(paths) = self.by_owner.remove(&torrent_id) {
+            for path in paths {
+                self.index.remove(&path);
+            }
+        }
+    }
 }
 
 impl Drop for PayloadClaim {
     fn drop(&mut self) {
         if let Ok(mut claims) = self.claims.lock() {
-            claims.remove(&self.torrent_id);
+            claims.remove_owner(self.torrent_id);
         }
     }
 }
@@ -832,6 +900,23 @@ impl Drop for ActiveDownloadGuard {
         {
             count.active_downloaders = count.active_downloaders.saturating_sub(1);
         }
+    }
+}
+
+impl Drop for ActiveWebSeedGuard {
+    fn drop(&mut self) {
+        if let Ok(mut peers) = self.torrents.lock()
+            && let Some(count) = peers.get_mut(&self.torrent_id)
+        {
+            count.active_web_seeds = count.active_web_seeds.saturating_sub(1);
+        }
+    }
+}
+
+impl ActiveWebSeedGuard {
+    fn record_bytes(&self, bytes: usize) {
+        self.downloaded_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 }
 
@@ -972,10 +1057,15 @@ impl EngineHandle {
             outbound_slots: Arc::new(Semaphore::new(outbound_connection_limit(
                 peer_connection_limit,
             ))),
+            outbound_attempt_slots: Arc::new(Semaphore::new(
+                peer_connection_limit.min(GLOBAL_PEER_CONNECT_CONCURRENCY),
+            )),
             incoming_handshake_slots: Arc::new(Semaphore::new(
                 peer_connection_limit.min(INCOMING_HANDSHAKE_LIMIT),
             )),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(options.peer_connection_limit),
             lsd_cookie: format!("dendrite-{:016x}", rand::random::<u64>()),
             encryption: options.encryption,
@@ -985,12 +1075,13 @@ impl EngineHandle {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(options.download_buffer_bytes.max(1))),
             piece_cache_budget: Arc::new(CacheBudget::new(options.piece_cache_bytes)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: options.transfer,
             piece_flush_interval: options.piece_flush_interval.max(Duration::from_millis(100)),
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(local_outbound_addresses())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -1114,6 +1205,7 @@ impl EngineHandle {
                     outbound: activity.outbound_peers,
                     seeds: activity.seed_peers,
                     active_downloaders: activity.active_downloaders,
+                    active_web_seeds: activity.active_web_seeds,
                 })
             })
             .unwrap_or_default()
@@ -1178,6 +1270,21 @@ fn track_active_download(services: &Services, torrent_id: TorrentId) -> ActiveDo
     ActiveDownloadGuard {
         torrents: services.torrent_activity.clone(),
         torrent_id,
+    }
+}
+
+fn track_active_web_seed(services: &Services, torrent_id: TorrentId) -> ActiveWebSeedGuard {
+    let downloaded_bytes = if let Ok(mut peers) = services.torrent_activity.lock() {
+        let activity = peers.entry(torrent_id).or_default();
+        activity.active_web_seeds += 1;
+        activity.downloaded_bytes.clone()
+    } else {
+        Arc::new(AtomicU64::new(0))
+    };
+    ActiveWebSeedGuard {
+        torrents: services.torrent_activity.clone(),
+        torrent_id,
+        downloaded_bytes,
     }
 }
 
@@ -2765,15 +2872,34 @@ async fn supervisor(
 async fn stop_background_tasks(services: &Services) {
     services.shutdown.cancel();
     services.tasks.close();
-    services.tasks.wait().await;
+    if tokio::time::timeout(BACKGROUND_SHUTDOWN_GRACE, services.tasks.wait())
+        .await
+        .is_err()
+    {
+        warn!("background engine tasks ignored cancellation");
+    }
 }
 
 async fn stop_all_actors(active: &mut HashMap<TorrentId, ActiveActor>) {
-    let actors: Vec<_> = active.drain().map(|(_, actor)| actor).collect();
-    for actor in &actors {
+    let actors: Vec<_> = active.drain().collect();
+    for (_, actor) in &actors {
         actor.cancellation.cancel();
     }
-    for actor in actors {
+    wait_for_actors(actors).await;
+}
+
+async fn wait_for_actors(actors: Vec<(TorrentId, ActiveActor)>) {
+    let deadline = tokio::time::Instant::now() + ACTOR_SHUTDOWN_GRACE;
+    while actors.iter().any(|(_, actor)| !actor.task.is_finished())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for (id, actor) in actors {
+        if !actor.task.is_finished() {
+            warn!(%id, "aborting torrent actor that ignored cancellation");
+            actor.task.abort();
+        }
         let _result_ignored = actor.task.await;
     }
 }
@@ -2781,7 +2907,7 @@ async fn stop_all_actors(active: &mut HashMap<TorrentId, ActiveActor>) {
 async fn stop_actor(active: &mut HashMap<TorrentId, ActiveActor>, id: TorrentId) {
     if let Some(actor) = active.remove(&id) {
         actor.cancellation.cancel();
-        let _result_ignored = actor.task.await;
+        wait_for_actors(vec![(id, actor)]).await;
     }
 }
 
@@ -2831,8 +2957,8 @@ async fn run_actor(
     }
     let metainfo = Metainfo::parse(&record.raw_metainfo, BencodeLimits::default())
         .map_err(|error| ActorError::Metainfo(error.to_string()))?;
-    ensure_exclusive_payload_paths(&record, &metainfo, services).await?;
-    let _payload_claim = claim_active_payload_paths(&record, &metainfo, services)?;
+    ensure_exclusive_payload_paths(&record, &metainfo, services, cancellation).await?;
+    let _payload_claim = claim_active_payload_paths(&record, &metainfo, services, cancellation)?;
     normalize_completion(&mut record, piece_count(&metainfo)?);
     match mode {
         ActorMode::Recheck => recheck(&metainfo, &mut record, services, cancellation).await,
@@ -2844,15 +2970,12 @@ async fn ensure_exclusive_payload_paths(
     record: &TorrentRecord,
     metainfo: &Metainfo,
     services: &Services,
+    cancellation: &CancellationToken,
 ) -> Result<(), ActorError> {
     let current_key = (record.added_at_unix_ms, record.id);
-    let current_paths: Vec<_> = metainfo
-        .files
-        .iter()
-        .filter(|file| !file.padding)
-        .map(|file| &file.path)
-        .collect();
+    let mut prior_paths = PayloadClaims::default();
     for other in services.store.list_torrents().await? {
+        cancelled(cancellation)?;
         if other.id == record.id
             || other.raw_metainfo.is_empty()
             || (other.added_at_unix_ms, other.id) > current_key
@@ -2869,74 +2992,77 @@ async fn ensure_exclusive_payload_paths(
         ) else {
             continue;
         };
-        for current in &current_paths {
-            if let Some(conflict) = other_metainfo
-                .files
-                .iter()
-                .filter(|file| !file.padding)
-                .map(|file| &file.path)
-                .find(|other| payload_paths_conflict(current, other))
-            {
-                return Err(ActorError::PathConflict {
-                    path: conflict.to_string(),
-                    owner: other.id,
-                });
-            }
+        for file in other_metainfo.files.iter().filter(|file| !file.padding) {
+            cancelled(cancellation)?;
+            prior_paths.insert(other.id, &file.path);
+        }
+    }
+    for file in metainfo.files.iter().filter(|file| !file.padding) {
+        cancelled(cancellation)?;
+        if let Some(conflict) = prior_paths.conflict(&file.path) {
+            return Err(ActorError::PathConflict {
+                path: conflict.display.clone(),
+                owner: conflict.torrent_id,
+            });
         }
     }
     Ok(())
+}
+
+fn normalized_payload_path(path: &TorrentPath) -> String {
+    let capacity = path
+        .components()
+        .iter()
+        .map(|component| component.len().saturating_add(1))
+        .sum();
+    let mut normalized = String::with_capacity(capacity);
+    for component in path.components() {
+        for character in component.chars().flat_map(char::to_lowercase) {
+            normalized.push(character);
+        }
+        normalized.push('\0');
+    }
+    normalized
+}
+
+#[cfg(test)]
+fn payload_paths_conflict(left: &TorrentPath, right: &TorrentPath) -> bool {
+    let left = normalized_payload_path(left);
+    let right = normalized_payload_path(right);
+    left.starts_with(&right) || right.starts_with(&left)
 }
 
 fn claim_active_payload_paths(
     record: &TorrentRecord,
     metainfo: &Metainfo,
     services: &Services,
+    cancellation: &CancellationToken,
 ) -> Result<PayloadClaim, ActorError> {
-    let paths: Vec<_> = metainfo
-        .files
-        .iter()
-        .filter(|file| !file.padding)
-        .map(|file| file.path.clone())
-        .collect();
     let mut claims = services
         .payload_claims
         .lock()
         .map_err(|_| ActorError::Peer("payload ownership registry was poisoned".to_owned()))?;
-    for (owner, owned_paths) in claims.iter() {
-        if *owner == record.id {
-            continue;
-        }
-        if let Some(conflict) = paths.iter().find(|path| {
-            owned_paths
-                .iter()
-                .any(|owned| payload_paths_conflict(path, owned))
-        }) {
+    for file in metainfo.files.iter().filter(|file| !file.padding) {
+        cancelled(cancellation)?;
+        if let Some(conflict) = claims.conflict(&file.path)
+            && conflict.torrent_id != record.id
+        {
             return Err(ActorError::PathConflict {
-                path: conflict.to_string(),
-                owner: *owner,
+                path: conflict.display.clone(),
+                owner: conflict.torrent_id,
             });
         }
     }
-    claims.insert(record.id, paths);
+    claims.remove_owner(record.id);
+    for file in metainfo.files.iter().filter(|file| !file.padding) {
+        cancelled(cancellation)?;
+        claims.insert(record.id, &file.path);
+    }
     drop(claims);
     Ok(PayloadClaim {
         claims: services.payload_claims.clone(),
         torrent_id: record.id,
     })
-}
-
-fn payload_paths_conflict(left: &TorrentPath, right: &TorrentPath) -> bool {
-    let left: Vec<_> = left
-        .components()
-        .iter()
-        .map(|component| component.to_lowercase())
-        .collect();
-    let right: Vec<_> = right
-        .components()
-        .iter()
-        .map(|component| component.to_lowercase())
-        .collect();
-    left.starts_with(&right) || right.starts_with(&left)
 }
 
 async fn acquire_magnet_metadata(
@@ -3554,6 +3680,7 @@ async fn download(
             cancellation,
             info_hash,
             AnnounceEvent::Started,
+            false,
         )
         .await
     };
@@ -3603,6 +3730,7 @@ async fn download_from_peers_with_retry(
             cancellation,
             info_hash,
             announce_event,
+            true,
         )
         .await
         {
@@ -3617,16 +3745,33 @@ async fn download_from_peers_with_retry(
             return Ok(());
         }
         announce_event = AnnounceEvent::None;
-        if record.downloaded > downloaded_before {
-            delay = SWARM_RETRY_MIN;
-        } else {
-            delay = delay.saturating_mul(2).min(SWARM_RETRY_MAX);
-        }
+        delay = next_swarm_retry_base(delay, record.downloaded > downloaded_before);
+        let sleep = jittered_swarm_retry(delay, rand::random());
         tokio::select! {
             () = cancellation.cancelled() => return Err(ActorError::Cancelled),
-            () = tokio::time::sleep(delay) => {}
+            () = tokio::time::sleep(sleep) => {}
         }
     }
+}
+
+fn next_swarm_retry_base(current: Duration, made_progress: bool) -> Duration {
+    if made_progress {
+        SWARM_RETRY_MIN
+    } else {
+        current.saturating_mul(2).min(SWARM_RETRY_MAX)
+    }
+}
+
+fn jittered_swarm_retry(base: Duration, entropy: u64) -> Duration {
+    let room = SWARM_RETRY_MAX.saturating_sub(base);
+    let jitter_limit = (base / 4).min(room);
+    let millis = u64::try_from(jitter_limit.as_millis()).unwrap_or(u64::MAX);
+    let jitter = if millis == u64::MAX {
+        entropy
+    } else {
+        entropy % millis.saturating_add(1)
+    };
+    base.saturating_add(Duration::from_millis(jitter))
 }
 
 fn retryable_peer_failure(error: &ActorError) -> bool {
@@ -3643,8 +3788,9 @@ async fn download_from_peer_round(
     cancellation: &CancellationToken,
     info_hash: Sha1Hash,
     announce_event: AnnounceEvent,
+    persistent_discovery: bool,
 ) -> Result<(), ActorError> {
-    let discovery = start_peer_discovery(
+    let events = start_peer_discovery(
         services,
         DiscoveryQuery {
             trackers: &metainfo.trackers,
@@ -3652,11 +3798,15 @@ async fn download_from_peer_round(
             info_hash,
             left: metainfo.total_length.saturating_sub(record.downloaded),
             allow_dht: !metainfo.private,
-            dht_announce: true,
+            dht_announce: announce_event == AnnounceEvent::Started,
             announce_event,
             cancellation: cancellation.child_token(),
         },
     )?;
+    let discovery = PeerDiscovery {
+        events,
+        persistent: persistent_discovery,
+    };
     run_peer_swarm_with_discovery(
         Vec::new(),
         Some(discovery),
@@ -3695,14 +3845,19 @@ async fn download_from_web_seeds(
         let mut index = 0_usize;
         let mut last_error = None;
         while index < seeds.len() {
-            match fetch_web_seed_piece(
-                &seeds[index],
-                metainfo,
-                piece,
-                services.allow_private_web_seeds,
-            )
-            .await
-            {
+            let activity = track_active_web_seed(services, record.id);
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(ActorError::Cancelled),
+                result = fetch_web_seed_piece(
+                    &seeds[index],
+                    metainfo,
+                    piece,
+                    services.allow_private_web_seeds,
+                    &activity,
+                ) => result,
+            };
+            match result {
                 Ok(data) if verify_piece(metainfo, piece, &data)? => {
                     accepted = Some(data);
                     break;
@@ -3712,6 +3867,7 @@ async fn download_from_web_seeds(
                         Some("web seed returned data that failed piece verification".to_owned());
                     seeds.remove(index);
                 }
+                Err(ActorError::Cancelled) => return Err(ActorError::Cancelled),
                 Err(error) => {
                     last_error = Some(error.to_string());
                     index += 1;
@@ -3737,6 +3893,7 @@ async fn fetch_web_seed_piece(
     metainfo: &Metainfo,
     piece: usize,
     allow_private: bool,
+    activity: &ActiveWebSeedGuard,
 ) -> Result<Bytes, ActorError> {
     let client = web_seed_client(seed, allow_private).await?;
     let length = piece_length(metainfo, piece)?;
@@ -3748,7 +3905,8 @@ async fn fetch_web_seed_piece(
         } else {
             let url = web_seed_file_url(seed, metainfo, file)?;
             output.extend_from_slice(
-                &fetch_http_range(&client, url, offset, length, file.length).await?,
+                &fetch_http_range(&client, url, offset, length, file.length, Some(activity))
+                    .await?,
             );
         }
     } else {
@@ -3765,6 +3923,7 @@ async fn fetch_web_seed_piece(
                         segment.file_offset,
                         segment.length,
                         segment.file.length,
+                        Some(activity),
                     )
                     .await?,
                 );
@@ -3881,6 +4040,7 @@ async fn fetch_http_range(
     offset: u64,
     length: usize,
     file_length: u64,
+    activity: Option<&ActiveWebSeedGuard>,
 ) -> Result<Bytes, ActorError> {
     let length_u64 = u64::try_from(length).map_err(|_| ActorError::Arithmetic)?;
     let end = offset
@@ -3944,6 +4104,9 @@ async fn fetch_http_range(
                 "web seed response exceeded the requested range".to_owned(),
             ));
         }
+        if let Some(activity) = activity {
+            activity.record_bytes(chunk.len());
+        }
         output.extend_from_slice(&chunk);
     }
     if output.len() != length {
@@ -3978,13 +4141,16 @@ async fn run_peer_swarm(
 #[allow(clippy::too_many_lines)] // The select loop keeps all mutable swarm I/O queues in one task.
 async fn run_peer_swarm_with_discovery(
     peers: Vec<SocketAddr>,
-    mut discovery: Option<mpsc::Receiver<DiscoveryEvent>>,
+    mut discovery: Option<PeerDiscovery>,
     info_hash: Sha1Hash,
     metainfo: &Metainfo,
     record: &mut TorrentRecord,
     services: &Services,
     cancellation: &CancellationToken,
 ) -> Result<(), ActorError> {
+    let persistent_discovery = discovery
+        .as_ref()
+        .is_some_and(|discovery| discovery.persistent);
     let (mut swarm, mut events) =
         initialize_swarm(peers, info_hash, metainfo, record, services, cancellation)?;
     let (incoming_sender, mut incoming_peers) =
@@ -3999,10 +4165,13 @@ async fn run_peer_swarm_with_discovery(
     let mut flush_interval = tokio::time::interval(services.piece_flush_interval);
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_interval.tick().await;
-    let mut retention_interval = tokio::time::interval(PEER_RETENTION_INTERVAL);
+    let mut retention_interval =
+        tokio::time::interval(PEER_RETENTION_INTERVAL.min(services.discovery_interval));
     retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     retention_interval.tick().await;
-    let mut last_discovery = Instant::now();
+    let mut next_discovery_at =
+        Instant::now() + jittered_swarm_retry(services.discovery_interval, rand::random());
+    let mut empty_retry_base = SWARM_RETRY_MIN;
     let mut last_dht_announce = Instant::now();
     let mut tracker_next_due: HashMap<String, Instant> = HashMap::new();
     loop {
@@ -4022,7 +4191,7 @@ async fn run_peer_swarm_with_discovery(
         if std::mem::take(&mut swarm.schedule_dirty) {
             schedule_pieces(&mut swarm, metainfo)?;
         }
-        if swarm_is_exhausted(&swarm, discovery.is_none(), pending_io) {
+        if swarm_is_exhausted(&swarm, !persistent_discovery, pending_io) {
             shutdown_swarm(&swarm);
             if let Some(error) = discovery_error {
                 return Err(error);
@@ -4091,7 +4260,7 @@ async fn run_peer_swarm_with_discovery(
                 enqueue_peer_candidates(&mut swarm, peers, false);
             }
             SwarmLoopEvent::Discovery(Some(DiscoveryEvent::TrackerInterval { url, interval })) => {
-                let interval = interval.clamp(TRACKER_INTERVAL_MIN, TRACKER_INTERVAL_MAX);
+                let interval = interval.clamp(services.discovery_interval, TRACKER_INTERVAL_MAX);
                 tracker_next_due.insert(url, Instant::now() + interval);
             }
             SwarmLoopEvent::Discovery(Some(DiscoveryEvent::Finished(result))) => {
@@ -4099,10 +4268,22 @@ async fn run_peer_swarm_with_discovery(
                     discovery_error = Some(error);
                 }
                 discovery = None;
+                let empty = swarm.workers.is_empty()
+                    && swarm.candidates.is_empty()
+                    && swarm.connecting == 0;
+                let delay = if empty {
+                    empty_retry_base = next_swarm_retry_base(empty_retry_base, false);
+                    jittered_swarm_retry(empty_retry_base, rand::random())
+                } else {
+                    empty_retry_base = SWARM_RETRY_MIN;
+                    jittered_swarm_retry(services.discovery_interval, rand::random())
+                };
+                next_discovery_at = Instant::now() + delay;
             }
             SwarmLoopEvent::Discovery(None) => discovery = None,
             SwarmLoopEvent::Stored(stored) => {
                 stage_stored_piece(&mut swarm, stored, &mut pending_pieces, &mut pending_paths)?;
+                empty_retry_base = SWARM_RETRY_MIN;
             }
             SwarmLoopEvent::Flushed(flushed) => {
                 commit_flushed_pieces(&mut swarm, flushed, metainfo, record, services).await?;
@@ -4117,22 +4298,29 @@ async fn run_peer_swarm_with_discovery(
             }
             SwarmLoopEvent::RetentionTick => {
                 retain_productive_peers(&mut swarm)?;
-                if discovery.is_none() && last_discovery.elapsed() >= PEER_REANNOUNCE_INTERVAL {
+                if persistent_discovery
+                    && discovery.is_none()
+                    && Instant::now() >= next_discovery_at
+                {
                     let due_trackers = due_tracker_tiers(&metainfo.trackers, &tracker_next_due);
                     let dht_announce = last_dht_announce.elapsed() >= DHT_ANNOUNCE_INTERVAL;
                     if dht_announce {
                         last_dht_announce = Instant::now();
                     }
-                    discovery = Some(restart_peer_discovery(
-                        services,
-                        &due_trackers,
-                        metainfo,
-                        record,
-                        info_hash,
-                        cancellation,
-                        dht_announce,
-                    )?);
-                    last_discovery = Instant::now();
+                    discovery = Some(PeerDiscovery {
+                        events: restart_peer_discovery(
+                            services,
+                            &due_trackers,
+                            metainfo,
+                            record,
+                            info_hash,
+                            cancellation,
+                            dht_announce,
+                        )?,
+                        persistent: true,
+                    });
+                    next_discovery_at = Instant::now()
+                        + jittered_swarm_retry(services.discovery_interval, rand::random());
                 }
             }
         }
@@ -4376,11 +4564,9 @@ fn initialize_swarm(
     Ok((swarm, events))
 }
 
-async fn receive_discovery_event(
-    discovery: &mut Option<mpsc::Receiver<DiscoveryEvent>>,
-) -> Option<DiscoveryEvent> {
+async fn receive_discovery_event(discovery: &mut Option<PeerDiscovery>) -> Option<DiscoveryEvent> {
     match discovery {
-        Some(receiver) => receiver.recv().await,
+        Some(discovery) => discovery.events.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -4847,34 +5033,43 @@ fn start_peer_discovery(
         .then(|| services.advertised_peer_port.load(Ordering::Acquire));
     let cancellation = query.cancellation;
     let (sender, receiver) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
-    let slots = Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY));
+    let local_tracker_slots = Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY_PER_TORRENT));
     let mut sources = tokio::task::JoinSet::new();
     for url in urls {
         let http = http.clone();
-        let slots = slots.clone();
+        let local_slots = local_tracker_slots.clone();
+        let global_slots = services.tracker_announce_slots.clone();
         sources.spawn(async move {
-            let permit = slots.acquire_owned().await;
-            let result = match permit {
-                Ok(_permit) => announce_tracker(&http, udp, &url, request).await,
-                Err(error) => Err(error.to_string()),
+            let local = local_slots.acquire_owned().await;
+            let global = global_slots.acquire_owned().await;
+            let result = match (local, global) {
+                (Ok(_local), Ok(_global)) => announce_tracker(&http, udp, &url, request).await,
+                (Err(error), _) | (_, Err(error)) => Err(error.to_string()),
             };
             DiscoverySourceResult::Tracker { url, result }
         });
     }
     if let Some(dht) = dht {
+        let slots = services.dht_lookup_slots.clone();
         sources.spawn(async move {
-            let lookup = async {
+            let lookup = async move {
+                let _permit = slots
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| error.to_string())?;
                 match dht_announce_port {
-                    Some(port) => {
-                        dht.get_peers_and_announce(info_hash, &bootstrap, port)
-                            .await
-                    }
-                    None => dht.get_peers(info_hash, &bootstrap).await,
+                    Some(port) => dht
+                        .get_peers_and_announce(info_hash, &bootstrap, port)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => dht
+                        .get_peers(info_hash, &bootstrap)
+                        .await
+                        .map_err(|error| error.to_string()),
                 }
             };
             let result = match tokio::time::timeout(DHT_DISCOVERY_TIMEOUT, lookup).await {
-                Ok(Ok(peers)) => Ok(peers),
-                Ok(Err(error)) => Err(error.to_string()),
+                Ok(result) => result,
                 Err(_) => Err("DHT lookup timed out".to_owned()),
             };
             DiscoverySourceResult::Dht(result)
@@ -5089,6 +5284,13 @@ async fn discover_tracker_peers(
 }
 
 async fn peer_worker(context: PeerWorkerContext, commands: mpsc::Receiver<PeerWorkerCommand>) {
+    let attempt_permit = tokio::select! {
+        () = context.cancellation.cancelled() => return,
+        permit = context.services.outbound_attempt_slots.clone().acquire_owned() => permit,
+    };
+    let Ok(attempt_permit) = attempt_permit else {
+        return;
+    };
     let outbound_permit = tokio::select! {
         () = context.cancellation.cancelled() => return,
         permit = context.services.outbound_slots.clone().acquire_owned() => permit,
@@ -5103,7 +5305,12 @@ async fn peer_worker(context: PeerWorkerContext, commands: mpsc::Receiver<PeerWo
     let Ok(_permit) = permit else {
         return;
     };
-    let Some((peer, seed, upload)) = establish_peer_worker(&context).await else {
+    let established = tokio::select! {
+        () = context.cancellation.cancelled() => return,
+        established = establish_peer_worker(&context) => established,
+    };
+    drop(attempt_permit);
+    let Some((peer, seed, upload)) = established else {
         return;
     };
     let _connection = track_connection(
@@ -7084,7 +7291,7 @@ fn cancelled(token: &CancellationToken) -> Result<(), ActorError> {
 }
 
 fn generate_peer_id() -> PeerId {
-    const PREFIX: &[u8; 8] = b"-SY2000-";
+    const PREFIX: &[u8; 8] = b"-SY0010-";
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let random: [u8; 12] = rand::random();
     let mut id = [0_u8; 20];
@@ -7384,14 +7591,17 @@ mod tests {
             .await?;
         let services = test_services(store.clone(), storage.clone(), "overlap");
 
-        let owner_claim = claim_active_payload_paths(&owner, &owner_metainfo, &services)?;
+        let cancellation = CancellationToken::new();
+        let owner_claim =
+            claim_active_payload_paths(&owner, &owner_metainfo, &services, &cancellation)?;
         let mut clock_rollback_contender = contender.clone();
         clock_rollback_contender.added_at_unix_ms = 0;
         assert!(matches!(
             claim_active_payload_paths(
                 &clock_rollback_contender,
                 &contender_metainfo,
-                &services
+                &services,
+                &cancellation,
             ),
             Err(ActorError::PathConflict { owner: id, .. }) if id == owner.id
         ));
@@ -7400,6 +7610,7 @@ mod tests {
             &clock_rollback_contender,
             &contender_metainfo,
             &services,
+            &cancellation,
         )?);
 
         assert!(matches!(
@@ -7450,6 +7661,35 @@ mod tests {
     }
 
     #[test]
+    fn payload_path_index_detects_case_and_both_prefix_directions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owner = TorrentId::new();
+        let claimed_path = TorrentPath::new(["Directory".to_owned(), "Payload.bin".to_owned()])?;
+        let mut claims = PayloadClaims::default();
+        claims.insert(owner, &claimed_path);
+
+        for conflict in [
+            TorrentPath::new(["directory".to_owned(), "PAYLOAD.BIN".to_owned()])?,
+            TorrentPath::new(["directory".to_owned()])?,
+            TorrentPath::new([
+                "directory".to_owned(),
+                "payload.bin".to_owned(),
+                "nested".to_owned(),
+            ])?,
+        ] {
+            assert_eq!(
+                claims.conflict(&conflict).map(|entry| entry.torrent_id),
+                Some(owner)
+            );
+        }
+        let sibling = TorrentPath::new(["directory".to_owned(), "other.bin".to_owned()])?;
+        assert!(claims.conflict(&sibling).is_none());
+        claims.remove_owner(owner);
+        assert!(claims.conflict(&claimed_path).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn peer_ids_have_stable_prefix() {
         assert_eq!(&generate_peer_id().as_bytes()[..8], b"-SY2000-");
     }
@@ -7468,6 +7708,174 @@ mod tests {
         assert_eq!(outbound_connection_limit(2), 1);
         assert_eq!(outbound_connection_limit(1_000), 750);
         assert_eq!(outbound_connection_limit(10_000), 9_744);
+    }
+
+    #[test]
+    fn empty_swarm_retry_is_bounded_jittered_and_resets_after_progress() {
+        let mut base = SWARM_RETRY_MIN;
+        for entropy in 0..64 {
+            let next = next_swarm_retry_base(base, false);
+            assert!(next >= base);
+            assert!(next <= SWARM_RETRY_MAX);
+            let actual = jittered_swarm_retry(next, entropy);
+            assert!(actual >= next);
+            assert!(actual <= SWARM_RETRY_MAX);
+            base = next;
+        }
+        assert_eq!(base, SWARM_RETRY_MAX);
+        assert_eq!(
+            next_swarm_retry_base(base, true),
+            SWARM_RETRY_MIN,
+            "verified progress must restore prompt recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_attempt_limit_is_global_and_cancellation_releases_it()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let first_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let second_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let directory = tempfile::tempdir()?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let storage = StorageHandle::start_portable(directory.path(), 8)?;
+        let mut services = test_services(store, storage, "global-attempt-test");
+        services.outbound_attempt_slots = Arc::new(Semaphore::new(1));
+        let (events, _event_receiver) = mpsc::channel(8);
+        let spawn_worker = |worker, address, torrent_id, cancellation: CancellationToken| {
+            let (_commands, receiver) = mpsc::channel(1);
+            let context = PeerWorkerContext {
+                worker,
+                address,
+                info_hash: Sha1Hash::from_bytes([7; 20]),
+                piece_count: 1,
+                completed_pieces: vec![0],
+                services: services.clone(),
+                events: events.clone(),
+                cancellation,
+                allow_pex: false,
+                force_utp: false,
+                torrent_id,
+            };
+            tokio::spawn(peer_worker(context, receiver))
+        };
+
+        let first_cancel = CancellationToken::new();
+        let first = spawn_worker(
+            1,
+            first_listener.local_addr()?,
+            TorrentId::new(),
+            first_cancel.clone(),
+        );
+        let (first_stream, _) =
+            tokio::time::timeout(Duration::from_secs(1), first_listener.accept()).await??;
+
+        let second_cancel = CancellationToken::new();
+        let second = spawn_worker(
+            2,
+            second_listener.local_addr()?,
+            TorrentId::new(),
+            second_cancel.clone(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second_listener.accept())
+                .await
+                .is_err(),
+            "a second torrent bypassed the process-wide attempt limit"
+        );
+        assert_eq!(
+            services.peer_slots.available_permits(),
+            INCOMING_PEER_LIMIT - 1,
+            "a queued attempt consumed a full connection slot"
+        );
+        assert_eq!(
+            services.outbound_slots.available_permits(),
+            INCOMING_PEER_LIMIT - 1,
+            "a queued attempt consumed an outbound connection slot"
+        );
+
+        first_cancel.cancel();
+        drop(first_stream);
+        let (second_stream, _) =
+            tokio::time::timeout(Duration::from_secs(1), second_listener.accept()).await??;
+        second_cancel.cancel();
+        drop(second_stream);
+        tokio::time::timeout(Duration::from_secs(1), first).await??;
+        tokio::time::timeout(Duration::from_secs(1), second).await??;
+        assert_eq!(services.outbound_attempt_slots.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracker_announce_limit_is_shared_across_torrents()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let first_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let second_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let first_url = format!("http://{}/announce", first_listener.local_addr()?);
+        let second_url = format!("http://{}/announce", second_listener.local_addr()?);
+        let first_tiers = vec![vec![first_url]];
+        let second_tiers = vec![vec![second_url]];
+        let payload = Bytes::from_static(b"global tracker admission");
+        let raw = multi_piece_v1_metainfo("tracker-limit.bin", &[payload]);
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let info_hash = wire_info_hash(&metainfo)?;
+        let record = test_record(&metainfo, raw);
+        let directory = tempfile::tempdir()?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let storage = StorageHandle::start_portable(directory.path(), 8)?;
+        let mut services = test_services(store, storage, "global-tracker-test");
+        services.tracker_announce_slots = Arc::new(Semaphore::new(1));
+        let first_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+
+        let _first_events = start_peer_discovery(
+            &services,
+            DiscoveryQuery {
+                trackers: &first_tiers,
+                record: &record,
+                info_hash,
+                left: record.total_length,
+                allow_dht: false,
+                dht_announce: false,
+                announce_event: AnnounceEvent::Started,
+                cancellation: first_cancel.clone(),
+            },
+        )?;
+        let (mut first_stream, _) =
+            tokio::time::timeout(Duration::from_secs(1), first_listener.accept()).await??;
+        let _second_events = start_peer_discovery(
+            &services,
+            DiscoveryQuery {
+                trackers: &second_tiers,
+                record: &record,
+                info_hash,
+                left: record.total_length,
+                allow_dht: false,
+                dht_announce: false,
+                announce_event: AnnounceEvent::Started,
+                cancellation: second_cancel.clone(),
+            },
+        )?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second_listener.accept())
+                .await
+                .is_err(),
+            "tracker work from another torrent bypassed global admission"
+        );
+
+        respond_empty_tracker(&mut first_stream).await?;
+        let (mut second_stream, _) =
+            tokio::time::timeout(Duration::from_secs(1), second_listener.accept()).await??;
+        respond_empty_tracker(&mut second_stream).await?;
+        first_cancel.cancel();
+        second_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while services.tracker_announce_slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "tracker admission permit leaked")?;
+        Ok(())
     }
 
     #[test]
@@ -7558,8 +7966,11 @@ mod tests {
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "pex-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -7569,12 +7980,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -7798,6 +8210,7 @@ mod tests {
                 outbound: 0,
                 seeds: 1,
                 active_downloaders: 1,
+                active_web_seeds: 0,
             }
         );
         let _result_ignored = release_piece.send(());
@@ -8357,8 +8770,11 @@ mod tests {
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "swarm-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -8368,12 +8784,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -8585,8 +9002,11 @@ mod tests {
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "lsd-downloader-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -8596,12 +9016,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -8671,8 +9092,11 @@ mod tests {
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "mse-out-test".to_owned(),
             encryption: EncryptionPolicy::Required,
@@ -8682,12 +9106,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -8763,6 +9188,108 @@ mod tests {
         assert_eq!(tokio::fs::read(downloads.join("root/a")).await?, first);
         assert_eq!(tokio::fs::read(downloads.join("root/b")).await?, second);
         assert!(!downloads.join("root/.pad").exists());
+        assert_eq!(
+            engine.torrent_downloaded_bytes(id),
+            u64::try_from(first.len() + second.len())?
+        );
+        assert_eq!(engine.torrent_peer_stats(id).active_web_seeds, 0);
+        server.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_seed_request_reports_an_active_source_and_wire_bytes()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let storage = StorageHandle::start_portable(&downloads, 8)?;
+        let services = test_services(store, storage, "web-seed-activity");
+        let id = TorrentId::new();
+        let activity = track_active_web_seed(&services, id);
+        assert_eq!(
+            services
+                .torrent_activity
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(&id)
+                .map(|entry| entry.active_web_seeds),
+            Some(1)
+        );
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = Url::parse(&format!("http://{}/file", listener.local_addr()?))?;
+        let response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 1-4/8\r\nConnection: close\r\n\r\ndata".to_vec();
+        let server = tokio::spawn(fake_raw_http_response(listener, response));
+        let client = web_seed_client(&url, true).await?;
+        assert_eq!(
+            fetch_http_range(&client, url, 1, 4, 8, Some(&activity)).await?,
+            Bytes::from_static(b"data")
+        );
+        assert_eq!(activity.downloaded_bytes.load(Ordering::Relaxed), 4);
+        drop(activity);
+        assert_eq!(
+            services
+                .torrent_activity
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(&id)
+                .map(|entry| entry.active_web_seeds),
+            Some(0)
+        );
+        server.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_web_seed_request()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = b"request that never receives an HTTP response";
+        let digest: [u8; 20] = Sha1::digest(payload).into();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let seed = format!("http://{}/payload.bin", listener.local_addr()?);
+        let (accepted_sender, accepted) = oneshot::channel();
+        let (release_sender, release) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await?;
+            let _result_ignored = accepted_sender.send(());
+            let _result_ignored = release.await;
+            Ok::<_, std::io::Error>(())
+        });
+        let mut raw = single_file_metainfo(
+            "http://127.0.0.1:1/announce",
+            "stalled-web-seed.bin",
+            payload,
+            digest,
+        );
+        if raw.pop() != Some(b'e') {
+            return Err("invalid stalled web-seed fixture".into());
+        }
+        raw.extend_from_slice(format!("8:url-list{}:{seed}e", seed.len()).as_bytes());
+        let metainfo = Metainfo::parse(&raw, BencodeLimits::default())?;
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let storage = StorageHandle::start_portable(&downloads, 8)?;
+        let mut services = test_services(store, storage, "stalled-web-seed");
+        services.allow_private_web_seeds = true;
+        let mut record = test_record(&metainfo, raw);
+        normalize_completion(&mut record, 1);
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            download_from_web_seeds(&metainfo, &mut record, &services, &task_cancellation).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), accepted).await??;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .map_err(|_| "stalled web-seed request ignored cancellation")??;
+        assert!(matches!(result, Err(ActorError::Cancelled)));
+        let _result_ignored = release_sender.send(());
         server.await.map_err(|error| error.to_string())??;
         Ok(())
     }
@@ -8803,7 +9330,7 @@ mod tests {
             let server = tokio::spawn(fake_raw_http_response(listener, response));
             let client = web_seed_client(&url, true).await?;
             assert!(
-                fetch_http_range(&client, url, 1, 4, 8).await.is_err(),
+                fetch_http_range(&client, url, 1, 4, 8, None).await.is_err(),
                 "malformed web-seed range response was accepted"
             );
             server.await.map_err(|error| error.to_string())??;
@@ -9115,8 +9642,11 @@ mod tests {
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "endgame-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -9126,12 +9656,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -9289,8 +9820,11 @@ mod tests {
             events: event_sender,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: "scheduler-test".to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -9300,12 +9834,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -9669,7 +10204,8 @@ mod tests {
         std::fs::create_dir(&downloads)?;
         let store = StateStoreHandle::start(&directory.path().join("state.redb"), 32)?;
         let storage = StorageHandle::start_portable(&downloads, 32)?;
-        let services = test_services(store.clone(), storage, "reannounce-test");
+        let mut services = test_services(store.clone(), storage, "reannounce-test");
+        services.discovery_interval = Duration::from_millis(100);
         let mut record = test_record(&metainfo, raw);
         normalize_completion(&mut record, 2);
         store.put_torrent(record.clone()).await?;
@@ -10124,6 +10660,56 @@ mod tests {
         assert!(!downloads.join("shutdown.bin").exists());
         tracker.await.map_err(|error| error.to_string())??;
         peer.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_an_actor_that_ignores_cancellation()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let id = TorrentId::new();
+        let cancellation = CancellationToken::new();
+        let actor_cancellation = cancellation.clone();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut active = HashMap::from([(
+            id,
+            ActiveActor {
+                generation: 1,
+                cancellation,
+                task,
+            },
+        )]);
+
+        tokio::time::timeout(
+            ACTOR_SHUTDOWN_GRACE + Duration::from_secs(1),
+            stop_all_actors(&mut active),
+        )
+        .await
+        .map_err(|_| "non-cooperative actor made shutdown unbounded")?;
+        assert!(active.is_empty());
+        assert!(actor_cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_forever_for_a_background_task()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads)?;
+        let store = StateStoreHandle::start(&directory.path().join("state.redb"), 8)?;
+        let storage = StorageHandle::start_portable(&downloads, 8)?;
+        let services = test_services(store, storage, "stuck-background-task");
+        let stuck = services.tasks.spawn(std::future::pending::<()>());
+
+        tokio::time::timeout(
+            BACKGROUND_SHUTDOWN_GRACE + Duration::from_secs(1),
+            stop_background_tasks(&services),
+        )
+        .await
+        .map_err(|_| "non-cooperative background task made shutdown unbounded")?;
+        assert!(services.shutdown.is_cancelled());
+        stuck.abort();
+        let _result_ignored = stuck.await;
         Ok(())
     }
 
@@ -11089,7 +11675,7 @@ mod tests {
         engine.resume(id).await?;
         wait_for_seeding(&mut events).await?;
         assert_eq!(
-            tokio::fs::read(downloads.join("root/payload.bin")).await?,
+            tokio::fs::read(downloads.join("payload.bin")).await?,
             payload
         );
         tracker_task.await.map_err(|error| error.to_string())??;
@@ -11311,8 +11897,11 @@ mod tests {
             events,
             peer_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             outbound_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(GLOBAL_PEER_CONNECT_CONCURRENCY)),
             incoming_handshake_slots: Arc::new(Semaphore::new(INCOMING_PEER_LIMIT)),
             metadata_slots: Arc::new(Semaphore::new(METADATA_GLOBAL_CONCURRENCY)),
+            tracker_announce_slots: Arc::new(Semaphore::new(TRACKER_ANNOUNCE_CONCURRENCY)),
+            dht_lookup_slots: Arc::new(Semaphore::new(DHT_LOOKUP_CONCURRENCY)),
             per_torrent_peer_limit: per_torrent_peer_limit(INCOMING_PEER_LIMIT),
             lsd_cookie: cookie.to_owned(),
             encryption: EncryptionPolicy::Disabled,
@@ -11322,12 +11911,13 @@ mod tests {
             upload_policy: Arc::new(std::sync::Mutex::new(UploadPolicy::default())),
             connected_peers: Arc::new(AtomicUsize::new(0)),
             torrent_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            payload_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            payload_claims: Arc::new(std::sync::Mutex::new(PayloadClaims::default())),
             download_budget: Arc::new(DownloadBudget::new(DEFAULT_DOWNLOAD_BUFFER_BYTES)),
             piece_cache_budget: Arc::new(CacheBudget::new(DEFAULT_PIECE_CACHE_BYTES)),
             hash_slots: Arc::new(Semaphore::new(hash_concurrency())),
             transfer: TransferPolicy::default(),
             piece_flush_interval: PIECE_FLUSH_INTERVAL,
+            discovery_interval: PEER_REANNOUNCE_INTERVAL,
             self_addresses: Arc::new(std::sync::RwLock::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -11522,6 +12112,28 @@ mod tests {
         std::future::pending().await
     }
 
+    async fn respond_empty_tracker(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 || request.len().saturating_add(read) > 16 * 1024 {
+                return Err("invalid tracker request".into());
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let body = b"d8:intervali60e5:peers0:e";
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body).await?;
+        Ok(())
+    }
+
     async fn fake_tracker_sequence<const N: usize>(
         listener: TcpListener,
         peers: [(SocketAddr, bool); N],
@@ -11547,7 +12159,7 @@ mod tests {
             let IpAddr::V4(ip) = peer.ip() else {
                 return Err("test peer must use IPv4".into());
             };
-            let mut body = b"d8:intervali60e5:peers6:".to_vec();
+            let mut body = b"d8:intervali0e5:peers6:".to_vec();
             body.extend_from_slice(&ip.octets());
             body.extend_from_slice(&peer.port().to_be_bytes());
             body.push(b'e');
